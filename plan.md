@@ -181,17 +181,42 @@ deliberately unidentified — do not go looking for it, the numbers are what mat
 | | value | vs bar |
 |---|---|---|
 | decode at **full 262,144 context** | **131 tok/s** (7.65 ms/token) | **in band** |
-| prefill, M=2048 | **2,690 tok/s** (upper bound) | **2x behind** |
+| prefill | **not yet measured at a comparable chunk size** | unknown |
 
 The decode figure is measured, not modelled: the indexer's 3,183.8 us/token is at
 65,536 blocks = 262,144 tokens x block 4, i.e. the *full* advertised context, and GDN is
 measured, and experts are arithmetic. It rests on one assumption that I-026 Item 1 must
-confirm: that QSA's 2048-key cap actually bounds `attn_decode`. If that cap is not enforced
-on the decode path, the 2,349.6 us/token attention term grows with context and this number
-is void.
+confirm: that QSA's 2048-key cap actually bounds `attn_decode`.
 
-The prefill figure is an **upper bound**: GDN and elementwise prefill are not yet measured.
-Prefill, not decode, is where we trail.
+**The earlier "2,690 tok/s prefill" figure is withdrawn.** It was computed at M=2048 and was
+unfair to us in two separate ways:
+
+1. **Chunk size.** All 512 experts are hit at M=2048 *and* at M=16384, so the 1.4157 GB of
+   expert weights per layer is read either way — 8x more tokens per byte at 16 K. The peer
+   engine's optimum is 16,384 and our only measurement is at 2,048, so the two numbers were
+   never comparable.
+2. **The PLE term.** 90 us *per token* x 2,048 = 184 ms, which I charged at 24 % of prefill.
+   That is a serialised table lookup per token; batched it is ~0.1 ms for the whole chunk.
+   Charging it per token made prefill look 24 % worse than the design intends.
+
+**Projection at M=16384, in us/token**, holding measured efficiency where measured:
+
+| term | at measured | at 31 % of FP4 peak | at 52 % |
+|---|---|---|---|
+| routed MoE | 147 (32.1 TFLOPS, 17 %) | 78.6 | 47.2 |
+| shared expert (FFMA) | 77 | 77 | 77 |
+| attention prefill | 57.8 | 57.8 | 57.8 |
+| PLE (batched) | ~0 | ~0 | ~0 |
+| **total** | **282 → 3,550 tok/s** | **213 → 4,690** | **182 → 5,494** |
+
+So the bar is reachable at 16 K but not comfortably: routed efficiency must roughly double
+from the measured 17 %, *and* the shared expert's 77 us/token (27 % of the token) must come
+off the FFMA path. Killing that alone is worth ~8,300 tok/s.
+
+**Cache warmth is our DRAM tier, and they pay it too.** The peer engine's 5,000 is a warm
+number. Our 4.30 GB expert overflow is read once per chunk: 2.1 MB/token at chunk 2,048
+versus 262 KB/token at 16,384. Large chunks are not a tuning knob — they are what makes the
+DRAM tier survivable at all. Every prefill figure we report must state cold or warm.
 
 ### The three levers, in payoff order
 
