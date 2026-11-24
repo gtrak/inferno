@@ -67,7 +67,8 @@ ring buffer update, for prefill (whole chunk) and decode (single step).
 
 ### 2. `core/src/kernels/gdn.zig`
 
-Launch wrappers + `zig build gdntest` comparing against `ref/gdn.zig` for
+Launch wrappers + a test suite (reached through the `c_api.zig` import; there is no
+per-kernel build step) comparing against `ref/gdn.zig` for
 `S ∈ {1, 63, 64, 65, 128, 1024}` (the non-multiples of 64 exercise the padding
 path — **do not skip them**).
 
@@ -79,8 +80,19 @@ bash tools/gate.sh ; echo EXIT=$?
 ```
 
 Acceptance:
-1. `max_abs_err / max|ref| <= 4e-3` for `gdn_prefill` and `gdn_decode`
-   (bf16 I/O, fp32 state) at every length above.
+1. `max_abs_err / max|ref| <= 4e-3` for `gdn_prefill` and `gdn_decode` at every
+   length above, under this **dtype contract** (corrected 2026-11-24 — the original
+   "(bf16 I/O, fp32 state)" wording was wrong):
+
+   | tensor | dtype | why |
+   |---|---|---|
+   | `query`, `key`, `value` | **f32** | the reference transposes and `.to(torch.float32)` these before the delta rule and keeps them f32 through `l2norm` (`modeling_qwen4_exp.py:309-313`); bf16 storage here was an engine artifact, not a model property |
+   | `beta`, `decay`, recurrent state | f32 | the rule's arithmetic |
+   | conv input/output, `out`, `z` | bf16 | activations crossing kernel boundaries |
+
+   Storing q/k in bf16 cost 20 KiB/token/layer and was the sole cause of the prefill
+   comparison reading 8.7e-3 instead of 2.35e-3. Issue I-013 must code against the
+   table above.
 2. **The central invariant:** for the same input sequence, running `gdn_prefill`
    over `S` tokens and running `gdn_decode` `S` times must agree within `4e-3`
    at every position, including the final recurrent state (`<= 1e-3` relative).
