@@ -1348,6 +1348,13 @@ pub const Block = struct {
     }
 
     /// Forgets the conv state (the reference's zeroed state after a reset).
+    ///
+    /// The conv state can be wider than the staging window the rows are
+    /// gathered through, so this copies it in chunks. The destination has to
+    /// advance with those chunks: a copy that re-used offset 0 for every one of
+    /// them left the tail of the ring holding the previous sequence's newest
+    /// column, which the dilated conv then convolves into the first rows of the
+    /// next sequence.
     pub fn reset(self: *Block) !void {
         assert(self.shapes.stateLen() > 0);
         assert(self.buffers.conv_state.bytes > 0);
@@ -1359,8 +1366,12 @@ pub const Block = struct {
         var written: u64 = 0;
         while (written < total) {
             const size: u64 = @min(window, total - written);
+            const destination = cuda_context.DeviceBuffer{
+                .pointer = self.buffers.conv_state.pointer + written,
+                .bytes = size,
+            };
             try self.ple.stream.copy_h_to_d(
-                &self.buffers.conv_state,
+                &destination,
                 &self.staging,
                 size,
             );

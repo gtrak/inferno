@@ -27,6 +27,11 @@ const cuda_arch = "sm_120a";
 const kernel_extension = ".cu";
 
 const kernels_directory = "src/kernels";
+
+/// Model-level glue is a `.cu` file too, and it lives beside the Zig that drives
+/// it rather than in `src/kernels`. The cubin pass therefore walks every
+/// directory here; a kernel in none of them is silently absent from the table.
+const kernel_directories = [_][]const u8{ "src/kernels", "src/model" };
 const cubin_table_file_name = "generated_cubins.zig";
 
 /// Hardware-probe binary: `zig build probe` installs it here.
@@ -117,14 +122,16 @@ const CubinTable = struct {
     fn add_kernel(
         table: *CubinTable,
         b: *std.Build,
+        directory: []const u8,
         file_name: []const u8,
     ) !void {
         assert(std.mem.endsWith(u8, file_name, kernel_extension));
         assert(table.nvcc_path.len > 0);
+        assert(directory.len > 0);
 
         const suffix_length = kernel_extension.len;
         const kernel_name = file_name[0 .. file_name.len - suffix_length];
-        const source_path = b.fmt("{s}/{s}", .{ kernels_directory, file_name });
+        const source_path = b.fmt("{s}/{s}", .{ directory, file_name });
 
         const nvcc = b.addSystemCommand(&.{table.nvcc_path});
         nvcc.addArg(b.fmt("-arch={s}", .{cuda_arch}));
@@ -455,32 +462,57 @@ fn build_kernels(b: *std.Build) !std.Build.LazyPath {
     assert(kernel_extension.len > 0);
 
     var table = try CubinTable.init(b, try find_nvcc(b));
-    var kernels = try b.build_root.handle.openDir(kernels_directory, .{
-        .iterate = true,
-    });
-    defer kernels.close();
-
-    var iterator = kernels.iterate();
-    while (try iterator.next()) |entry| {
-        const is_kernel = entry.kind == .file and
-            std.mem.endsWith(u8, entry.name, kernel_extension);
-        if (is_kernel) {
-            try table.add_kernel(b, entry.name);
-        } else {
-            // Sub-directories and non-CUDA files hold no kernels.
-        }
+    for (kernel_directories) |directory| {
+        try add_kernels_in_directory(&table, b, directory);
     }
 
     if (table.kernel_count == 0) {
         std.debug.print(
-            "error: no {s} files in {s}; the cubin table would be empty\n",
-            .{ kernel_extension, kernels_directory },
+            "error: no {s} files in any of {d} kernel directories;" ++
+                " the cubin table would be empty\n",
+            .{ kernel_extension, kernel_directories.len },
         );
         return error.NoKernelsFound;
     } else {
         assert(table.kernel_count > 0);
     }
     return table.finish();
+}
+
+/// Appends every `.cu` file in `directory` to the table. A missing directory is
+/// a hard error rather than an empty pass: a typo would otherwise drop a kernel
+/// from the table and surface as a runtime "cubin missing" on the GPU.
+fn add_kernels_in_directory(
+    table: *CubinTable,
+    b: *std.Build,
+    directory: []const u8,
+) !void {
+    assert(directory.len > 0);
+    assert(kernels_directory.len > 0);
+
+    var kernels = b.build_root.handle.openDir(directory, .{
+        .iterate = true,
+    }) catch |err| {
+        std.debug.print(
+            "error: cannot open kernel directory {s}: {s}\n",
+            .{ directory, @errorName(err) },
+        );
+        return err;
+    };
+    defer kernels.close();
+
+    const count_before = table.kernel_count;
+    var iterator = kernels.iterate();
+    while (try iterator.next()) |entry| {
+        const is_kernel = entry.kind == .file and
+            std.mem.endsWith(u8, entry.name, kernel_extension);
+        if (is_kernel) {
+            try table.add_kernel(b, directory, entry.name);
+        } else {
+            // Sub-directories and non-CUDA files hold no kernels.
+        }
+    }
+    assert(table.kernel_count >= count_before);
 }
 
 /// Resolves the `nvcc` binary, preferring `CUDA_HOME` over the default toolkit.

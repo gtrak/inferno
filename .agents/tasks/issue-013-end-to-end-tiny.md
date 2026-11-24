@@ -123,77 +123,104 @@ the glue — they exist and 185 tests pin them.
 The lanes ran alongside other GPU work. Any throughput printed by these lanes is indicative
 only; M-001 is the measurement of record.
 
-## OPEN: residual nondeterminism (2026-11-24, gauntlet evidence)
+## SUPERVISOR RULINGS on the rev-e2e-p2 blocking findings — 2026-11-24
 
-Determinism is **NOT** fixed. Sixteen repeat runs of one binary produced:
+Read this before acting. Two of the six findings are **mine**, not the lane's, and must not
+consume your clock.
 
-```
-ulp_error 6.75  x14
-ulp_error 6.70  x 1   (/tmp/run_9.log)
-ulp_error 5.91  x 1   (/tmp/run_8.log)
-```
+**P1-4 (`zig build tiny-check` does not exist) — MOOT, my spec defect.** The gate was amended
+before this review; the reviewer read a stale copy. The end-to-end check is a normal test block
+wired through `c_api.zig`, run by `zig build test`, which `tools/gate.sh` already runs. **Do not
+add a build step.** Adding one would put the architecture gate behind a command CI never calls.
 
-and a later invocation showed `ulp_error 7.79, max_abs_err 1.522e-2` while all sixteen logs carry
-`max_abs_err 7.652e-3`. The greedy ids are identical in every run, so the ids gate holds; the
-*forward* still varies. Flake rate ~12 %.
+**P1-5 (`core/build.zig` was edited in breach of the fence) — AUTHORISED, and it was me.** I
+generalised the cubin pass to walk `kernel_directories = { "src/kernels", "src/model" }` so that
+`src/model/glue.cu` becomes a cubin; before that, `glue.zig` could only ever return
+`GlueCubinMissing`. The table is verified to contain `glue`. Do not revert it, do not re-add the
+step, and do not re-litigate the fence.
 
-The 1.4 MB score-buffer overrun and the missing `applyRope` fence were real and are fixed, but
-they were not the whole story.
+**P1-6 (`weights/manifest.zig` cannot load the tiny fixture) — ACCEPTED DEVIATION, no action.**
+The requirement is unsatisfiable: the fixture has no `model.safetensors.index.json`, and
+`weights/config.zig::hyperConnectionWidth` rejects the tiny shape (256 vs 160). Loading through
+`safetensors.zig` and documenting the deviation in-tree is the correct resolution. **Do not
+weaken `manifest.zig` or `config.zig` to accept the fixture** — that would make the production
+loader accept a shape it must reject. Report it as residual risk.
 
-### Do these in order, cheapest first
+**P1-3 (vacuous `max_logit > 0.0` over `reference`) — FIX IT.** Iterate `produced`. This is the
+same vacuity class that has now appeared six times in this project; an assertion that can pass on
+an all-zero model is not a test.
 
-1. **`CUDA_LAUNCH_BLOCKING=1` on the e2e test.** One env var, no code change. If the spread
-   vanishes, the remaining bug is **host-side async ordering** — another unordered dependency
-   between the executor stream and a module stream. If it persists, it is memory (uninitialised
-   read, a second sizing mismatch) or an intra-kernel race.
-2. **`compute-sanitizer --tool racecheck`** — catches shared-memory and warp-sync hazards inside
-   kernels, and names the kernel and line. This is the one tool never run on this path.
-   Then `--tool memcheck`. Note `memcheck` reported 0 errors despite a 1.4 MB overrun, because
-   the write stayed inside a larger allocation, so its silence proves less than it looks.
-3. **Bisect by synchronisation.** If step 1 implicates ordering, add an explicit
-   `cudaStreamSynchronize` after every launch behind an env flag, confirm determinism, then
-   re-add syncs one at a time until the spread returns. That localises the missing dependency
-   to a single launch pair — do not guess which one.
+### The two that are actually the work, in priority order
 
-### Verification rule
+**P1-2 — nondeterminism first.** `forward` gives max_abs_err 1.423e-2 / 7.814e-3 / 9.803e-3
+across runs of the *same tree*. Until that is fixed the greedy-id gate cannot be a gate at all.
+Diagnose it, do not paper over it: run the forward **twice in one process on identical inputs**
+and compare **layer by layer**, reporting the first layer whose output differs between the two
+runs. That localises it to a kernel or a launch. Prime suspects: a kernel launched without a
+stream dependency, a workspace/device buffer reused across layers without reinitialisation, an
+uninitialised allocation, or a split reduction whose order varies.
 
-Flake rate is ~12 %, so three runs cannot clear a fix. Verify the final configuration with
-**>= 20 runs once**, record the count and every distinct value, and do not repeat the loop per
-gate afterwards. See the verification-effort rule in `plan.md`.
+**P1-1 — prefill logits 4.402e-2 against a 4e-3 gate (~14.6 bf16 ulp).** Only after P1-2 is
+resolved, because a nondeterministic forward cannot be measured to one number. If it persists
+once deterministic, bisect per layer against `trace.safetensors` and report the first divergent
+tensor and its magnitude — **do not adjust a kernel to make logits agree.**
 
-### Do not
+## OPEN BUG found by the diagnostic: `reset()` is not idempotent
 
-- Do not widen the ulp ceiling (16) to absorb the spread. The spread is the bug.
-- Do not touch `core/build.zig`, add a `tiny-check` step, or relax any tolerance.
-- Do not "fix" it by adding a blanket `cudaDeviceSynchronize` and calling it done — that hides
-  the dependency rather than stating it, and it would serialise the real pipeline.
+While hunting the residual nondeterminism the lane added a temporary
+`Model.diagnoseReproducibility` that runs three full forwards from a reset and prints the
+residual-stream drift per phase. Its own output:
 
-## OPEN after the determinism fix: `reset()` zeroes the whole KV cache
+- the **first** reset+forward is correct (`ulp_error 0.07`),
+- the **fourth** reset+forward diverges at **`ulp_error 88.23`**, max_abs_err 1.723e-1.
 
-`State.reset` currently zeroes **every tracked allocation**:
+The 20/20 clean runs did not catch this because each test process resets once. This is a
+**serving-path bug**: every request resets, so request 4 onward would be silently wrong. It is
+almost certainly the same mechanism as the earlier "reset zeroes the mRoPE tables" defect
+returning by a different route — something `reset` clears is not restored on the second pass.
 
-```zig
-for (self.allocations.items) |buffer| { try self.zero(buffer.pointer, buffer.bytes); }
-```
+Do not work around it. Reproduce it directly: `reset(); forward(); reset(); forward();` and
+compare the two forwards. Then find which buffer differs between pass 1 and pass 2 and fix the
+reset (or the fill-after-reset), do not special-case the test.
 
-Every per-layer cache is tracked via `push`, so at 262,144 tokens this is the KV cache:
-**3 GiB per rank, ~7.5 ms at the measured 397.6 GiB/s** — against a 5.3 ms decode step. It is
-invisible on the tiny fixture (a few MB), which is exactly why the test passes.
+The diagnostic call sites have been removed from the measured path so the gate reflects the
+shipping behaviour; the function itself is kept for the reproduction.
 
-**This is a band-aid over an unidentified read-before-write.** Zeros are indistinguishable from
-correct data, so a kernel reading unwritten KV contributes 0.0, the model is quietly wrong, and
-nothing fails. That is worse than a crash, and it is the same class as the reviewer's
-`max_logit > 0.0` finding — a check that passes on an all-zero model.
+## RESOLVED: `reset()` was not idempotent — chunked copy never advanced its destination
 
-Correct treatment, by case:
+Found by repeat-run diagnosis, localised by hashing buffers across passes, fixed at the mechanism.
 
-| case | treatment |
-|---|---|
-| real data (KV, activations, expert slabs) | write before read; zeroing hides the bug |
-| padding / masked regions (MoE 16-row pad, KV tile tails) | zero **once at allocation**; never re-zero |
-| conditionally-written accumulators | zero in the kernel, where the bound is small and known |
-| debug builds | poison with **NaN**, so an uninitialised read fails loudly |
+`ple.Block.reset()`'s chunked H2D loop copied **every chunk to offset 0** of `conv_state`. The
+tiny fixture's staging window is 8,192 B (`64 tokens x 2 heads x 16 dims x 4 B`) while
+`conv_state` is 12,288 B, so iteration 1 wrote `[0,8192)` and iteration 2 re-wrote `[0,4096)`;
+**`[8192,12288)` was never written.** Probe after a reset: exactly 256 nonzero floats, the first
+at index 2048 = byte offset 8192 = the ring's newest column. Because `plan.ple_layer == 1`, that
+stale column was convolved into the first rows of the PLE layer on every pass after the first:
+pass 1 read a fresh ring, pass 2+ read pass 1's column and agreed with each other — which is why
+the first `reset()`+`forward()` was correct and the fourth diverged at ulp 88.23.
 
-Follow-up work, in order: name the buffer that was being read unwritten (the 240-tensor bisect
-can), fix that read, zero only true padding at allocation, and add NaN poisoning in debug.
-Keep the blanket reset-zeroing no longer than it takes to find the real read.
+The fix advances the destination by `written` and clears **exactly the same byte count** as
+before, so this is an offset fix, not a widening. Verified non-vacuous: a reviewer swapped only
+`ple.zig` between HEAD and working tree in a `/tmp` copy and reproduced the failure to the digit
+(`logit 0 is -5.080317e-2 then -2.5817446e-2`).
+
+**This is the third bug of the same family tonight** — `reset` clearing a container but not the
+meaning of its contents:
+
+| bug | what cleared | what did not |
+|---|---|---|
+| mRoPE cos/sin tables | the buffers | the refill after clearing |
+| PLE block buffer | the allocations | the block's index state |
+| `conv_state` (this one) | part of the buffer | the chunk offset, so 4 KiB survived |
+
+## OPEN: `reset()` still zeroes every allocation including the KV cache
+
+`State.reset` zeroes all tracked allocations, which at 262,144 tokens is the KV cache: **3 GiB per
+rank, ~7.5 ms at the measured 397.6 GiB/s**, against a 5.3 ms decode step. Invisible on the tiny
+fixture (a few MB). Real data should be written before read; only true padding needs zeroing, once
+at allocation. Zeros are indistinguishable from valid data, so this masks rather than fixes — the
+same class as the `max_logit > 0.0`-over-reference vacuity.
+
+Also: `logits_ulps_max = 16.0` now sits **230x above the measured 0.07 ulp**, so it can never bind
+and the effective gate is the relative 4e-3. Tighten it to a value that binds (~2 ulp) or drop it
+and keep one gate. A gate that cannot fail is decoration.
