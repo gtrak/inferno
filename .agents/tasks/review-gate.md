@@ -49,7 +49,25 @@ Never force-kill a process; use `timeout`.
    - `unreachable`/`catch unreachable` only where provably impossible, with a
      comment; error returns checked?
    - `zig fmt --check` clean.
-5. **Numerics**: for any kernel or math change, is it validated against the
+5. **Numerics — two questions, never conflated.** A kernel test must answer
+   "is the kernel's *math* right?", i.e. both sides get **identical inputs**
+   (round the oracle's inputs to the kernel's dtype first). The effect of the
+   engine's dtype policy (bf16 activations, fp8 KV, ...) is a *model-level*
+   question, measured against the HF golden trace at I-013 and later, never
+   folded into a kernel comparison. Why this matters: with bf16 output the
+   irreducible floor against an f32 oracle is half a bf16 ulp ≈ 2e-3, so mixing
+   input-quantisation error into a kernel test both hides real bugs in noise and
+   fails correct kernels for reasons unrelated to the kernel.
+   A comparison whose reference has a tiny magnitude (e.g. a ~1e-4 residual) must
+   additionally report **absolute** error and the reference's magnitude, because
+   dividing by a small max inflates the relative figure under cancellation. A
+   tiny-magnitude fixture is a weak bug detector: require at least one
+   production-magnitude comparison per kernel.
+   Lanes may add `pub` visibility to `core/src/ref/` internals they need. They may
+   **never** change a reference function's body or semantics to make a kernel
+   match — that is the one unrecoverable failure mode in this project.
+
+5b. **was** for any kernel or math change, is it validated against the
    oracle (HF golden trace in `tests/golden/`, or the CPU reference) rather than
    against another part of our code? Tolerance choice must be justified (fp32
    reference vs bf16 GPU ⇒ relative error ~1e-3 of the max magnitude, not 1e-9).
