@@ -1,5 +1,25 @@
 # I-011 — PLE kernels: n-gram ids, 16-row gather, key/value proj, dilated conv
 
+## Launch infrastructure (shared, already written — do not reinvent)
+
+`core/src/hw/kernel.zig` exists on main and is the only way to load a cubin and
+launch a kernel. Copy it into your worktree (`cp /home/gary/dev/inferno/core/src/hw/kernel.zig core/src/hw/`)
+and add exactly TWO lines to the test block in `core/src/c_api.zig`:
+`_ = @import("hw/kernel.zig");` and `_ = @import("kernels/<yours>.zig");`.
+
+```zig
+var module = try kernel.Module.load(cubin_bytes);   // decompress-free: bytes are embedded
+defer module.unload();
+var fn_ = try module.function("your_kernel");       // extern "C" name from the .cu
+try fn_.setDynamicSharedBytes(64 * 1024);           // only if you need > 48 KiB/block
+var params = [_]?*anyopaque{ @ptrCast(&ptr), @ptrCast(&n) };
+try fn_.launch(.{ gx, 1, 1 }, .{ bx, 1, 1 }, shared_bytes, stream.handle, &params);
+```
+
+`core/build.zig` already globs `src/kernels/*.cu` into the embedded cubin table, so
+adding a `.cu` file needs no build change. **Do not edit `core/build.zig`.**
+There is no per-kernel build step: your tests run under `zig build test`.
+
 ## Working agreement
 - Sole writer. tiger-style binding. Reference lines 1055–1272 (`_splitmix64`,
   `_build_layer_multipliers`, `_find_nth_prime_after`, `NGramEmbedding`,
@@ -31,7 +51,7 @@
 ## Gates
 ```
 bash tools/gate.sh ; echo EXIT=$?
-(cd core && timeout 900 zig build ple-test) ; echo PLE=$?
+(cd core && timeout 900 zig build test) ; echo CORETEST=$?
 ```
 1. `ngram_ids` **exactly equal** to the oracle for the golden input and for a
    second input containing EOS mid-sequence (the EOS-segment logic is the trap).
