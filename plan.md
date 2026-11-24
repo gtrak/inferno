@@ -79,9 +79,12 @@ pipelining is *not* used for a single stream (it cannot shorten the critical pat
 
 ```
 core/                     Zig hot path (static lib, C ABI)
-  build.zig               also drives nvcc for kernels/*.cu
+  build.zig               also drives nvcc for kernels/*.cu (-arch=sm_120a)
   src/c_api.zig           exported C ABI surface
-  src/cuda/               driver bindings, streams, events, graphs, peer copy
+  src/hw/                 driver bindings, streams, events, graphs, peer copy (I-001)
+  src/bench/              hardware probe binary (I-002)
+  src/weights/            safetensors, config, manifest, quant, expert repack (I-003)
+  src/ref/                fp32 CPU reference = the GPU oracle (I-005)
   src/kernels/*.cu        CUDA kernels (sm_120a)
   src/model/              qwen4_exp graph: gdn, indexed attention, moe, hc, ple
   src/mem/                placement planner, expert cache, kv/state pool
@@ -109,6 +112,11 @@ THEORY.md PLAN-log.md ledger.jsonl configs/ best-config.json   (inference-optimi
 | L9 | batch/pack decode across sequences (continuous batching) | 2–4× cN | scheduler |
 
 ## 7. Issues (dependency order)
+
+Done: **I-001** build skeleton (gates green; probe sees 4 × 16.66 GB, driver
+610.57.04) · **I-004** oracle (240 golden tensors, transformers 5.24.0.dev0 @
+d8f10a8, tiny checkpoint in both HF and published-checkpoint layouts).
+Carried-forward reviewer suggestions: `.agents/tasks/reviewer-followups.md`.
 
 Wave 1 — foundation (parallel-safe, disjoint dirs):
 - **I-01** build skeleton: Cargo workspace + Zig static lib + nvcc pipeline + `tools/gate.sh` + hardware probe (device query, P2P, measured PCIe/GDDR bandwidth). Lane A.

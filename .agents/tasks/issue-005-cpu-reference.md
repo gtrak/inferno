@@ -27,8 +27,20 @@ and the rest of the engine becomes mechanical.
     **1094–1196 `NGramEmbedding`** · 1198–1272 `PLELayer`
   - 1274–1325 `DecoderLayer` · 1375–1520 `TextModel.forward`
 - Goldens: `tests/golden/tiny/` (produced by I-04) with the tensor names listed
-  in `.agents/tasks/issue-004-ref-trace.md` §3.
-- Builds on I-01/I-03 in the same worktree: `core/src/weights/{safetensors,config,manifest,quant}.zig`.
+  in `.agents/tasks/issue-004-ref-trace.md` §3. Read `tests/golden/README.md`
+  first, and `.agents/tasks/reviewer-followups.md` items 4–6 (they change how you
+  compare and what you may touch).
+- **Dependency note:** `core/src/weights/*` (issue I-003) is being written in a
+  *different lane* and is **not in your tree**. Do not create or modify
+  `core/src/weights/`. Instead write `core/src/ref/fixtures.zig`: a
+  self-contained reader for `tests/golden/tiny/config.json` (`std.json`) and
+  `tests/golden/tiny/checkpoint.safetensors` (8-byte little-endian header length
+  + JSON header + raw bytes; dtypes present are BF16/F32/I64). It should expose
+  `RefConfig` and a name→f32-tensor table. ~150 lines. A later issue consolidates
+  it with the weights layer.
+- You may add a `--greedy` mode to `tools/ref-trace/trace.py` (16 greedy tokens
+  from the golden input, `torch.set_num_threads(1)`) and commit
+  `tests/golden/tiny/greedy_ids.json` — nothing else in `tools/` is yours.
 - Everything is **f32**. `allocation` only at `init`; all buffers are sized from
   `Config` and owned by a `Scratch` struct passed by pointer.
 
@@ -37,6 +49,7 @@ and the rest of the engine becomes mechanical.
 ```
 core/src/ref/
   mod.zig          pub exports + Scratch allocator/init
+  fixtures.zig     self-contained tiny-config + safetensors reader (see dependency note)
   ops.zig          rmsnorm, rmsnorm_gated, silu, sigmoid, softmax, l2norm, matmul, gemv, embed_gather
   conv.zig         causal depthwise conv1d (+ state update, dilation variant)
   rope.zig         partial RoPE + mRoPE recomposition
