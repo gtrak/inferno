@@ -3,8 +3,11 @@
 `trace.py` produces per-activation goldens for the tiny fixture (240 tensors, one forward,
 kernel-validation scale). This tool produces the other kind of reference: **logits per
 position over a fixed prompt set**, which is what KL / ΔPPL / router-agreement need, and it
-works for any checkpoint the installed `transformers` can load — the tiny fixture today, the
-real 124 GB checkpoint on a quiet box once `io-probe` says the box can hold it.
+works for any checkpoint the installed `transformers` can load — the tiny random model today, and
+any full-precision checkpoint on a box that can hold it. It does **not** work for the published
+NVFP4 checkpoint: its `modelopt` quantiser is not in `transformers`, and the 123.5 GiB of weights do
+not fit this box's 63.7 GiB VRAM + ~55 GiB RAM. See REAL_REFERENCE.md §5.3–5.4 and
+`published_traces.py` for what replaced the real-model run.
 
 Three modes
 -----------
@@ -50,8 +53,9 @@ Examples
     python reference_trace.py io-probe --model ~/models/qwen38-flash-next-nvfp4 \
         --prompts prompts/quality-v1.json --out traces/real-io-probe.json
 
-    # the real reference, on a quiet box (see REAL_REFERENCE.md for the blockers it must clear)
-    python reference_trace.py generate --model ~/models/qwen38-flash-next-nvfp4 \
+    # a full-precision checkpoint on a box with the memory for it (NOT the published NVFP4 one:
+    # see REAL_REFERENCE.md §5.3; on this box use published_traces.py instead)
+    python reference_trace.py generate --model <full-precision-checkpoint> \
         --prompts prompts/quality-v1.json --positions 64 --dtype bfloat16 \
         --device-map auto --max-memory '{"cpu":"40GiB",0:"14GiB",1:"14GiB",2:"14GiB",3:"14GiB","disk":"80GiB"}' \
         --out traces/real-v1.safetensors

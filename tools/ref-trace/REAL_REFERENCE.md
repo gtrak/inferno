@@ -1,6 +1,6 @@
-# The real-model quality reference (I-031, part 1): generator, noise floor, feasibility
+# The real-model reference (I-031, parts 1–2): generator, noise floor, feasibility, published traces
 
-Three things live here:
+Four things live here:
 
 * **`reference_trace.py`** — runs HF `transformers` over a checkpoint for a fixed prompt set and a
   fixed number of positions and writes a *logits* trace (prompt ids, logits per position, greedy
@@ -8,12 +8,19 @@ Three things live here:
   loading a model or touching a GPU.
 * **`verify_reference_trace.py`** — proves the generator reproduces the committed goldens, and proves
   the bound refuses a *known* KL (non-vacuity).
-* **this file** — the noise-floor record, the regeneration recipe, and the measured feasibility note.
+* **`published_traces.py`** — part 2's ingestion path for the four *published* trace datasets that
+  replace a reference run this box cannot host: revision-pinned fetch, checksum verification against
+  each publisher's manifest, a KL reproduction, and the router-weight comparison that links the
+  routing traces to our checkpoint bit for bit. Writes only into `traces/` (gitignored).
+* **this file** — the noise-floor record, the regeneration recipe, the measured feasibility note, and
+  the provenance record for the published traces.
 
 Status: **the generator is built and proven on the tiny fixture. The real 124 GB trace has not been
-generated**, and §5.3 records a blocker that is not about GPU contention. No kernel, no oracle
-comparison, no `core/build.zig` and no committed fixture was changed; the only file this added under
-`tests/` is `tests/golden/tiny/noise_floor.json`.
+and cannot be generated on this box**, for capacity reasons recorded in §5.3 (not for GPU contention,
+and not because no engine can load the checkpoint — vLLM 0.34.0 can). Part 2 therefore ingests what
+was published instead; §5.4 records what each dataset is, what it can prove, and what it cannot. No
+kernel, no oracle comparison, no `core/build.zig` and no committed fixture was changed by either part;
+the only file this added under `tests/` is `tests/golden/tiny/noise_floor.json`.
 
 ---
 
@@ -252,54 +259,228 @@ but `--positions` is a direct multiplier, because each generated token is one mo
 it prints the call count and the transfer total without touching a GPU. And see 5.3: today the run
 cannot start at all.
 
-### 5.3 The blocker (this is the finding, not the timing)
+### 5.3 The blocker, corrected in part 2: the loader was not the wall, capacity is
 
-`transformers` at the pinned commit **cannot load this checkpoint at all**, quantised or not:
+Part 1 recorded the `transformers` refusal as *the* finding. That refusal is still exactly true —
+`AutoQuantizationConfig.from_dict` on the checkpoint's `quantization_config` raises
 
 ```
-config.json: "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", ...}
-AutoQuantizationConfig.from_dict(...) ->
-  ValueError: Unknown quantization type, got modelopt - supported types are:
-  ['awq','bitsandbytes_4bit','bitsandbytes_8bit','gptq','aqlm','quanto','quark','fouroversix',
-   'fp_quant','eetq','higgs','hqq','compressed-tensors','fbgemm_fp8','torchao','bitnet','vptq',
-   'spqr','fp8','gguf','nvfp4','mxfp8','auto-round','mxfp4','metal','sinq','gemma']
+ValueError: Unknown quantization type, got modelopt - supported types are: [...]
 ```
 
-There is no `modelopt` entry in `transformers.quantizers.auto.AUTO_QUANTIZER_MAPPING`, and no
-modelopt integration anywhere in the installed package (`grep -r modelopt` is empty). The closest
-entry, `nvfp4`, is not a way in: `quantizers/quantizer_nvfp4.py` is a *post-training* quantiser for
-full-precision checkpoints — `validate_environment` raises
-`"Loading pre-quantized NVFP4 checkpoints is not supported yet"`, requires `kernels`, requires CUDA,
-supports exactly one CUDA device, and states `"NVFP4 quantization does not support CPU or disk
-offload"`. So even rewriting `quant_method` to `nvfp4` would be refused, and offload is precisely
-what this box needs.
+— but it was the wrong wall to stop at, and part 1's conclusion that the reference "needs
+`nvidia-modelopt` … or a second weight-streaming engine" undersold the one route that actually
+exists. The model card names vLLM as the supported engine, and vLLM 0.34.0 (measured in a scratch
+venv: `torch 2.14.0+cu130`) registers all three Qwen4Exp architectures and the checkpoint's
+quantiser:
 
-And the fallback the issue already ruled out is ruled out by arithmetic too: materialising bf16 costs
-**236.8 GiB**, against 118.2 GiB of VRAM + available RAM and 95 GiB of free disk — it does not fit in
-memory *or* on disk, and 102.4 GiB of that is the PLE n-gram table, which is gather-only (16 rows per
-token) and would be re-read or re-mapped in its entirety by HF's `nn.Embedding` path.
+```
+vllm 0.34.0 torch 2.14.0+cu130
+supported archs: 426
+Qwen4Exp present: ['Qwen4ExpForCausalLM', 'Qwen4ExpForConditionalGeneration', 'Qwen4ExpMTP']
+quant methods: [..., 'modelopt', 'modelopt_fp4', 'modelopt_mixed', ...]
+```
 
-Consequences, for the decision that belongs to the orchestrator and not to this lane:
+So "no Python engine can load this checkpoint" is false. What is true is arithmetic:
 
-1. **The "run HF over the real checkpoint once and cache it" plan does not survive contact with the
-   loader.** It needs either (a) `nvidia-modelopt` installed into the reference venv and a confirmed
-   offload path (its own `validate_environment` behaviour under `device_map` with CPU/disk tiers is
-   unverified), (b) a dequant-on-load weight provider feeding the HF *model classes* — which means
-   writing a second weight-streaming engine, against the spirit of "the reference is HF", and still
-   does not fit in bf16, or (c) a bf16 copy of the checkpoint on a bigger box (236.8 GiB weights +
-   working set; this box is 60/66 by construction).
-2. **Everything else in I-031 can proceed on a random-weight checkpoint of the real shape.** The KL /
-   ΔPPL / router-agreement / per-layer-RMS machinery, its thresholds, and the FP8-KV-vs-BF16-KV
-   experiment do not need the published weights: a medium random Qwen4Exp checkpoint (real config, a
-   fraction of the layers so it fits in RAM in fp32) is a *better-controlled* instrument for a
-   precision study, and its noise floor is measurable today. `reference_trace.py` runs it unchanged —
-   `--model <dir> --prompts ... --positions ...` — with the real prompt ids, since `prompts/quality-v1.json`
-   only requires vocab ≤ 248,320.
-3. If the number that must be quoted on the *published* weights is ΔPPL on a fixed text set, that
-   can come from our own engine plus the I-018 acceptance runs (needle at 50 %/100 % context, chat +
-   tools round-trip), which need no HF oracle at all. What cannot be replaced is a *per-position KL
-   against HF on the published weights* — and that is the one this lane can currently neither produce
-   nor measure.
+| quantity | value | source |
+|---|---:|---|
+| checkpoint on disk | 123.53 GiB (132.73 GB), 299,545 tensors | safetensors headers |
+| VRAM, four GPUs | 63.7 GiB | `nvidia-smi` |
+| RAM available | 54.5 GiB | `/proc/meminfo` |
+| vLLM `--cpu-offload-gb` capacity | pinned host memory — it cannot swap | vLLM's offload path |
+
+123.53 GiB of weights do not fit in 118.2 GiB of VRAM + RAM, and the shortfall is structural, not a
+tuning knob: TP=4 shards the routed experts across GPUs (65.63 GiB / 4 = **16.4 GiB per GPU**, more
+than the 15.9 GiB a 16 GB card actually offers) before any dense weight, PLE table or KV cache is
+placed. No placement of this checkpoint fits this box, so an independent *run* of the published
+NVFP4 weights is unavailable here. §5.4 is what replaced it.
+
+The same arithmetic rules out the sibling FP8 checkpoint the card benchmarks against
+(`Qwen/Qwen3.8-Flash-Next-FP8`): it is **185.56 GB (172.82 GiB) in 144 files**, against 82–91 GB of
+free disk on this box during this work — the download alone needs ~2x the free space. Its *loader*
+is fine: `transformers` 5.24 dispatches its `quant_method: fp8` / `weight_block_size: [128,128]`
+config to `FineGrainedFP8Config`, and vLLM knows the architecture. That route is closed by disk and
+memory, not by software, and it is recorded here so the next person does not discover it from a
+failed 186 GB download.
+
+**Dtype facts from the model card, because they change what a reference would even be.** Only the
+routed MoE experts in the main language model are NVFP4 (W4A4, group 16, MSE-calibrated scales).
+Attention layers, shared experts and the other main-model layers remain **BF16**; the MTP routed
+experts are **128×128 block-scaled FP8**; the PLE n-gram table is **per-tensor FP8**. Anything that
+assumes "the checkpoint is FP4" would be wrong about 7 GiB of dense weights, the 47.7 GiB PLE table
+and the 2.7 GiB MTP module.
+
+**What part 1 got right and part 2 kept:** the `transformers` path is still shut, and materialising
+bf16 is still 236.8 GiB against 118.2 GiB of VRAM+RAM — so a *from-scratch* HF reference remains
+impossible on this box for a second, independent reason. The random-weight fixture route (item 2
+below) is still the right instrument for threshold-setting; what §5.4 adds is a way to measure a
+real model's behaviour without running one.
+
+### 5.4 Published traces: what exists, what it proves, what it does not
+
+Four datasets were ingested with `published_traces.py`. Every artefact is fetched at a **pinned
+dataset revision** and checked against the publisher's own manifest before it is used; all four
+blocks below distinguish what the publisher *states* from what it leaves unsaid, because a trace is
+only a reference to the extent those gaps are known.
+
+First, the baseline this all hangs off: **our local copy is the published file.** `sha256sum` of all
+13 LFS-backed files under `~/models/qwen38-flash-next-nvfp4` matches the Hub's LFS oids exactly
+(132.7 GB, 0 failures, `traces/published/nvfp4-local-vs-published-sha256.json`), so the model card's
+statements about the published checkpoint describe the bytes on this box, not a lookalike.
+
+| dataset | revision | size | what it is | what it cannot do |
+|---|---:|---|---|---|
+| `Vemloir/Qwen3.8-Flash-Next-traces` | `26fdf6eddae7` | 0.38 GiB | calibration **inputs** (`input_ids` + `lengths`) generated by the model itself | no logits, no activations: cannot grade anything |
+| `satsder/qwen3.8-flash-next-routing-traces` | `6e29444b7472` | 45.85 GiB (one `.7z`) | llama.cpp-branch hidden/router/expert dumps, 85 request dirs | not downloaded (49.2 GB + 54.4 GB extracted); model/tokeniser identity uncertified |
+| `jyohukuchan/qwen38-flash-next-bf16-logits` | `5294aa9ab94b` | 78.82 GiB | **BF16 reference logits** from exllamav3, 21 cases / 32,359 positions | max 4,097 positions, no states/router ids, and a documented cross-engine disagreement |
+| `aswinkumar99/qwen3.8-flash-next-expert-traces` | `13969e686ba0` | 1046 GiB | FreeToken traces: top-10 experts per token per layer, top-32 logits, 5-tap states, LM-head top-8 | 5 taps only in `compact/`, no full-vocab logits, different publisher's NVFP4 export |
+
+#### Vemloir: a calibration input set, not a reference
+
+Measured from the safetensors headers: **only `input_ids` (int64, right-padded with 0) and
+`lengths` (int64)**, plus `mm_len`/`mm_row`/`mm_start` and raw `mm_image_*` bytes in the multimodal
+part. No logits and no hidden states anywhere in the three parts.
+
+| part | `input_ids` | rows | tokens (min / max / mean) |
+|---|---|---:|---|
+| agents | `[40, 200863]` | 40 | 8,669 / **200,863** / 49,978 |
+| chat | `[700, 43460]` | 700 | 88 / 43,460 / 3,892 |
+| multimodal | `[105, 10349]` | 105 | 341 / 10,349 / 2,628 |
+
+Provenance: generated by Qwen3.8-Flash-Next itself, served as `nvidia/Qwen3.8-Flash-Next-FP4-Local`
+in vLLM (card), at four reasoning levels. **Not stated:** the model revision, a tokeniser file or
+hash, and there are no outputs. What it *is* good for: 200k-token prompt ids from the model's own
+distribution, for the long-context path, where the only other published artefacts stop at 4k.
+
+#### satsder: per-token, per-layer expert ids — but not fetched, and not certified
+
+The routing record is documented (in `DATASET_INFO/README.md`, Chinese) as:
+
+* `experts.csv`: `graph_id,split_id,layer,tensor,token_row,rank,expert_id,sched_id` — **yes, expert
+  ids at token × layer × rank granularity**;
+* `router/rl_*.bin` / `rp_*.bin`: 512 float32 gate logits (2,048 bytes per single-token file), and
+  **only for single-token graphs**, so not the full prefill;
+* `hidden/hidden_meta.csv`: F32 `[2560, 1, nt]` hidden states, and `tokens.csv` token ids.
+
+The archive is 49,235,820,003 bytes → 50.69 GiB uncompressed across **4,158,067 files**, against
+82–91 GB free: downloading plus extracting it would consume both, so it was **not** fetched. Its
+provenance is the weakest of the four: a locally modified llama.cpp branch, context 4,096, Q8 KV,
+16 generated tokens, no launch/exit manifest for the `collect-*` batches, and the publisher states
+the records are not enough to bind every batch to a certified model/tokeniser/collector snapshot.
+A dead end worth recording, with the size that makes it one.
+
+#### jyohukuchan: the only artefact here that can grade an output
+
+**BF16 logits of the official `Qwen/Qwen3.8-Flash-Next` at revision `de4b8e4d43b9…`, produced by
+exllamav3 (BF16 weights), FP32 raw pre-softmax rows, temperature 1, one streamed forward per case.**
+21 cases / 32,359 positions, 32.14 GB of FP32 on the Hub:
+
+| group | cases | shapes (rows × 248,320) |
+|---|---|---|
+| mtp-bench | 11 | 55, 129×2, 257×3, 513×2, 1,025, **4,097×2** |
+| WikiText-2 | 10 | 2,103 rows each = 2,048 scored tokens behind a 55-token chat-template prefix |
+
+Measured from the manifests: every case carries `positions`, `nonfinite_count` (all **0**),
+`input_token_ids_sha256`, and `corpus/all-cases.json` publishes the exact `token_ids` — so the input
+side is authoritative and checkable. Candidates: `candidate-xestrata` (EXL3 3.05 bpw, all 21 cases)
+and `candidate-turboderp-exl3-3.05bpw` (WikiText-2 only, prefix rows removed).
+
+Exact file sizes, measured: `manifest.json` 10,476 B; `reference/manifest.json` 311,791 B;
+`candidate-xestrata/manifest.json` 311,759 B; `candidate-turboderp-exl3-3.05bpw/manifest.json`
+196,277 B; `corpus/all-cases.json` 184,870 B. One case is `rows × 248,320 × 4` bytes — 128,133,120 B
+for the 129-position `en_prose_129`, 2,088,867,840 B for a WikiText-2 row — so a single case plus
+the metadata is ~2 GB, which is what this lane fetched; the other 75 GiB stayed on the Hub.
+
+Two measured facts pin the ingestion down:
+
+* **We reproduce the publisher's own number.** `published_traces.py kl --case wiki2_r0` re-derives
+  KL(reference ‖ XeStrata) in float64 over the 248,077 valid ids: **0.4667382507872193** against the
+  published **0.4667382507871942** (2.5e-14 apart), top-1 agreement 0.85986328125 identical. The
+  WikiText-2 headline 0.1587 in the card is the mean over the ten rows; row 0 is the outlier.
+* **The existing metrics run on it unchanged.** Converting `en_prose_129` with
+  `published_traces.py to-trace` gives a `p0/prompt_ids` + `p0/prompt_logits` safetensors file;
+  `reference_trace.distribution_metrics` then reports KL mean 0.074203, p50 0.043729, p99 0.354432,
+  argmax agreement 0.852713, ΔPPL 321.68 — and the publisher's `results/kl-xestrata-vs-bf16.json`
+  has en_prose_129 at exactly 0.074203 / 0.852713.
+
+**The caveat that matters more than any of that:** the publisher rejected `transformers` 5.20.2
+`qwen4_exp` as a reference engine — KL 3.2 (reference vs transformers) / 4.1 (reverse), top-1
+agreement 0.3101, next-token accuracy 0.234 against exllamav3's 0.516 on the same inputs
+(`results/engine-crosscheck.json`). Two independent implementations of this architecture do not
+agree by default. **A KL gate against this trace measures engine disagreement first and
+quantisation second**, and the publisher's own candidate-path noise floor (CPU-expert vs GPU-expert
+path) is KL **0.0149** — 30x the BF16-vs-BF16 thread noise of the tiny fixture and the correct scale
+for any threshold derived from this dataset.
+
+#### aswinkumar99: real-text routing, and the weight-level link to our checkpoint
+
+**FreeToken 0.1.2 (branch `expert-trace-study`) traces of `RadixArk/Qwen3.8-Flash-Next-NVFP4`**, a
+different publisher's NVFP4 export with the same recipe (routed experts only, group 16, routers
+excluded from quantisation and kept BF16 with no bias). 18 raw runs (1,046 GiB total), plus a
+`compact/` training set: **2,222,925 decode rows in 98.1 GB**, per row
+
+| array | dtype | shape | meaning |
+|---|---|---|---|
+| `experts.npy` | int16 | `[rows, 48, 10]` | routed top-10 expert ids, rank order |
+| `gates.npy` | float16 | `[rows, 48, 10]` | renormalised gate weights |
+| `logit_idx.npy` / `logit_val.npy` | int16 / float16 | `[rows, 48, 32]` | top-32 router ids and logits |
+| `taps.npy` | float16 | `[rows, 5, 2560]` | hidden state at probes 0/12/24/36/47 |
+| `stats.npy` | float16 | `[rows, 5, 48]` | entropy, top-10 mass, norms |
+| `token_id.npy` etc. | int32 | `[rows]` | exact input id, request, position |
+
+The raw `trace.bin` format (v3) additionally records `token_id`, `prev_token_ids[3]` and
+**`ple_hash_ids[16]`** per token — the actual PLE table rows the model gathered, which is a direct
+oracle for the n-gram id derivation I-011 has only ever seen on the tiny fixture.
+
+Fetched here: `compact/batch-001/{experts,gates}.npy` 455,474,048 B each, `token_id.npy` 1,897,936 B,
+`diagnostic/router_weights.npz` 309,433,101 B (56 tensors: the 48 gates, three hyper-connection
+mixers and their MTP counterparts, all fp32), plus the manifests and `manifest.jsonl` (18 runs).
+The remaining 1 TB of `trace.bin` / `taps.npy` / heads was not fetched.
+
+**The provenance link was measured, not assumed.** `published_traces.py router` compares the
+published `diagnostic/router_weights.npz` with our checkpoint's unquantised weights:
+
+```
+48/48 gate matrices bit-identical, worst max|diff| 0.0
+  hc_norm.weight: bit_equal True max|d| 0.0
+  input_mix_weight_down.weight: bit_equal True max|d| 0.0
+  input_mix_weight_up.weight: bit_equal True max|d| 0.0
+```
+
+So RadixArk's routers and hyper-connection mixers are the same tensors as NVIDIA's, bit for bit:
+`W_l @ x` with our weights is their router, and a top-10 computed from a *matching hidden state* is
+the same top-10. What is **not** established is that the NVFP4 expert weights are identical between
+the two exports — so the traces are a router/weight oracle, not proof that the whole forward agrees.
+
+**And the recorded router output reproduces from those weights.** `published_traces.py router-trace`
+recomputes `W_l @ x` for the first 64 rows of `compact/batch-001` out of the recorded five taps and
+our own gate matrices, then compares against the recorded top-32 logits (after the recorder's per-row
+max shift) and the executed top-10:
+
+| layer | top-10 set overlap | exact rank order | max abs logit diff | mean abs logit diff |
+|---|---:|---:|---:|---:|
+| 0 | 0.9906 | 0.672 | 0.02214 | 0.00753 |
+| 12 | 0.9969 | 0.672 | 0.02282 | 0.00771 |
+| 24 | 0.9891 | 0.734 | 0.02325 | 0.00725 |
+| 36 | 0.9859 | 0.547 | 0.02311 | 0.00774 |
+| 47 | 0.9859 | 0.484 | 0.02664 | 0.00819 |
+
+The mean logit difference **0.0072–0.0082** is exactly the "~0.008, pure bf16 GEMV accumulation
+noise" the publisher reports, recomputed independently here. The top-10 *set* survives; the *rank
+order* does not (0.48–0.73 exact), because near-tie margins are inside that noise. **Gate router
+agreement on set overlap, never on rank order** — and on a real cross-machine replay the publisher
+measured **95.7% mean top-10 set agreement** (100% on the same machine), with 25% of router margins
+inside 0–2 bf16 ulps. That is the floor under any router-agreement gate built on this dataset.
+
+#### The question that decides the long-context path
+
+**None of the four gives 262,144-token behaviour.** The longest logits case is **4,097 positions**
+(two mtp-bench cases), WikiText-2 is 2,048 scored positions, satsder's context is 4,096, and
+aswinkumar99's runs are long-document prompts traced at per-token decode granularity, not at full
+context. Vemloir has 200,863-token *inputs* but no outputs at all. So the published material can
+validate short-context numerics and router behaviour; the 262,144-token path has no external
+reference and must be gated on the engine's own consistency (I-018) plus the CPU reference.
 
 ## 6. How to regenerate everything
 
@@ -325,33 +506,46 @@ $PY reference_trace.py io-probe --model ~/models/qwen38-flash-next-nvfp4 \
     --prompts prompts/quality-v1.json --positions 64 --read-mib 2048 --read-streams 4 \
     --load-shard model-00002-of-00010.safetensors --out traces/real-v1-io-probe.json
 
-# 5. the real reference — ONLY once §5.3 is resolved, on a quiet box, with the blockers cleared
-$PY reference_trace.py generate --model ~/models/qwen38-flash-next-nvfp4 \
-    --prompts prompts/quality-v1.json --positions 64 --dtype bfloat16 --threads 1 \
-    --tokenizer ~/models/qwen38-flash-next-nvfp4 --low-cpu-mem-usage \
-    --device-map auto --max-memory '{"cpu":"40GiB",0:"14GiB",1:"14GiB",2:"14GiB",3:"14GiB","disk":"80GiB"}' \
-    --out traces/real-v1.safetensors
-# and the twice-run floor, same prompt set, one model load (mode `noise-floor`):
-$PY reference_trace.py noise-floor --model ~/models/qwen38-flash-next-nvfp4 \
-    --prompts prompts/quality-v1.json --positions 64 --dtype bfloat16 \
-    --tokenizer ~/models/qwen38-flash-next-nvfp4 --low-cpu-mem-usage \
-    --device-map auto --max-memory '{"cpu":"40GiB",0:"14GiB",1:"14GiB",2:"14GiB",3:"14GiB","disk":"80GiB"}' \
-    --out-report traces/real-v1-noise-floor.json
+# 5. the real reference is NOT runnable on this box (§5.3): 123.53 GiB of weights against
+#    63.7 GiB VRAM + 54.5 GiB RAM. Do not start the 186 GB FP8 download either.
+
+# 6. published traces instead (no model load, no GPU; downloads land in traces/, gitignored)
+$PY published_traces.py inspect      # writes traces/published/provenance.json
+$PY published_traces.py verify       # sha256 every downloaded file against its manifest
+$PY published_traces.py kl --case wiki2_r0                 # reproduces the publisher's KL to 2.5e-14
+$PY published_traces.py router --model ~/models/qwen38-flash-next-nvfp4   # 48/48 gates bit-identical
+$PY published_traces.py router-trace            # recorded top-10 reproduces from the recorded taps
+$PY published_traces.py to-trace --case en_prose_129 \
+    --out traces/published/en_prose_129.safetensors          # then reference_trace.distribution_metrics
 ```
 
 `traces/` is gitignored: a real trace is >1 GiB and regenerable, so it is never committed. The
-committed artefacts of this issue are `prompts/*.json`, `tests/golden/tiny/noise_floor.json`, the two
-scripts and this note.
+committed artefacts of this issue are `prompts/*.json`, `tests/golden/tiny/noise_floor.json`, the
+three scripts (`reference_trace.py`, `verify_reference_trace.py`, `published_traces.py`) and this
+note.
 
 ## 7. What this lane did **not** do
 
-* No real-checkpoint trace, and no real-checkpoint noise floor: not run, not even a load. §5.3 is why.
-* No GPU work of any kind: `io-probe` reads headers, `/proc/meminfo` and `nvidia-smi` only. The
-  compute term in §5.2 is arithmetic on the reference's loop structure, not a measurement.
-* No real-model noise floor, so the numbers in §4 are *tiny-fixture* numbers. The published-weight
-  reference's floor will be larger in absolute terms (bf16 logits, 248k vocab) and must be measured
-  with the same command when the loader exists.
-* No I-031 metric test under `zig build test` (that is part 2), no change to any kernel tolerance,
-  oracle comparison, `core/build.zig`, or committed fixture.
+* No real-checkpoint trace and no real-checkpoint noise floor. §5.3 is why: not the loader (vLLM
+  0.34.0 would take it), but 123.53 GiB of weights against 118.2 GiB of VRAM + RAM.
+* No GPU work of any kind. `io-probe` reads headers, `/proc/meminfo` and `nvidia-smi`; the vLLM
+  capability check imported the package and queried its registry without initialising CUDA; the
+  published traces were ingested on CPU. The compute term in §5.2 remains arithmetic on the
+  reference's loop structure, not a measurement.
+* No full download of the `satsder` routing archive (45.85 GiB compressed, 50.69 GiB extracted,
+  4.16 M files) or of the FP8 checkpoint (185.56 GB). Both sizes are measured and recorded above;
+  neither fits the free disk.
+* No byte-for-byte comparison of our PLE n-gram table against `Qwen/Qwen3.8-Flash-Next-FP8`. The
+  FP8 table has the same 128 shards of `[2500012, 160]` F8_E4M3 and the same 51,200,245,760 data
+  bytes as ours (headers measured), and the model card states they are byte-identical, but the
+  51.2 GB range-fetch needed to prove it was not run: HF delivered 17.6 MB/s on one stream and
+  33.8 MB/s on eight, i.e. ~25–50 minutes. That is the cheapest remaining provenance check.
+* No real-model noise floor of our own, so the numbers in §4 remain *tiny-fixture* numbers. For the
+  published logits the publisher's own floors apply instead: cross-engine KL 3.2/4.1 and top-1
+  0.31 (transformers vs exllamav3), candidate-path KL 0.0149. For routing, the measured floor is the
+  one in §5.4: mean |Δlogit| 0.0072–0.0082 from bf16 GEMV accumulation, 0.986–0.997 top-10 set
+  overlap on one machine, and 95.7% across machines.
+* No I-031 metric test under `zig build test`, no change to any kernel tolerance, oracle
+  comparison, `core/build.zig`, or committed fixture.
 * No edit to `run.sh`'s unpinned `transformers` install, even though it currently cannot bootstrap a
   venv that matches the fixtures (§1).
