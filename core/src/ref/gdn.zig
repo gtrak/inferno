@@ -531,7 +531,10 @@ fn load_head(
 }
 
 /// Chunked gated delta rule: one pass of the UT transform per chunk.
-fn gated_delta_rule_chunked(
+///
+/// `pub` so a kernel test can drive the same scan from `scratch` with the
+/// dtype-rounded inputs the kernel reads, instead of only through `forward`.
+pub fn gated_delta_rule_chunked(
     tokens: u32,
     scratch: *Scratch,
     config: *const fixtures.RefConfig,
@@ -810,7 +813,10 @@ fn solve_lower_unit(
 }
 
 /// Recurrent gated delta rule, the decode-time form.
-fn gated_delta_rule_recurrent(
+///
+/// `pub` for the same reason as the chunked form above: a kernel test feeds it
+/// the dtype-rounded inputs the kernel reads.
+pub fn gated_delta_rule_recurrent(
     tokens: u32,
     scratch: *Scratch,
     config: *const fixtures.RefConfig,

@@ -240,6 +240,7 @@ test {
     _ = @import("hw/pcie_link.zig");
     _ = @import("hw/bench.zig");
     _ = @import("hw/kernel.zig");
+    _ = @import("kernels/gdn.zig");
     _ = @import("weights/safetensors.zig");
     _ = @import("weights/config.zig");
     _ = @import("weights/manifest.zig");
