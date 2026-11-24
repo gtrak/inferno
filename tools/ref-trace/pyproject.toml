@@ -1,0 +1,19 @@
+[project]
+name = "ref-trace"
+version = "0.1.0"
+description = "HF reference traces and tiny random-weight Qwen4Exp checkpoints (inferno oracle)"
+requires-python = ">=3.13"
+dependencies = [
+    "torch",
+    # The reference implementation of Qwen4Exp only exists on transformers main.
+    "transformers @ git+https://github.com/huggingface/transformers",
+    "safetensors",
+    "numpy",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
