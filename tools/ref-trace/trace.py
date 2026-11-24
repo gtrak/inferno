@@ -4,9 +4,14 @@ Everything here is produced by the reference implementation itself (see `capture
 run is self-checking: the patched model must reproduce the unpatched model's logits
 bit-exactly for both the 12-token prefill and the 1-token decode step, otherwise nothing is
 written.
+
+`--greedy` writes `tests/golden/tiny/greedy_ids.json` instead: the 16 token ids the
+reference produces by greedy decoding from the same prompt. That file is the
+greedy-equivalence gate for the CPU reference (I-005) and every later GPU path.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -21,6 +26,9 @@ GOLDEN = ROOT.parent.parent / "tests" / "golden" / "tiny"
 
 # Literal token ids (vocab_size is 256) so the trace never depends on a tokenizer.
 INPUT_IDS = [13, 4, 199, 42, 7, 88, 211, 30, 96, 155, 61, 240]
+
+# Greedy tokens the CPU reference must reproduce exactly (`--greedy` mode).
+GREEDY_TOKENS = 16
 
 
 def contract_names(config):
@@ -78,6 +86,40 @@ def _record_states(recorder, cache, config, prefix):
                 continue
             recorder.put(f"layer{layer}/gdn/conv_state", cache.get_conv_state(layer, state_idx=0))
             recorder.put(f"layer{layer}/gdn/recurrent_state", cache.get_recurrent_state(layer, state_idx=0))
+
+
+def greedy():
+    """Write the 16-token greedy continuation the CPU reference has to reproduce."""
+    torch.set_num_threads(1)
+    model = Qwen4ExpForCausalLM.from_pretrained(GOLDEN, dtype=torch.float32, _attn_implementation="eager")
+    model.eval()
+    input_ids = torch.tensor([INPUT_IDS], dtype=torch.long)
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=GREEDY_TOKENS,
+            do_sample=False,
+            use_cache=True,
+            eos_token_id=None,
+            pad_token_id=0,
+        )
+    generated = [int(t) for t in out[0, input_ids.shape[1] :].tolist()]
+    if len(generated) != GREEDY_TOKENS:
+        raise AssertionError(f"expected {GREEDY_TOKENS} generated ids, got {len(generated)}")
+    version, commit = provenance.transformers_provenance()
+    document = {
+        "input_ids": INPUT_IDS,
+        "generated_ids": generated,
+        "max_new_tokens": GREEDY_TOKENS,
+        "transformers_version": version,
+        "transformers_sha": commit,
+        "torch_version": torch.__version__,
+        "num_threads": 1,
+        "note": "greedy argmax, no sampling, no eos stop; compare exactly, token for token",
+    }
+    path = GOLDEN / "greedy_ids.json"
+    path.write_text(json.dumps(document, indent=2) + "\n")
+    print(f"wrote {path}: {generated}")
 
 
 def main():
@@ -151,4 +193,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--greedy" in sys.argv[1:]:
+        greedy()
+    else:
+        main()

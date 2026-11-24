@@ -1,0 +1,40 @@
+{
+  "input_ids": [
+    13,
+    4,
+    199,
+    42,
+    7,
+    88,
+    211,
+    30,
+    96,
+    155,
+    61,
+    240
+  ],
+  "generated_ids": [
+    169,
+    252,
+    39,
+    151,
+    132,
+    239,
+    223,
+    20,
+    198,
+    120,
+    47,
+    121,
+    121,
+    144,
+    96,
+    19
+  ],
+  "max_new_tokens": 16,
+  "transformers_version": "5.24.0.dev0",
+  "transformers_sha": "d8f10a82213a3a9db48385aba3a4b57ab535de50",
+  "torch_version": "2.15.0+cpu",
+  "num_threads": 1,
+  "note": "greedy argmax, no sampling, no eos stop; compare exactly, token for token"
+}
