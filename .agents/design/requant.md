@@ -113,8 +113,9 @@ revertible without re-downloading.
 - One offline pass, `tools/requant`, reading 76.5 GB and writing ~66 GB; I/O
   bound, tens of minutes. Output is our own shard format + manifest, cached next to
   the checkpoint; **never converted at startup**.
-- Disk: 132 GB original + ~66 GB converted ≈ 198 GB of 244 GB free (checked before
-  writing; refuse to start if it would leave < 20 GB).
+- Disk (measured after the download completed): 122 GB free with the 133 GB original
+  in place. A ~66 GB converted copy therefore fits with ~56 GB spare; the converter
+  must check free space first and refuse to start if it would leave < 20 GB.
 - Determinism: the converter must be bit-reproducible (fixed rounding: RNE to the
   target grid) so a rebuilt artefact is byte-identical — asserted by hashing.
 - The converted weights are validated by re-running the **manifest** gate
