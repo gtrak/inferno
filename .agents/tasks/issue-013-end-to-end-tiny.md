@@ -58,3 +58,31 @@ It must print and assert:
 Implemented / Changed files / Validation (the three checks, verbatim) / Open risks
 (any place the GPU path and the oracle disagree in a way you had to investigate) /
 Recommended next step.
+
+## Resume state (2026-11-24, first attempt timed out at 90 min)
+
+The first attempt did **not** hang — it spent the full budget on design and scaffolding and
+died mid-`core/src/model/load.zig`. Work that exists in the worktree and is worth keeping:
+
+| file | lines | state |
+|---|---|---|
+| `core/src/model/plan.zig` | 78 | execution plan, appears complete |
+| `core/src/model/glue.cu` | 262 | layer wiring kernels |
+| `core/src/model/glue.zig` | 856 | host side; **fails `zig fmt --check`** |
+| `core/src/model/load.zig` | 385 | written last, never compiled |
+
+Also decided during that attempt and worth not re-deriving: the tiny config has
+`rotary_dim=8`, `index_dim=16`, so rope halves do not match the production shape —
+`validateMisc` must not assume the 2560/256/0.25 production ratios.
+
+**What remains, in order:**
+1. `zig fmt core/src/model/glue.zig` and get the whole tree to compile
+   (`bash tools/gate.sh` currently fails at the first step, `zig fmt --check`).
+2. `_ = @import("model/...zig");` — one line in `core/src/c_api.zig`'s merged test block.
+3. The end-to-end test: 16 tokens, assert `expectEqualSlices` against
+   `tests/golden/tiny/greedy_ids.json`, both full-recompute and incremental-cache paths.
+4. Match the ids. If they mismatch, bisect per layer against the trace tensors and report
+   the first divergence — do not adjust a kernel to make ids agree.
+
+If this times out again, the next attempt should be given a **2.5 h budget** and start at
+item 1, not at design: 1,581 lines of wiring already exist.
