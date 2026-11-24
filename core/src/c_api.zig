@@ -243,6 +243,8 @@ test {
     _ = @import("weights/config.zig");
     _ = @import("weights/manifest.zig");
     _ = @import("weights/quant.zig");
+    _ = @import("hw/kernel.zig");
+    _ = @import("kernels/gemm.zig");
 }
 
 test "inferno_version is a NUL terminated C string" {

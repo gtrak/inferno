@@ -17,6 +17,9 @@ const std = @import("std");
 /// `DriverVersion`) through this one module import.
 pub const cuda_driver = @import("cuda_driver.zig");
 const cuda_context = @import("cuda_context.zig");
+const gemm = @import("gemm.zig");
+/// Public so the probe binary can name the peak record and its matrix size.
+pub const gemm_peak = @import("gemm_peak.zig");
 const pcie_link = @import("pcie_link.zig");
 
 const assert = std.debug.assert;
@@ -79,14 +82,16 @@ extern "c" fn memcpy(
     bytes: usize,
 ) *anyopaque;
 
-pub const ProbeError = cuda_driver.DriverError || error{
-    too_many_devices,
-    out_of_memory,
-    impossible_timing,
-    timer_unsupported,
-    thread_count_unavailable,
-    vram_leak,
-};
+pub const ProbeError = cuda_driver.DriverError ||
+    gemm_peak.Error ||
+    error{
+        too_many_devices,
+        out_of_memory,
+        impossible_timing,
+        timer_unsupported,
+        thread_count_unavailable,
+        vram_leak,
+    };
 
 /// Direction of a staged copy, i.e. which side holds the pinned buffer.
 const StagedDirection = enum { host_to_device, device_to_host };
@@ -131,6 +136,9 @@ pub const Report = struct {
     cpu_count: u32,
     host_device_latency_us: [device_count_max]f64,
     vram_leak_bytes: [device_count_max]u64,
+    /// Tensor throughput of the four prefill GEMM kernels at M=N=K=4096.
+    /// THEORY.md §3's prefill ceiling is stated against these.
+    gemm_peak_tflops: gemm_peak.Peaks,
 };
 
 /// The probe's live state: measured data plus the contexts it must release.
@@ -175,6 +183,29 @@ pub const Probe = struct {
         try probe.measure_aggregate_h2d();
         try probe.measure_host();
         try probe.measure_host_device_latency();
+    }
+
+    /// Measures the prefill GEMM peaks on GPU0 from an embedded cubin image.
+    ///
+    /// The probe binary owns the cubin table (it is compiled from the same
+    /// `src/kernels` directory), so the caller passes the bytes in rather than
+    /// this module knowing how the build embeds them.
+    pub fn measure_gemm_peaks(probe: *Probe, cubin: []const u8) ProbeError!void {
+        assert(probe.report.device_count > 0);
+        assert(cubin.len > 0);
+
+        try probe.contexts[0].set_current();
+        const stream = try cuda_context.Stream.create();
+        defer stream.destroy();
+        const kernels = try gemm.Kernels.init(cubin);
+        defer kernels.deinit();
+
+        probe.report.gemm_peak_tflops = try gemm_peak.measure(
+            std.heap.page_allocator,
+            &kernels,
+            &stream,
+        );
+        assert(probe.report.gemm_peak_tflops.nvfp4_mma > 0);
     }
 
     /// Asserts that the device allocations were all returned to the driver.
@@ -224,6 +255,12 @@ pub const Probe = struct {
             probe.report.devices[index] = devices[index];
         }
 
+        probe.report.gemm_peak_tflops = .{
+            .bf16 = 0,
+            .fp8 = 0,
+            .nvfp4_mma = 0,
+            .nvfp4_dequant_bf16 = 0,
+        };
         probe.report.cuda_api_version = try cuda_driver.cuda_api_version();
         probe.report.driver_version = cuda_driver.DriverVersion.unknown();
         cuda_driver.display_driver_version(

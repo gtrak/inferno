@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const bench = @import("hw");
+const gemm_peak = bench.gemm_peak;
 const cuda_driver = bench.cuda_driver;
 
 const assert = std.debug.assert;
@@ -126,6 +127,19 @@ fn render_document(
         ",\n  \"aggregate_h2d_bytes_per_device\":{d}",
         .{bench.aggregate_bytes_per_device},
     );
+    // Tensor peaks: measured, not guessed, so THEORY.md §3's prefill ceiling
+    // and the per-kernel ratios in the GEMM harness both have one basis.
+    try writer.writeAll(",\n  \"gemm_peak_tflops\":{");
+    try writer.writeAll("\"bf16\":");
+    try write_number(report.gemm_peak_tflops.bf16, writer);
+    try writer.writeAll(",\"fp8\":");
+    try write_number(report.gemm_peak_tflops.fp8, writer);
+    try writer.writeAll(",\"nvfp4_mma\":");
+    try write_number(report.gemm_peak_tflops.nvfp4_mma, writer);
+    try writer.writeAll(",\"nvfp4_dequant_bf16\":");
+    try write_number(report.gemm_peak_tflops.nvfp4_dequant_bf16, writer);
+    try writer.print(",\"side\":{d}", .{gemm_peak.side});
+    try writer.writeAll("}");
     try writer.writeAll(",\n  \"host\":{\"memcpy_gib_s\":");
     try write_number(report.host_memcpy_bw_gib_s, writer);
     try writer.print(

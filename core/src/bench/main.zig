@@ -10,6 +10,7 @@ const std = @import("std");
 const bench = @import("hw");
 const report_json = @import("report_json.zig");
 const report_markdown = @import("report_markdown.zig");
+const generated_cubins = @import("generated_cubins");
 
 const assert = std.debug.assert;
 
@@ -39,9 +40,13 @@ fn run() !u8 {
     defer probe.deinit();
 
     try probe.measure_all();
+    // The tensor-core peaks come from the prefill GEMM kernels themselves, so
+    // the prefill ceiling in THEORY.md §3 is measured rather than assumed.
+    try probe.measure_gemm_peaks(try gemm_cubin());
     try probe.verify_no_leak();
     try write_json(&probe);
     try print_tables(&probe);
+    print_gemm_peaks(&probe);
 
     const failures = probe.report.p2p_failure_count;
     if (failures == 0) {
@@ -50,6 +55,42 @@ fn run() !u8 {
         print_failures(&probe);
         return 1;
     }
+}
+
+/// Finds the `gemm` cubin among the kernels embedded in this binary.
+fn gemm_cubin() ![]const u8 {
+    assert(generated_cubins.cubins.len > 0);
+    assert(@sizeOf(generated_cubins.Cubin) > 0);
+
+    for (generated_cubins.cubins) |entry| {
+        if (std.mem.eql(u8, std.mem.span(entry.name), "gemm")) {
+            const bytes = entry.bytes[0..entry.length];
+            assert(bytes.len > 0);
+            return bytes;
+        }
+    }
+    return error.GemmCubinMissing;
+}
+
+/// Prints the measured tensor peaks and the payoff of native FP4 MMA.
+fn print_gemm_peaks(probe: *const bench.Probe) void {
+    assert(probe.report.device_count > 0);
+    assert(probe.report.gemm_peak_tflops.nvfp4_mma > 0);
+
+    const peaks = probe.report.gemm_peak_tflops;
+    std.debug.print(
+        "gemm peaks at M=N=K={d}: bf16 {d:.2} TFLOPS, fp8 {d:.2}, " ++
+            "nvfp4_mma {d:.2}, nvfp4_dequant_bf16 {d:.2}; " ++
+            "native FP4 payoff {d:.2}x\n",
+        .{
+            bench.gemm_peak.side,
+            peaks.bf16,
+            peaks.fp8,
+            peaks.nvfp4_mma,
+            peaks.nvfp4_dequant_bf16,
+            peaks.nvfp4_mma / peaks.nvfp4_dequant_bf16,
+        },
+    );
 }
 
 /// Writes `bench/hw-probe.json` into this repository.
