@@ -4,6 +4,12 @@
 //! model calls, in f32, without fusion: `x * (1 + w)` RMSNorm, the gated
 //! RMSNorm, `silu`, `sigmoid`, `softplus` with PyTorch's threshold, full-row
 //! softmax, L2 normalisation, and a transposed-weight matmul (`x @ w^T`).
+//!
+//! Issue I-027 widened the reductions with `@Vector` and nothing else: an
+//! elementwise loop needs no reassociation, so LLVM already emits it as SIMD,
+//! while a sum cannot be reassociated by the compiler at all. `reduceDot` and
+//! `reduceSquares` are therefore the only hand-written SIMD in the oracle, and
+//! the whole cost they impose is the reassociation budget recorded there.
 
 const std = @import("std");
 
@@ -11,6 +17,81 @@ const assert = std.debug.assert;
 
 /// Largest value `softplus` evaluates the logarithm for; above it, `x`.
 const softplus_threshold: f32 = 20.0;
+
+/// Lanes per SIMD step: eight f32 fill one 256-bit AVX2 register and divide
+/// the tiny model's 128-wide rows (and every head width derived from them)
+/// without a ragged tail.
+const lanes: usize = 8;
+
+/// One SIMD step of f32 lanes.
+const Vector = @Vector(lanes, f32);
+
+/// Horizontal sum of a vector, accumulated in one fixed order.
+///
+/// `@reduce` is left out deliberately: the point of a hand-written order is
+/// that it does not change with the backend.
+fn sumLanes(values: Vector) f32 {
+    assert(lanes > 0);
+
+    const parts: [lanes]f32 = values;
+    var total: f32 = 0.0;
+    for (parts) |part| {
+        total += part;
+    }
+    assert(total == total);
+    return total;
+}
+
+/// `sum_i left[i] * right[i]`, eight products in flight.
+///
+/// Reassociation budget, measured on the 193 float tensors of the golden
+/// trace (issue I-027, accepted by the orchestrator 2026-11-24): this shifts
+/// the oracle by at most 1.75e-6 relative to a tensor's own scale, and at most
+/// 1.91e-6 in absolute value, and it *improved* the oracle's worst error
+/// against the HF golden (1.363e-6 -> 6.901e-7 scaled, no tolerance touched).
+/// 1.75e-6 is ~9 % of the tightest kernel budget in the tree (2e-5), so a
+/// marginal kernel failure against this reference should account for that 9 %
+/// before the kernel is assumed wrong. The scalar serial order was never the
+/// truth either: HF's own matmuls run through cuBLAS with an unspecified
+/// accumulation order.
+///
+/// Anything that must stay exact stays scalar: see `round_bf16`,
+/// `embed_gather`, `argmax`, and the elementwise output passes below, which
+/// need no reassociation and which LLVM already vectorises.
+fn reduceDot(left: []const f32, right: []const f32) f32 {
+    assert(left.len > 0);
+    assert(right.len == left.len);
+
+    var accumulator: Vector = @splat(0.0);
+    var offset: usize = 0;
+    while (offset + lanes <= left.len) : (offset += lanes) {
+        const a: Vector = left[offset..][0..lanes].*;
+        const b: Vector = right[offset..][0..lanes].*;
+        accumulator += a * b;
+    }
+
+    var total = sumLanes(accumulator);
+    while (offset < left.len) : (offset += 1) {
+        total += left[offset] * right[offset];
+    }
+    assert(total == total);
+    return total;
+}
+
+/// `sum_i row[i] * row[i]`, eight lanes at a time.
+///
+/// Same reassociation budget as `reduceDot` (measured 1.75e-6 relative worst
+/// over the golden trace, ~9 % of the tightest 2e-5 kernel budget); the head
+/// vectors here are 16 wide, so this is where the shift is largest - the tree
+/// sum of 16 terms differs most from the serial sum exactly on the
+/// cancellation-heavy GDN l2norm and delta-rule tensors.
+fn reduceSquares(row: []const f32) f32 {
+    assert(row.len > 0);
+
+    const total = reduceDot(row, row);
+    assert(total >= 0.0);
+    return total;
+}
 
 /// Activations the model applies elementwise after a projection.
 pub const Activation = enum {
@@ -91,12 +172,12 @@ pub fn rmsnorm(
 
     var start: usize = 0;
     while (start < columns) : (start += group) {
-        var sum_squares: f32 = 0.0;
-        for (row[start..][0..group]) |value| {
-            sum_squares += value * value;
-        }
+        const sum_squares = reduceSquares(row[start..][0..group]);
         const mean = sum_squares / @as(f32, @floatFromInt(group));
         const scale = 1.0 / @sqrt(mean + eps);
+        // The output pass is left to the compiler: an elementwise multiply
+        // needs no reassociation, so LLVM already emits it as SIMD (a
+        // hand-written `@Vector` version measured 0.8x of that, not faster).
         for (row[start..][0..group], 0..) |value, i| {
             out[start + i] = value * scale * (1.0 + weight[start + i]);
         }
@@ -121,10 +202,7 @@ pub fn rmsnorm_gated(
     assert(out.len == row.len);
     assert(weight.len == row.len);
 
-    var sum_squares: f32 = 0.0;
-    for (row) |value| {
-        sum_squares += value * value;
-    }
+    const sum_squares = reduceSquares(row);
     const mean = sum_squares / @as(f32, @floatFromInt(row.len));
     const scale = 1.0 / @sqrt(mean + eps);
     for (row, 0..) |value, i| {
@@ -140,10 +218,7 @@ pub fn l2norm(row: []const f32, out: []f32, eps: f32) void {
     assert(eps >= 0.0);
     assert(eps <= 1.0);
 
-    var sum_squares: f32 = 0.0;
-    for (row) |value| {
-        sum_squares += value * value;
-    }
+    const sum_squares = reduceSquares(row);
     const scale = 1.0 / @sqrt(sum_squares + eps);
     for (row, 0..) |value, i| {
         out[i] = value * scale;
@@ -172,6 +247,9 @@ pub fn softmax(values: []f32) void {
         assert(largest > -std.math.inf(f32));
     }
 
+    // The exponentials stay scalar: `@exp` on a vector lowers to one libm
+    // `expf` call per lane on this target, so the vector form buys nothing
+    // (measured 1.00x). `softmax` is left as written apart from that note.
     var total: f32 = 0.0;
     for (values) |*value| {
         value.* = std.math.exp(value.* - largest);
@@ -263,15 +341,16 @@ pub fn gemv(
     assert(out.len == shape.out_features);
 }
 
-/// Dot product of two equal-length vectors, accumulated in f32 in order.
+/// Dot product of two equal-length vectors, eight lanes at a time.
+///
+/// The lane accumulators reassociate the sum relative to the in-order scalar
+/// loop this replaces; the budget that shift consumes is recorded on
+/// `reduceDot`.
 pub fn dot(left: []const f32, right: []const f32) f32 {
     assert(left.len > 0);
     assert(right.len == left.len);
 
-    var total: f32 = 0.0;
-    for (left, right) |a, b| {
-        total += a * b;
-    }
+    const total = reduceDot(left, right);
     assert(total == total);
     return total;
 }
