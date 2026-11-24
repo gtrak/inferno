@@ -158,9 +158,9 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 
 | work class | model | notes |
 |---|---|---|
-| hard: tensor-core kernels, numerics, multi-GPU placement/comms, requantiser, end-to-end integration | **`opencode-go/deepseek-v4.1-flash`** ("DeepSeek V4.1 Flash 1017", 1M ctx, $0.15/$0.60 per Mtok) — **one slot only** | reserve the single slot for the critical path |
-| straightforward: cleanup lanes, mechanical kernel ports, test harnesses, docs/specs | **`synthetic/syn:large:text`** | `desktop` is **OFFLINE as of 2026-11-24 (user directive)** — see the note below |
-| general reasoning when the deepseek slot is busy | `synthetic/syn:large:text` | |
+| **all worker lanes** (hard and straightforward) | **`opencode-go/deepseek-v4.1-flash`** ("DeepSeek V4.1 Flash 1017", 1M ctx) | **user directive 2026-11-24: workers use the opencode-go provider.** The earlier "one slot only" reservation is superseded — lanes may run concurrently on this provider; watch for rate limits rather than assuming the slot is exclusive |
+| `synthetic/syn:large:text` | **review gate and reviewer roles only** | no longer used for implementation work |
+| `desktop` | **OFFLINE** | see the note below |
 | **review gate** | `synthetic/syn:large:text`, always | the gate has caught 3+ real defects; never downgrade it to a small model, and prefer a *different* family from the implementer to avoid same-model blind spots |
 
 `local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not

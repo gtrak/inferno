@@ -18,10 +18,12 @@ const GATE = BASE + '1/.agents/tasks/review-gate.md';
 const ART = '/home/gary/.pi/agent/sessions/--home-gary-dev-inferno--/subagent-artifacts/';
 
 // Every model the routing table may use. Define all of them, always.
-const DEEPSEEK = 'opencode-go/deepseek-v4.1-flash'; // hard work, ONE slot only
-const DESKTOP = 'desktop';                          // OFFLINE 2026-11-24: local engine on
-// the same GPUs; do NOT dispatch. Kept defined so old scripts do not break.
-const STRONG = 'synthetic/syn:large:text';          // general; ALWAYS the reviewer
+// User directive 2026-11-24: WORKERS use the opencode-go provider.
+const WORKER = 'opencode-go/deepseek-v4.1-flash';
+const REVIEW = 'synthetic/syn:large:text'; // review gate stays a DIFFERENT family from the worker
+const DEEPSEEK = WORKER;                   // kept so older scripts still resolve
+const STRONG = REVIEW;                     // kept so older scripts still resolve
+const DESKTOP = 'desktop';                 // OFFLINE 2026-11-24: do not dispatch. Kept defined.
 
 const COMMON = 'You are the ONLY writer in your cwd. Never touch /home/gary/dev/inferno (main) '
   + 'or another slot. Do not run git commit. Do not edit core/build.zig or core/src/hw/kernel.zig. '
@@ -34,7 +36,7 @@ const COMMON = 'You are the ONLY writer in your cwd. Never touch /home/gary/dev/
 
 // ---- EDIT ONLY BELOW THIS LINE ----
 const LANES = [
-  { id: 'example', slot: '1', model: STRONG, spec: '.agents/tasks/issue-XXX.md',
+  { id: 'example', slot: '1', model: WORKER, spec: '.agents/tasks/issue-XXX.md',
     extra: ' What matters most here, and what the common mistake would be.' },
 ];
 
@@ -58,7 +60,7 @@ for (let i = 0; i < LANES.length; i++) {
 }
 const log = [];
 const implOpts = { agent: 'worker', timeoutMs: 5400000 };
-const revOpts = { agent: 'gate-reviewer', model: STRONG, timeoutMs: 1800000 };
+const revOpts = { agent: 'gate-reviewer', model: REVIEW, timeoutMs: 1800000 };
 
 for (let attempt = 1; attempt <= 3; attempt++) {
   const jobs = [];
