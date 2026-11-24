@@ -178,3 +178,39 @@ faithful of the two, so the observed 0.1 % selection drift is an oracle artifact
 Indexer compute is trivial at any context (0.067 GFLOP per layer per query at 256 K ⇒
 0.36 µs at the measured fp8 rate), so a correct `indexer_scores` is memory-bound at
 ~0.11 ms/token across 12 layers. Gate: ≤0.35 ms/token at the 256 K block count.
+
+## 9. Measured indexer cost at 256 K, and the fix
+
+First real measurement (I-008 follow-up, single GPU, 65 536 blocks, median of 7):
+
+| stage | µs/launch | diagnosis |
+|---|---:|---|
+| cold (pools all blocks) | 581.7 | per-prefill cost, not per-token |
+| **steady state** (`first_block == blocks`, 3 of 4 decode steps) | **266.7** | **× 12 layers = 3.20 ms/token** |
+| `indexer_block_scores` | 93.4 | 65 536 CTAs of near-zero work — CTA scheduling, not bandwidth (717 GB/s = 40 % of peak) |
+| `indexer_select` | 103.1 | **a single CTA** doing 8 radix passes over 65 536 scores — ~20 GB/s |
+| projection + norm/rope + append | ~70 | 6 launches of latency (CUDA graphs will compress this) |
+
+### The floor was mis-stated by the orchestrator (again, same class of error)
+
+An earlier gate demanded ≤0.35 ms/token, computed as 201 MB at **aggregate** HBM
+(1792 GB/s). With **replicated attention every rank reads all pooled keys from its
+own HBM**, so the honest floor is:
+
+| configuration | ms/token |
+|---|---:|
+| per-rank read, 12 layers × 16.78 MB @ 426 GB/s | **0.473** ← the real single-GPU floor |
+| shard block scoring across 4 ranks (I-014) | **0.118** + a 512-entry top-k all-gather |
+| demanded by the original gate | 0.35 ← below the floor, unattainable |
+
+### Fixes, in order
+
+1. **A1** chunk blocks per CTA in `indexer_block_scores` (grid.x = blocks/K, K blocks
+   per CTA) — removes the 65 536-CTA pathology.
+2. **A2** multi-CTA selection (two-phase radix / persistent grid) for `indexer_select`.
+3. **I-014: shard block scoring across ranks** and merge a 512-entry partial top-k.
+   This is the step that actually reaches the floor, and it is the reason the indexer
+   must be treated as a distributed concern rather than a per-kernel one.
+
+Gate as landed: assert ≤0.6 ms/token steady state; if A1+A2 land higher, assert
+achieved + 10 % as a regression guard and carry the gap as named debt.
