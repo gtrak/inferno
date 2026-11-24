@@ -97,3 +97,57 @@ statement for this machine.
   not a later optimisation.
 - I-022 (speculative decoding) becomes the main lever for going beyond ~200 tok/s,
   and no longer competes with batching for the win.
+
+## 7. KV tiering: hot window in VRAM, tail in DRAM (user directive 2026-11-24)
+
+**Naive full-KV streaming is impossible**: 3.22 GB (fp8) per *token* would be 110 ms.
+But QSA changes the working set, and this is the key insight:
+
+| quantity | value |
+|---|---|
+| full FP8 KV at 256 K, one copy | 3.22 GB |
+| **QSA budget per query** | **2,048 tokens** |
+| per-(layer, token) K+V, fp8 | 1,024 B |
+| **worst-case KV actually read per decode step** | 12 layers × 2048 × 1 KB = **25.2 MB** |
+| that at 28.9 GB/s of measured host bandwidth | **0.87 ms/token** |
+| pooled indexer keys at 256 K (one per 4-token block) | **8.4 MB — stays resident in VRAM** |
+| hot window of 32 K context in VRAM (fp8) | 0.40 GB |
+| **VRAM freed vs fully-resident 256 K** | **2.82 GB** |
+
+So attention reads ~25 MB/token, not 3.2 GB/token — a ~128× reduction, entirely
+because the indexer caps attention at 2,048 selected keys and selection is
+**per layer**.
+
+### Design
+
+1. **Pooled indexer keys stay in VRAM** (8.4 MB at 256 K). They are maintained
+   *incrementally* — when a 4-token block completes, its pooled key is computed once
+   and stored — instead of the reference's re-pool of all raw keys every step. This
+   also means **raw indexer keys need not be retained at all** beyond the current
+   partial block, saving 3 KB/token of the 13.5 KB/token.
+2. **A hot window of KV (e.g. the last 32 K positions) stays in VRAM.** Selection has
+   strong recency locality (nearby queries select nearby blocks), so the hot window
+   should absorb most selected tokens and the DRAM read is far below the 25 MB worst
+   case. Size it by measurement, not by guess.
+3. **The DRAM tail is gathered on demand** into a compact per-step VRAM working set:
+   a dense `[budget, kv_head, head_dim]` K and V block per layer. The CPU issues the
+   scattered 1 KB reads (12 cores, otherwise idle) into pinned staging, then one H2D
+   per layer.
+4. **Layout requirement:** K and V for one (layer, token) must be contiguous, 1 KB
+   per token per layer, so a gather is one read and not two. Layout
+   `[layer][token][2 kv heads][256] K then V`.
+5. **Prefill**: gather by the *union* of the chunk's selections, not per query — with
+   a 4 K chunk the union is a few hundred MB at most and amortises over thousands of
+   tokens, so prefill pays ~0.2 s of DRAM traffic for a 256 K prompt.
+
+### Consequences
+
+- **The attention kernel must consume an explicitly gathered K/V working set**, never
+  assume the master cache is contiguous or fully resident. This decouples the kernel
+  from the storage tier and is *simpler* to implement.
+- Freeing 2.82 GB of VRAM shrinks the DRAM expert tier from ~7.5 GB to ~4.7 GB at
+  256 K, which also speeds up decode. The two tiers compete for the same DRAM
+  bandwidth, so budget them together: worst case ~25 MB (KV) + ~40 MB (cold experts)
+  per token ≈ 2.2 ms at 28.9 GB/s, against a ~2.8 ms HBM floor — i.e. decode remains
+  HBM-bound at max context, which is exactly where we want it.
+- Consequence for I-008 (in flight): attention takes a gather list, not an arena.
