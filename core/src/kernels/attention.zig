@@ -17,8 +17,9 @@
 
 const std = @import("std");
 
-const cuda_context = @import("../hw/cuda_context.zig");
-const cuda_driver = @import("../hw/cuda_driver.zig");
+const cuda_context = @import("../hw/api.zig").cuda_context;
+const cuda_driver = @import("../hw/api.zig").cuda_driver;
+const epochs = @import("../hw/epochs.zig");
 const kernel = @import("../hw/kernel.zig");
 const generated_cubins = @import("generated_cubins");
 const ops = @import("../ref/ops.zig");
@@ -308,8 +309,10 @@ fn cubinImage(name: []const u8) ![]const u8 {
 
 /// Arguments of `rope_table_build`.
 pub const RopeTableArgs = struct {
-    cos: cuda_driver.DevicePtr,
-    sin: cuda_driver.DevicePtr,
+    /// Sealed, not a raw pointer: the only way to obtain one is a `Writable`,
+    /// and the launch below declares the write so the epoch records it.
+    cos: epochs.Sealed,
+    sin: epochs.Sealed,
     /// One int32 `[rows]` position grid per mRoPE axis.
     grids: [3]cuda_driver.DevicePtr,
     /// int32 `[3]`: `mrope_section`.
@@ -323,8 +326,10 @@ pub const RopeTableArgs = struct {
 pub const RopeApplyArgs = struct {
     /// bf16 `[rows, heads, head_dim]`, rotated in place.
     values: cuda_driver.DevicePtr,
-    cos: cuda_driver.DevicePtr,
-    sin: cuda_driver.DevicePtr,
+    /// Sealed: this launch reads them, so `State.reset` voiding them is an
+    /// error here instead of a rotation by zero.
+    cos: epochs.Sealed,
+    sin: epochs.Sealed,
     /// int32 `[rows]`.
     positions: cuda_driver.DevicePtr,
     rows: u32,
@@ -467,8 +472,14 @@ pub const Attention = struct {
         assert(args.rotary_dim > 0);
         assert(args.rotary_dim % 2 == 0);
 
-        var cos = args.cos;
-        var sin = args.sin;
+        // Declared before the launch: both tables are produced here, and a
+        // later read of either is legal only because of this.
+        try epochs.check("attention.build_rope_tables", &.{
+            .{ .label = "rope_cos", .pointer = args.cos.pointer, .access = .write },
+            .{ .label = "rope_sin", .pointer = args.sin.pointer, .access = .write },
+        });
+        var cos = args.cos.pointer;
+        var sin = args.sin.pointer;
         var temporal = args.grids[0];
         var height = args.grids[1];
         var width = args.grids[2];
@@ -500,9 +511,15 @@ pub const Attention = struct {
         assert(args.rotary_dim > 0);
         assert(args.rotary_dim % 2 == 0);
 
+        // This is the launch the mRoPE reset bug read through: `cos` and `sin`
+        // are consumed, so both must have been produced since the last reset.
+        try epochs.check("attention.apply_rope", &.{
+            .{ .label = "rope_cos", .pointer = args.cos.pointer, .access = .read },
+            .{ .label = "rope_sin", .pointer = args.sin.pointer, .access = .read },
+        });
         var values = args.values;
-        var cos = args.cos;
-        var sin = args.sin;
+        var cos = args.cos.pointer;
+        var sin = args.sin.pointer;
         var positions = args.positions;
         var rows: u32 = args.rows;
         var heads: u32 = args.heads;
@@ -1319,6 +1336,26 @@ const Harness = struct {
         assert(buffer.pointer != 0);
         return buffer.pointer;
     }
+
+    /// Registers an already-allocated pointer and returns its readable handle,
+    /// which is what the epoch-checked launches take.
+    fn seal(
+        self: *Harness,
+        label: []const u8,
+        pointer: cuda_driver.DevicePtr,
+        bytes: u64,
+    ) !epochs.Sealed {
+        assert(label.len > 0);
+        assert(pointer != 0);
+        assert(bytes > 0);
+        assert(self.allocations.items.len > 0);
+
+        const buffer = cuda_context.DeviceBuffer{ .pointer = pointer, .bytes = bytes };
+        const writable = try epochs.open(label, buffer, .must_write);
+        // The harness only seals pointers that already hold host-uploaded data.
+        epochs.markWritten(pointer);
+        return writable.seal();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1696,11 +1733,12 @@ fn buildTables(
     const device_grids = try harness.uploadI32(encoded);
     const device_section = try harness.uploadI32(sections);
     const stride: u64 = @as(u64, rows) * @sizeOf(i32);
-    const device_cos = try harness.allocate(@as(u64, rows) * shapes.rotary_dim * 4);
-    const device_sin = try harness.allocate(@as(u64, rows) * shapes.rotary_dim * 4);
+    const table_bytes: u64 = @as(u64, rows) * shapes.rotary_dim * 4;
+    const device_cos = try harness.allocate(table_bytes);
+    const device_sin = try harness.allocate(table_bytes);
     try harness.attention.buildRopeTables(.{
-        .cos = device_cos,
-        .sin = device_sin,
+        .cos = try harness.seal("rope_cos", device_cos, table_bytes),
+        .sin = try harness.seal("rope_sin", device_sin, table_bytes),
         .grids = .{ device_grids, device_grids + stride, device_grids + 2 * stride },
         .section = device_section,
         .rows = rows,
@@ -1787,8 +1825,8 @@ fn checkRope(harness: *Harness, shapes: Shapes, rows: u32) !void {
     const device_sin = try harness.uploadF32(actual_sin);
     try harness.attention.applyRope(.{
         .values = device_values,
-        .cos = device_cos,
-        .sin = device_sin,
+        .cos = try harness.seal("rope_cos", device_cos, @as(u64, rows) * rotary * 4),
+        .sin = try harness.seal("rope_sin", device_sin, @as(u64, rows) * rotary * 4),
         .positions = device_positions,
         .rows = rows,
         .heads = shapes.heads,
@@ -3470,8 +3508,8 @@ fn compareGoldenRotary(
     const device_keys = try harness.uploadBf16(built.k);
     try harness.attention.applyRope(.{
         .values = device_queries,
-        .cos = device_cos,
-        .sin = device_sin,
+        .cos = try harness.seal("rope_cos", device_cos, @as(u64, tokens) * rotary * 4),
+        .sin = try harness.seal("rope_sin", device_sin, @as(u64, tokens) * rotary * 4),
         .positions = device_positions,
         .rows = tokens,
         .heads = shapes.heads,
@@ -3480,8 +3518,8 @@ fn compareGoldenRotary(
     });
     try harness.attention.applyRope(.{
         .values = device_keys,
-        .cos = device_cos,
-        .sin = device_sin,
+        .cos = try harness.seal("rope_cos", device_cos, @as(u64, tokens) * rotary * 4),
+        .sin = try harness.seal("rope_sin", device_sin, @as(u64, tokens) * rotary * 4),
         .positions = device_positions,
         .rows = tokens,
         .heads = shapes.kv_heads,

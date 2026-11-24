@@ -26,8 +26,8 @@
 
 const std = @import("std");
 
-const cuda_context = @import("../hw/cuda_context.zig");
-const cuda_driver = @import("../hw/cuda_driver.zig");
+const cuda_context = @import("../hw/api.zig").cuda_context;
+const cuda_driver = @import("../hw/api.zig").cuda_driver;
 const kernel = @import("../hw/kernel.zig");
 const generated_cubins = @import("generated_cubins");
 

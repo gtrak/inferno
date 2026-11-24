@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-const cuda_driver = @import("hw/cuda_driver.zig");
+const cuda_driver = @import("hw/api.zig").cuda_driver;
 const generated_cubins = @import("generated_cubins");
 
 const Cubin = generated_cubins.Cubin;
@@ -236,8 +236,8 @@ fn copy_truncated(source: []const u8, target: []u8) u32 {
 // merges stacked four copies of it; kept deduplicated and grouped by directory.
 test {
     _ = @import("hw/bench.zig");
-    _ = @import("hw/cuda_context.zig");
-    _ = @import("hw/cuda_driver.zig");
+    _ = @import("hw/api.zig").cuda_context;
+    _ = @import("hw/api.zig").cuda_driver;
     _ = @import("hw/dl.zig");
     _ = @import("hw/kernel.zig");
     _ = @import("hw/pcie_link.zig");

@@ -20,8 +20,8 @@
 
 const std = @import("std");
 
-const cuda_context = @import("../hw/cuda_context.zig");
-const cuda_driver = @import("../hw/cuda_driver.zig");
+const cuda_context = @import("../hw/api.zig").cuda_context;
+const cuda_driver = @import("../hw/api.zig").cuda_driver;
 const kernel = @import("../hw/kernel.zig");
 const ops = @import("../ref/ops.zig");
 const quant = @import("../weights/quant.zig");

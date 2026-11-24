@@ -42,8 +42,8 @@
 
 const std = @import("std");
 
-const cuda_context = @import("../hw/cuda_context.zig");
-const cuda_driver = @import("../hw/cuda_driver.zig");
+const cuda_context = @import("../hw/api.zig").cuda_context;
+const cuda_driver = @import("../hw/api.zig").cuda_driver;
 const gemm = @import("../hw/gemm.zig");
 const gemm_peak = @import("../hw/gemm_peak.zig");
 const ref_fixtures = @import("../ref/fixtures.zig");

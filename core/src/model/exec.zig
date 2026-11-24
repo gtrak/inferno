@@ -15,8 +15,9 @@
 const std = @import("std");
 
 const attention = @import("../kernels/attention.zig");
-const cuda_context = @import("../hw/cuda_context.zig");
-const cuda_driver = @import("../hw/cuda_driver.zig");
+const cuda_context = @import("../hw/api.zig").cuda_context;
+const cuda_driver = @import("../hw/api.zig").cuda_driver;
+const guards = @import("../hw/buffer.zig");
 const elementwise = @import("../kernels/elementwise.zig");
 const fixtures = @import("../ref/fixtures.zig");
 const gdn = @import("../kernels/gdn.zig");
@@ -253,8 +254,8 @@ pub const Model = struct {
         }
         try self.state.uploadI32(&self.rope_grid, positions);
         try self.attention.buildRopeTables(.{
-            .cos = self.state.rope_cos.pointer,
-            .sin = self.state.rope_sin.pointer,
+            .cos = self.state.rope_cos,
+            .sin = self.state.rope_sin,
             .grids = .{
                 self.rope_grid.pointer,
                 self.rope_grid.pointer,
@@ -385,6 +386,11 @@ pub const Model = struct {
         self.timings.embed_ns += timer.lap();
         try self.forwardLayers(ids, tokens, past);
         try self.forwardHead(tokens);
+        if (guards.enabled()) {
+            try self.state.verifyGuards();
+        } else {
+            assert(!guards.enabled());
+        }
         self.timings.total_ns += timer.read();
         self.state.length = past + tokens;
         assert(self.state.length == past + tokens);
@@ -429,6 +435,14 @@ pub const Model = struct {
         const recurrent_form = tokens == 1 and past > 0;
         for (0..self.plan.layer_count) |index| {
             try self.forwardLayer(@intCast(index), ids, tokens, past, recurrent_form);
+            // Debug only (`INFERNO_GUARD_BANDS`): a kernel that wrote past an
+            // allocation tears that allocation's canary, and the first layer
+            // to do it names the buffer instead of corrupting a later one.
+            if (guards.enabled()) {
+                try self.state.verifyGuards();
+            } else {
+                assert(!guards.enabled());
+            }
         }
         try self.forwardMixer(tokens);
         assert(self.state.hyper.bytes > 0);
@@ -832,8 +846,8 @@ pub const Model = struct {
         try self.ple.stream.synchronize();
         try self.attention.applyRope(.{
             .values = self.state.attn_query_bf16.pointer,
-            .cos = self.state.rope_cos.pointer,
-            .sin = self.state.rope_sin.pointer,
+            .cos = self.state.rope_cos,
+            .sin = self.state.rope_sin,
             .positions = self.state.positions.pointer,
             .rows = tokens,
             .heads = self.config.num_attention_heads,
@@ -842,8 +856,8 @@ pub const Model = struct {
         });
         try self.attention.applyRope(.{
             .values = self.state.attn_key_bf16.pointer,
-            .cos = self.state.rope_cos.pointer,
-            .sin = self.state.rope_sin.pointer,
+            .cos = self.state.rope_cos,
+            .sin = self.state.rope_sin,
             .positions = self.state.positions.pointer,
             .rows = tokens,
             .heads = self.config.num_key_value_heads,

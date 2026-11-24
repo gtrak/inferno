@@ -10,8 +10,10 @@
 const std = @import("std");
 
 const attention_kernels = @import("../kernels/attention.zig");
-const cuda_context = @import("../hw/cuda_context.zig");
-const cuda_driver = @import("../hw/cuda_driver.zig");
+const cuda_context = @import("../hw/api.zig").cuda_context;
+const cuda_driver = @import("../hw/api.zig").cuda_driver;
+const epochs = @import("../hw/epochs.zig");
+const guards = @import("../hw/buffer.zig");
 const fixtures = @import("../ref/fixtures.zig");
 const plan_module = @import("plan.zig");
 
@@ -31,15 +33,6 @@ pub fn allocationBytes(bytes: u64) u64 {
     assert(@alignOf(u64) == 8);
 
     return (bytes + 4095) / 4096 * 4096;
-}
-
-/// One device buffer of at least `bytes`, rounded to the allocation size.
-fn allocate(bytes: u64) !cuda_context.DeviceBuffer {
-    assert(bytes > 0);
-
-    const buffer = try cuda_context.DeviceBuffer.allocate(allocationBytes(bytes));
-    assert(buffer.pointer != 0);
-    return buffer;
 }
 
 /// One attention layer's caches.
@@ -102,8 +95,12 @@ pub const State = struct {
     /// i32 `[1]`: gathered rows past a query's causal horizon.
     violations: cuda_context.DeviceBuffer,
     /// f32 `[arena, rotary_dim]` and int32 `[arena]` per mRoPE axis.
-    rope_cos: cuda_context.DeviceBuffer,
-    rope_sin: cuda_context.DeviceBuffer,
+    ///
+    /// These two are `Sealed`, not `DeviceBuffer`: `State.reset` voids them, so
+    /// a read of either before `Model.fillRopeTables` runs again is the
+    /// `read_before_write` error rather than a silent rotation by zero.
+    rope_cos: epochs.Sealed,
+    rope_sin: epochs.Sealed,
     rope_positions: cuda_context.DeviceBuffer,
 
     // Gated DeltaNet scratch.
@@ -283,12 +280,17 @@ pub const State = struct {
     }
 
     /// Forgets every cached token: the caches return to their init state.
+    ///
+    /// The zero fill is `epochs.fillVoid`, which also voids each buffer's write
+    /// epoch: after a reset nothing may be *read* until a data path writes it
+    /// again. A reset that only zeroed memory was the mRoPE bug — the tables
+    /// were wiped and read back as zeros with no error anywhere.
     pub fn reset(self: *State) !void {
         assert(self.arena_length > 0);
         assert(self.layer_count > 0);
 
         for (self.allocations.items) |buffer| {
-            try self.zero(buffer.pointer, buffer.bytes);
+            try epochs.fillVoid(buffer, self.stream(), &self.staging);
         }
         self.length = 0;
         self.pooled_blocks = 0;
@@ -300,7 +302,7 @@ pub const State = struct {
         assert(self.allocator.vtable != undefined);
 
         for (self.allocations.items) |buffer| {
-            buffer.free();
+            guards.free(&buffer);
         }
         self.allocations.deinit();
         self.staging.free();
@@ -328,67 +330,67 @@ pub const State = struct {
         const intermediate: u64 = self.config.moe_intermediate_size;
         const shared: u64 = self.config.shared_expert_intermediate_size;
 
-        self.hyper = try self.push(tokens * hyper * 4);
-        self.injection = try self.push(tokens * self.config.hc_count * 4);
-        self.stream_in = try self.push(tokens * hidden * 4);
-        self.stream_out = try self.push(tokens * hidden * 4);
-        self.stream_bf16 = try self.push(tokens * hidden * 2);
-        self.mixed = try self.push(tokens * hidden * 4);
-        self.logits = try self.push(tokens * self.config.vocab_size * 4);
-        self.argmax_index = try self.push(4);
-        self.argmax_value = try self.push(4);
-        self.positions = try self.push(tokens * 4);
-        self.violations = try self.push(4);
-        self.rope_positions = try self.push(self.arena_length * 4);
+        self.hyper = try self.push("hyper", tokens * hyper * 4);
+        self.injection = try self.push("injection", tokens * self.config.hc_count * 4);
+        self.stream_in = try self.push("stream_in", tokens * hidden * 4);
+        self.stream_out = try self.push("stream_out", tokens * hidden * 4);
+        self.stream_bf16 = try self.push("stream_bf16", tokens * hidden * 2);
+        self.mixed = try self.push("mixed", tokens * hidden * 4);
+        self.logits = try self.push("logits", tokens * self.config.vocab_size * 4);
+        self.argmax_index = try self.push("argmax_index", 4);
+        self.argmax_value = try self.push("argmax_value", 4);
+        self.positions = try self.push("positions", tokens * 4);
+        self.violations = try self.push("violations", 4);
+        self.rope_positions = try self.push("rope_positions", self.arena_length * 4);
 
         const conv_dim: u64 = self.config.conv_dim();
         const value_dim: u64 = self.config.value_dim();
         const key_dim: u64 = self.config.key_dim();
         const gdn_heads: u64 = self.config.linear_num_value_heads;
-        self.gdn_qkv = try self.push(tokens * conv_dim * 4);
-        self.gdn_z = try self.push(tokens * value_dim * 4);
-        self.gdn_a = try self.push(tokens * gdn_heads * 4);
-        self.gdn_b = try self.push(tokens * gdn_heads * 4);
-        self.gdn_beta = try self.push(tokens * gdn_heads * 4);
-        self.gdn_decay = try self.push(tokens * gdn_heads * 4);
-        self.gdn_conv_in = try self.push(tokens * conv_dim * 2);
-        self.gdn_conv_out = try self.push(tokens * conv_dim * 2);
-        self.gdn_query = try self.push(tokens * key_dim * 4);
-        self.gdn_key = try self.push(tokens * key_dim * 4);
-        self.gdn_value = try self.push(tokens * value_dim * 4);
-        self.gdn_core = try self.push(tokens * value_dim * 2);
-        self.gdn_gate = try self.push(tokens * value_dim * 2);
-        self.gdn_normed = try self.push(tokens * value_dim * 2);
-        self.gdn_normed_f32 = try self.push(tokens * value_dim * 4);
+        self.gdn_qkv = try self.push("gdn_qkv", tokens * conv_dim * 4);
+        self.gdn_z = try self.push("gdn_z", tokens * value_dim * 4);
+        self.gdn_a = try self.push("gdn_a", tokens * gdn_heads * 4);
+        self.gdn_b = try self.push("gdn_b", tokens * gdn_heads * 4);
+        self.gdn_beta = try self.push("gdn_beta", tokens * gdn_heads * 4);
+        self.gdn_decay = try self.push("gdn_decay", tokens * gdn_heads * 4);
+        self.gdn_conv_in = try self.push("gdn_conv_in", tokens * conv_dim * 2);
+        self.gdn_conv_out = try self.push("gdn_conv_out", tokens * conv_dim * 2);
+        self.gdn_query = try self.push("gdn_query", tokens * key_dim * 4);
+        self.gdn_key = try self.push("gdn_key", tokens * key_dim * 4);
+        self.gdn_value = try self.push("gdn_value", tokens * value_dim * 4);
+        self.gdn_core = try self.push("gdn_core", tokens * value_dim * 2);
+        self.gdn_gate = try self.push("gdn_gate", tokens * value_dim * 2);
+        self.gdn_normed = try self.push("gdn_normed", tokens * value_dim * 2);
+        self.gdn_normed_f32 = try self.push("gdn_normed_f32", tokens * value_dim * 4);
 
-        self.attn_query = try self.push(tokens * width * 4);
-        self.attn_gate = try self.push(tokens * width * 4);
-        self.attn_key = try self.push(tokens * kv_dim * 4);
-        self.attn_value = try self.push(tokens * kv_dim * 4);
-        self.attn_query_bf16 = try self.push(tokens * width * 2);
-        self.attn_key_bf16 = try self.push(tokens * kv_dim * 2);
-        self.attn_value_bf16 = try self.push(tokens * kv_dim * 2);
-        self.index_query = try self.push(tokens * index_heads * index_dim * 2);
-        self.index_projected = try self.push(tokens * projected * index_dim * 4);
-        self.index_scores = try self.push(self.indexScoreBytes());
-        self.index_partial = try self.push(tokens * block_topk * 8);
-        self.index_selected = try self.push(tokens * slots * 4);
-        self.gather_index = try self.push(slots * 4);
-        self.gathered_key = try self.push(slots * kv_dim * 2);
-        self.gathered_value = try self.push(slots * kv_dim * 2);
-        self.attn_out = try self.push(tokens * width * 2);
-        self.attn_out_f32 = try self.push(tokens * width * 4);
-        self.attn_gated = try self.push(tokens * width * 4);
+        self.attn_query = try self.push("attn_query", tokens * width * 4);
+        self.attn_gate = try self.push("attn_gate", tokens * width * 4);
+        self.attn_key = try self.push("attn_key", tokens * kv_dim * 4);
+        self.attn_value = try self.push("attn_value", tokens * kv_dim * 4);
+        self.attn_query_bf16 = try self.push("attn_query_bf16", tokens * width * 2);
+        self.attn_key_bf16 = try self.push("attn_key_bf16", tokens * kv_dim * 2);
+        self.attn_value_bf16 = try self.push("attn_value_bf16", tokens * kv_dim * 2);
+        self.index_query = try self.push("index_query", tokens * index_heads * index_dim * 2);
+        self.index_projected = try self.push("index_projected", tokens * projected * index_dim * 4);
+        self.index_scores = try self.push("index_scores", self.indexScoreBytes());
+        self.index_partial = try self.push("index_partial", tokens * block_topk * 8);
+        self.index_selected = try self.push("index_selected", tokens * slots * 4);
+        self.gather_index = try self.push("gather_index", slots * 4);
+        self.gathered_key = try self.push("gathered_key", slots * kv_dim * 2);
+        self.gathered_value = try self.push("gathered_value", slots * kv_dim * 2);
+        self.attn_out = try self.push("attn_out", tokens * width * 2);
+        self.attn_out_f32 = try self.push("attn_out_f32", tokens * width * 4);
+        self.attn_gated = try self.push("attn_gated", tokens * width * 4);
 
-        self.moe_logits = try self.push(tokens * experts * 4);
-        self.moe_indices = try self.push(tokens * top_k * 4);
-        self.moe_weights = try self.push(tokens * top_k * 4);
-        self.moe_gate_up = try self.push(tokens * 2 * intermediate * 4);
-        self.moe_act = try self.push(tokens * intermediate * 4);
-        self.moe_expert_out = try self.push(experts * tokens * hidden * 4);
-        self.moe_shared_gate_up = try self.push(tokens * 2 * shared * 4);
-        self.moe_shared_act = try self.push(tokens * shared * 4);
-        self.moe_shared_out = try self.push(tokens * hidden * 4);
+        self.moe_logits = try self.push("moe_logits", tokens * experts * 4);
+        self.moe_indices = try self.push("moe_indices", tokens * top_k * 4);
+        self.moe_weights = try self.push("moe_weights", tokens * top_k * 4);
+        self.moe_gate_up = try self.push("moe_gate_up", tokens * 2 * intermediate * 4);
+        self.moe_act = try self.push("moe_act", tokens * intermediate * 4);
+        self.moe_expert_out = try self.push("moe_expert_out", experts * tokens * hidden * 4);
+        self.moe_shared_gate_up = try self.push("moe_shared_gate_up", tokens * 2 * shared * 4);
+        self.moe_shared_act = try self.push("moe_shared_act", tokens * shared * 4);
+        self.moe_shared_out = try self.push("moe_shared_out", tokens * hidden * 4);
         assert(self.staging.bytes >= staging_bytes);
     }
 
@@ -414,8 +416,8 @@ pub const State = struct {
         assert(self.config.rotary_dim() > 0);
 
         const rotary: u64 = self.config.rotary_dim();
-        self.rope_cos = try self.push(self.arena_length * rotary * 4);
-        self.rope_sin = try self.push(self.arena_length * rotary * 4);
+        self.rope_cos = try self.pushSealed("rope_cos", self.arena_length * rotary * 4);
+        self.rope_sin = try self.pushSealed("rope_sin", self.arena_length * rotary * 4);
         assert(self.rope_positions.bytes >= @as(u64, self.arena_length) * 4);
     }
 
@@ -447,17 +449,25 @@ pub const State = struct {
         var cache = LayerCache{};
         switch (self.plan.layer(index).kind) {
             .indexed_attention => cache.attention = .{
-                .key = try self.push(arena * kv_dim * 2),
-                .value = try self.push(arena * kv_dim * 2),
-                .index_keys = try self.push(arena * index_dim * 2),
-                .index_pooled = try self.push((arena / ratio) * index_dim * 2),
+                .key = try self.push("attention.key", arena * kv_dim * 2),
+                .value = try self.push("attention.value", arena * kv_dim * 2),
+                .index_keys = try self.push(
+                    "attention.index_keys",
+                    arena * index_dim * 2,
+                ),
+                .index_pooled = try self.push(
+                    "attention.index_pooled",
+                    (arena / ratio) * index_dim * 2,
+                ),
             },
             .linear_attention => cache.gdn = .{
                 .conv = try self.push(
+                    "gdn.conv",
                     self.config.conv_dim() *
                         (self.config.linear_conv_kernel_dim - 1) * 4,
                 ),
                 .recurrent = try self.push(
+                    "gdn.recurrent",
                     self.config.linear_num_value_heads *
                         self.config.linear_key_head_dim *
                         self.config.linear_value_head_dim * 4,
@@ -468,13 +478,51 @@ pub const State = struct {
     }
 
     /// Allocates one buffer and tracks it for `deinit`.
-    fn push(self: *State, bytes: u64) !cuda_context.DeviceBuffer {
+    ///
+    /// `label` names the allocation in a guard-band report and in an epoch
+    /// error; allocation itself goes through `hw/buffer.zig`, so the canary
+    /// band and the write epoch are both decided in one place.
+    fn push(
+        self: *State,
+        comptime label: []const u8,
+        bytes: u64,
+    ) !cuda_context.DeviceBuffer {
+        assert(label.len > 0);
         assert(bytes > 0);
 
-        const buffer = try allocate(bytes);
-        errdefer buffer.free();
-        try self.allocations.append(buffer);
-        return buffer;
+        const sealed = try self.pushSealed(label, bytes);
+        return sealed.device();
+    }
+
+    /// `push`, but keeping the readable capability handle.
+    fn pushSealed(
+        self: *State,
+        comptime label: []const u8,
+        bytes: u64,
+    ) !epochs.Sealed {
+        assert(label.len > 0);
+        assert(bytes > 0);
+
+        const writable = try guards.allocate(
+            label,
+            allocationBytes(bytes),
+            self.stream(),
+            .must_write,
+        );
+        const sealed = writable.seal();
+        const device = sealed.device();
+        errdefer guards.free(&device);
+        try self.allocations.append(device);
+        return sealed;
+    }
+
+    /// Scans every guarded allocation's canary; a no-op unless guard bands are
+    /// enabled. `exec.zig` calls this after each decoder layer.
+    pub fn verifyGuards(self: *State) !void {
+        assert(self.allocations.items.len > 0);
+        assert(self.layer_count > 0);
+
+        try guards.verifyGuardsAll(self.stream());
     }
 
     /// Uploads `values` into `buffer` through the pinned staging window.
@@ -556,25 +604,6 @@ pub const State = struct {
             read += chunk;
         }
         assert(read == out.len);
-    }
-
-    /// Zeroes `bytes` of device memory starting at `pointer`.
-    fn zero(self: *State, pointer: cuda_driver.DevicePtr, bytes: u64) !void {
-        assert(pointer != 0);
-        assert(bytes > 0);
-        assert(self.staging.bytes > 0);
-
-        const buffer = cuda_context.DeviceBuffer{ .pointer = pointer, .bytes = bytes };
-        @memset(self.staging.slice(), 0);
-        var written: u64 = 0;
-        while (written < bytes) {
-            const chunk: u64 = @min(self.staging.bytes, bytes - written);
-            const destination = view(&buffer, written, chunk);
-            try self.stream().copy_h_to_d(&destination, &self.staging, chunk);
-            written += chunk;
-        }
-        try self.stream().synchronize();
-        assert(written == bytes);
     }
 
     /// The queue every host copy is issued on.

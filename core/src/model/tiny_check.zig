@@ -406,3 +406,49 @@ test "the tiny model reproduces the golden logits and the golden greedy ids" {
         },
     );
 }
+
+test "a reset that forgets the mRoPE table is a read before write, not a silent zero rotation" {
+    // The bug this is the regression test for: `State.reset` zeroed every
+    // allocation including `rope_cos`/`rope_sin`, and nothing refilled them, so
+    // the next `applyRope` rotated by `cos = 0, sin = 0`. No error, no crash —
+    // just a different answer on every run. `Model.reset` is the correct whole
+    // operation; the test below takes `State.reset` alone, which is exactly the
+    // half-finished reset, and requires the launch to refuse it.
+    const allocator = std.testing.allocator;
+    var model = try exec.Model.init(allocator);
+    defer model.deinit();
+    try model.reset();
+
+    const rotary: u32 = model.config.rotary_dim();
+    assert(rotary > 0);
+
+    // 1. The half-finished reset: the buffer set is wiped, the tables are void.
+    try model.state.reset();
+    const refused = model.attention.applyRope(.{
+        .values = model.state.attn_query_bf16.pointer,
+        .cos = model.state.rope_cos,
+        .sin = model.state.rope_sin,
+        .positions = model.state.positions.pointer,
+        .rows = 1,
+        .heads = model.config.num_attention_heads,
+        .head_dim = model.config.head_dim,
+        .rotary_dim = rotary,
+    });
+    try std.testing.expectError(error.read_before_write, refused);
+    try std.testing.expect(model.state.rope_cos.written() == .never);
+
+    // 2. The whole reset: the tables are rebuilt, and the same launch is legal.
+    try model.reset();
+    try std.testing.expect(model.state.rope_cos.written() == .written);
+    try model.attention.applyRope(.{
+        .values = model.state.attn_query_bf16.pointer,
+        .cos = model.state.rope_cos,
+        .sin = model.state.rope_sin,
+        .positions = model.state.positions.pointer,
+        .rows = 1,
+        .heads = model.config.num_attention_heads,
+        .head_dim = model.config.head_dim,
+        .rotary_dim = rotary,
+    });
+    try model.attention.stream.synchronize();
+}
