@@ -334,6 +334,35 @@ answer, and costs 3 GiB per reset at full context. It is rule 3 masquerading as 
 Corollary: the guard must be easier to satisfy than the workaround, or lanes route around it.
 Three lanes asked to edit `core/build.zig` to dodge a fence in one night.
 
+## 7e. Bit-exactness is a test technique, not a requirement (user correction 2026-11-24)
+
+I had been treating **bit-identical output versus our own single-GPU path** as an architecture gate
+and letting it choose the parallelisation. It is neither: the user's targets are 262,144 context,
+>= 150 tok/s decode, >= 5,000 prefill and quality-neutral quantisation. **Bit-exactness is my
+testing convenience.**
+
+Separate the two claims that were being conflated:
+
+| claim | status |
+|---|---|
+| greedy ids equal the **HF golden** ids | **a real requirement** - it is the correctness gate |
+| ids bit-identical to **our own single-GPU run** | a **test technique**: it makes a mismatch unambiguous (fault is in placement, not kernels) at a cost worth paying *only* when it is free |
+
+Consequences:
+- Gates compare against the fixture/oracle, never against a second configuration of our own code.
+  "The 4-rank path must match the 1-rank path exactly" may be used as a **diagnostic**, but a
+  placement choice must never be justified by it alone.
+- A parallelisation is chosen on **measured** grounds - bytes on the link, redundant compute, occupancy
+  - and the resulting numerical difference from another configuration is reported, not gated.
+- The replacement for bit-exactness as an architecture gate is the fp32 oracle plus the output-format
+  ulp budget; see the tier-1 tolerance rule in I-013/#8.
+
+This matters because the difference is not free. At our measured 7.2 GB/s PCIe:
+column-parallel + all-gather of a 1,280-wide bf16 intermediate is ~1,920 B/token/rank, while
+row-parallel + all-reduce of a 2,560-wide activation is ~7,680 B/token/rank - but all-gather then
+duplicates the whole down-projection on every rank (~53 ms per 48-layer 16K chunk of redundant
+compute). Either can win; **measure it, do not derive it from a test property.**
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
