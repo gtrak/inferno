@@ -9,7 +9,9 @@
 //  3. `action:"validate"` checks structure WITHOUT executing. It will not catch
 //     an undefined identifier. Define every model const below, even if unused.
 //  4. A workflow driver has no access to the repo; it only launches children.
-//  5. Never let a lane take a perf number while another lane holds a GPU. Tell
+//  5. A caller must treat a FAILED/TIMED-OUT review as BLOCKING. A dead reviewer emits no
+//     verdict, and "no verdict" is not "pass" - wave 5 shipped that mistake.
+//  6. Never let a lane take a perf number while another lane holds a GPU. Tell
 //     it to report "unmeasured, blocked on an idle box" instead.
 const BASE = '/home/gary/dev/inferno/.agents/worktrees/slot-';
 const GATE = BASE + '1/.agents/tasks/review-gate.md';
@@ -89,7 +91,11 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   for (let j = 0; j < revJobs.length; j++) {
     const laneId = revJobs[j].key.split('-')[1];
     state[laneId].review = revs[j].output || '';
-    state[laneId].blocking = /VERDICT:\s*BLOCKING/i.test(state[laneId].review);
+    // A review that FAILED OR TIMED OUT has no verdict line. Treating silence as approval
+    // let a broken tree through (wave 5 reported "blocking=none" for a reviewer that died).
+    const revFailed = revs[j].ok === false;
+    state[laneId].blocking = revFailed || /VERDICT:\s*BLOCKING/i.test(state[laneId].review);
+    if (revFailed) { emit('REVIEW FAILED for ' + laneId + ' - treating as BLOCKING'); }
     if (state[laneId].blocking) { still.push(laneId); }
   }
   log.push('pass ' + attempt + ': blocking=' + (still.length ? still.join(',') : 'none'));
