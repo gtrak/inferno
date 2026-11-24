@@ -208,6 +208,14 @@ pub const MemoryFunctions = struct {
         usize,
         CuStream,
     ) callconv(.c) CuResult,
+    copy_peer_async: *const fn (
+        DevicePtr,
+        CuContext,
+        DevicePtr,
+        CuContext,
+        usize,
+        CuStream,
+    ) callconv(.c) CuResult,
 };
 
 /// `cuStream*` entry points.
@@ -491,6 +499,9 @@ fn resolve_memory_symbols(
         ),
         .copy_d_to_d_async = @ptrCast(
             try library.symbol("cuMemcpyDtoDAsync_v2"),
+        ),
+        .copy_peer_async = @ptrCast(
+            try library.symbol("cuMemcpyPeerAsync"),
         ),
     };
 }

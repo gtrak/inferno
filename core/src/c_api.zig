@@ -253,6 +253,7 @@ test {
     _ = @import("kernels/moe.zig");
     _ = @import("kernels/ple.zig");
     _ = @import("model/mod.zig");
+    _ = @import("model/multi.zig");
 }
 
 test "inferno_version is a NUL terminated C string" {

@@ -329,6 +329,37 @@ pub const Stream = struct {
         ));
         assert(destination.bytes > 0);
     }
+
+    /// Enqueues a peer copy of `bytes` bytes from `source`, which lives in
+    /// `source_context`, into `destination`, which lives in
+    /// `destination_context`. Both contexts must have peer access enabled.
+    ///
+    /// This is the primitive multi-rank dispatch and combine use: it takes the
+    /// two contexts explicitly instead of assuming the current one owns both.
+    pub fn copy_peer(
+        stream: *const Stream,
+        destination: *const DeviceBuffer,
+        destination_context: *const Context,
+        source: *const DeviceBuffer,
+        source_context: *const Context,
+        bytes: u64,
+    ) DriverError!void {
+        assert(bytes > 0);
+        assert(bytes <= destination.bytes);
+        assert(bytes <= source.bytes);
+        assert(@intFromPtr(stream.handle) != 0);
+
+        const table = try cuda_driver.functions();
+        try cuda_driver.check_result(table.memory.copy_peer_async(
+            destination.pointer,
+            destination_context.handle,
+            source.pointer,
+            source_context.handle,
+            @intCast(bytes),
+            stream.handle,
+        ));
+        assert(destination.pointer != 0);
+    }
 };
 
 /// A timestamp recorded on a stream, used for device-side elapsed time.
