@@ -294,9 +294,25 @@ rate of ~7.9 GB/s). The production 4.30 GB per-rank overflow therefore costs **0
 (1.4156 GB/layer is ~16x the production overflow) and must not be multiplied by 48 as a production
 figure.
 
-**The one lever that reaches 5,000:** at 16K, shared expert + combine is **73-76 us/token (43 % of
-the block)** with pure shared at 59-62 us/token across 48 layers. Killing the shared FFMA cost is
-worth up to 59-62 us/token and even halving it reaches **~4,930-5,070 tok/s**. That is the single
+**The one lever that reached 5,000 - DONE:** the shared expert moved to BF16 tensor cores (HMMA),
+**1.292 -> 0.452 us/token/layer (2.86x)**, i.e. ~40 us/token across 48 layers. Anchored 16K prefill
+projection is now **~5,150-5,350 tok/s**, across the 5,000 bar on **one GPU**.
+
+Its numerics are recorded deliberately, because the result is *not* "same or better": **5.475e-6**
+against the FFMA path's **1.054e-6**, both with 91x margin under the 5e-4 gate. The lane's control
+table is why the design is defensible:
+
+| shared down operand | error vs oracle | us/token |
+|---|---:|---:|
+| FFMA (before) | 1.054e-6 | 1.292 |
+| tensor core, 1x bf16 round | **1.380e-3 - gate fails** | - |
+| tensor core, 2-term split (shipped) | 5.475e-6 | **0.452** |
+| tensor core, 3-term split | 5.856e-6 (no gain) | 0.587 |
+
+So the floor is **accumulation, not operand precision**, and a 3-term split buys nothing. A 5x increase
+in relative error that is still 91x inside its gate is exactly the trade that **must be validated by
+KL against a reference rather than by a tolerance** - see I-031. It is a quality datapoint to confirm,
+not a quality argument to assert. That is the single
 highest-value prefill change and it remains quality-neutral: the BF16 shared expert only sits on the
 FFMA path because the 5e-4 exactness gate forbids quantising it.
 
