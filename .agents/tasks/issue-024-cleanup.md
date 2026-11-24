@@ -15,6 +15,12 @@ re-running the owning issue's gate. **No refactors, no new features.**
 2. `queue_ms` does not measure queue time (`server/src/api/generate.rs:169`). Measure
    from request accept to engine-submit completion; add a test that it is > 0 when the
    engine delays acceptance.
+2b. (P2-3) the chat-golden gate is not self-contained: it must resolve its tokenizer
+   from `INFERNO_MODEL_DIR` when set, else fall back to the committed
+   `server/tests/fixtures/model/tokenizer.json`, and fail with a message naming the
+   variable when a *configured* path is missing. **Do not add a precondition to
+   `tools/gate.sh`** — that would make the gate fail on any machine without the 132 GB
+   checkpoint, which is worse than the problem it fixes.
 3. Any other P2 in the I-007 review report (read the artifact at
    `~/.pi/agent/sessions/--home-gary-dev-inferno--/subagent-artifacts/71816212-4caa-4c53-80f6-de14ac63edac_gate-reviewer_output.md`).
 
@@ -32,10 +38,16 @@ re-running the owning issue's gate. **No refactors, no new features.**
 7. tiger-style MINOR: 123 lines > 80 columns across `weights/*.zig`; `document_bytes: usize`
    should be an explicit width.
 
-### From I-002 (probe)
-8. The report overstated run-to-run stability as ±0.5 % when 18 fields exceed it —
-   re-measure and state the real spread in `bench/hw-probe.json`
-   (`stability_percent_max`).
+### From I-002 (probe) — mechanism now, measurement on an idle GPU
+8. The "±0.5 %" stability claim lived only in the I-002 *worker report*; it is in no
+   committed file (verified by grep over THEORY.md, `core/src/bench/*.zig` and the
+   I-002 spec), so nothing in the tree needs correcting. What is missing is the
+   mechanism: `core/src/bench/report_json.zig` must emit `stability_percent_max`,
+   **null when unmeasured** (never 0 or a default that reads as a measurement), with
+   a repeat runner (N ≥ 6). The *value* must be taken on an **idle host** —
+   plan.md non-negotiable 4 forbids timing while other lanes hold the GPUs — so the
+   measurement is scheduled separately and the field stays null until then.
+   Amended 2026-11-24: the lane correctly refused to take a contaminated number.
 
 ## Gates
 ```
