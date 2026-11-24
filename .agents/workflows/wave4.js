@@ -1,7 +1,9 @@
 // Wave 4: I-025 attention perf (deepseek), I-012 elementwise/RoPE/sampler (syn:large),
 // reviewer-followups sweep (desktop). Impl -> review -> bounded fix, per lane.
-// CHILD RESULTS EXPOSE ONLY {runId, ok, output, ...}: every lookup indexes the LOCAL
-// jobs array. Passing a custom field (e.g. .lane_id) through runs.all() returns undefined.
+// TWO HARD RULES LEARNED THE HARD WAY - both crashed this driver after a full impl round:
+//  1. runs.all() items REQUIRE a unique `key`. Without it the call dies at launch.
+//  2. Child results expose ONLY {runId, ok, output}; custom fields (lane_id, cwd, model)
+//     do NOT come back. Recover the lane from the key you set, never from the result.
 const BASE = '/home/gary/dev/inferno/.agents/worktrees/slot-';
 const GATE = BASE + '1/.agents/tasks/review-gate.md';
 const ART = '/home/gary/.pi/agent/sessions/--home-gary-dev-inferno--/subagent-artifacts/';
@@ -70,35 +72,34 @@ for (let attempt = 1; attempt <= 3; attempt++) {
     const task = attempt === 1 ? implTask(L)
       : ('Fix exactly the BLOCKING findings below, per ' + BASE + L.slot + '/' + L.spec + '. ' + COMMON
          + ' Do not broaden scope.\n\nBLOCKING FINDINGS:\n' + state[L.id].review);
-    jobs.push({ cwd: BASE + L.slot, model: L.model, task: task, ...implOpts });
+    jobs.push({ key: 'impl-' + L.id + '-p' + attempt, cwd: BASE + L.slot,
+                model: L.model, task: task, ...implOpts });
   }
   if (jobs.length === 0) { break; }
   const impls = await runs.all(jobs);
   for (let j = 0; j < jobs.length; j++) {
-    // index the LOCAL array: the result carries no lane id
-    let lane = null;
-    for (let k = 0; k < LANES.length; k++) { if (BASE + LANES[k].slot === jobs[j].cwd) { lane = LANES[k]; } }
-    if (lane === null) { continue; }
-    state[lane.id].impl = impls[j].output || '(no output)';
+    // Index the LOCAL jobs array. Results expose only {runId, ok, output}, so the
+    // lane is recovered from the key I set, never from a field on the result.
+    const parts = jobs[j].key.split('-');
+    const laneId = parts[1];
+    state[laneId].impl = impls[j].output || '(no output)';
   }
   emit('impl pass ' + attempt + ' done for ' + jobs.length + ' lane(s)');
 
   const revJobs = [];
   for (let j = 0; j < jobs.length; j++) {
-    let lane = null;
-    for (let k = 0; k < LANES.length; k++) { if (BASE + LANES[k].slot === jobs[j].cwd) { lane = LANES[k]; } }
-    if (lane === null) { continue; }
-    revJobs.push({ cwd: jobs[j].cwd, task: reviewTask(lane, state[lane.id].impl), ...revOpts });
+    const laneId = jobs[j].key.split('-')[1];
+    const lane = LANES.filter(function (x) { return x.id === laneId; })[0];
+    revJobs.push({ key: 'rev-' + laneId + '-p' + attempt, cwd: jobs[j].cwd,
+                   task: reviewTask(lane, state[laneId].impl), ...revOpts });
   }
   const revs = await runs.all(revJobs);
   const still = [];
   for (let j = 0; j < revJobs.length; j++) {
-    let lane = null;
-    for (let k = 0; k < LANES.length; k++) { if (BASE + LANES[k].slot === revJobs[j].cwd) { lane = LANES[k]; } }
-    if (lane === null) { continue; }
-    state[lane.id].review = revs[j].output || '';
-    state[lane.id].blocking = /VERDICT:\s*BLOCKING/i.test(state[lane.id].review);
-    if (state[lane.id].blocking) { still.push(lane.id); }
+    const laneId = revJobs[j].key.split('-')[1];
+    state[laneId].review = revs[j].output || '';
+    state[laneId].blocking = /VERDICT:\s*BLOCKING/i.test(state[laneId].review);
+    if (state[laneId].blocking) { still.push(laneId); }
   }
   log.push('pass ' + attempt + ': blocking=' + (still.length ? still.join(',') : 'none'));
   emit(log[log.length - 1]);
