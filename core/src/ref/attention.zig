@@ -224,6 +224,19 @@ pub const Scratch = struct {
     }
 };
 
+/// Storage dtype of the pooled block keys.
+///
+/// The model pools in f32 and casts the result back to the cache dtype
+/// (`key_groups.float().mean(dim=1).to(raw_keys.dtype)`) before the norm and the
+/// rotation, so on a bf16 cache the pooled keys a query is scored against are
+/// bf16. The graph itself stays f32 throughout; this only names the cast.
+pub const PooledDtype = enum {
+    /// f32 pooled keys, what `forward` computes.
+    f32,
+    /// The cache dtype: round the pooled key to bf16 at the cast points.
+    cache_dtype,
+};
+
 /// RoPE tables for the positions this forward covers.
 pub const Rope = struct {
     /// `[positions, rotary_dim]`, positions `0..positions`.
@@ -274,7 +287,7 @@ pub fn forward(
 }
 
 /// Runs the indexer: fills `scratch.selected` and `scratch.mask`.
-fn forward_indexer(
+pub fn forward_indexer(
     input: []const f32,
     tokens: u32,
     positions: []const u32,
@@ -333,12 +346,23 @@ fn forward_indexer(
             rope.apply(normed, cos, sin, target);
         }
     }
-    forward_select(tokens, positions, weights, state, scratch, table, config);
+    forward_select(
+        tokens,
+        positions,
+        weights,
+        state,
+        scratch,
+        table,
+        config,
+        .f32,
+    );
     assert(state.length > 0);
 }
 
 /// Block pooling, block scoring and the token-level selection mask.
-fn forward_select(
+///
+/// `pooled_dtype` selects the storage the pooled keys are scored in.
+pub fn forward_select(
     tokens: u32,
     positions: []const u32,
     weights: *const Weights,
@@ -346,6 +370,7 @@ fn forward_select(
     scratch: *Scratch,
     table: Rope,
     config: *const fixtures.RefConfig,
+    pooled_dtype: PooledDtype,
 ) void {
     assert(tokens > 0);
     assert(state.length == positions[tokens - 1] + 1);
@@ -369,6 +394,7 @@ fn forward_select(
             scratch,
             table,
             config,
+            pooled_dtype,
         );
         // The incomplete trailing block is appended without pooling.
         const tail = visible - blocks * ratio;
@@ -394,6 +420,17 @@ fn forward_select(
     assert(scratch.mask.len >= tokens * kv_length);
 }
 
+/// Casts one pooled key component to the storage it is held in.
+fn castPooled(value: f32, dtype: PooledDtype) f32 {
+    assert(@sizeOf(f32) == 4);
+    assert(@sizeOf(u16) == 2);
+
+    switch (dtype) {
+        .f32 => return value,
+        .cache_dtype => return ops.round_bf16(value),
+    }
+}
+
 /// Scores the visible blocks and writes the top-k block order.
 ///
 /// The score is `sum_heads relu(q_h . pooled_block) / sqrt(index_dim)`, taken
@@ -408,6 +445,7 @@ fn select_blocks(
     scratch: *Scratch,
     table: Rope,
     config: *const fixtures.RefConfig,
+    pooled_dtype: PooledDtype,
 ) u32 {
     assert(token < config.max_position_embeddings);
     assert(blocks * config.indexer_head_dim <= scratch.pooled.len);
@@ -432,7 +470,7 @@ fn select_blocks(
             }
         }
         for (pooled) |*value| {
-            value.* /= @floatFromInt(ratio);
+            value.* = castPooled(value.* / @as(f32, @floatFromInt(ratio)), pooled_dtype);
         }
         ops.rmsnorm(
             pooled,
@@ -446,6 +484,11 @@ fn select_blocks(
         const cos = table.cos[start * rotary ..][0..rotary];
         const sin = table.sin[start * rotary ..][0..rotary];
         rope.apply(pooled, cos, sin, pooled);
+        for (pooled) |*value| {
+            value.* = castPooled(value.*, pooled_dtype);
+        }
+    }
+    for (0..blocks) |block| {
         scratch.block_scores[block] = block_score(
             token,
             block,

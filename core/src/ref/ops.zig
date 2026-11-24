@@ -220,6 +220,34 @@ pub fn matmul(
     assert(out.len == rows * out_features);
 }
 
+/// Rounds an f32 to the nearest bf16 value and back, ties to even.
+///
+/// The arena stores keys in bf16 and the model casts its pooled index keys to
+/// that dtype, so the reference needs the same rounding at those points. It
+/// mirrors `weights/quant.zig`, which the reference cannot import: a module root
+/// may not reach outside `src/ref/`.
+pub fn round_bf16(value: f32) f32 {
+    assert(@sizeOf(f32) == 4);
+    assert(@sizeOf(u16) == 2);
+
+    const bits: u32 = @bitCast(value);
+    const magnitude = bits & 0x7fff_ffff;
+    // NaN must stay NaN, so quiet it instead of rounding into an infinity.
+    if (magnitude > 0x7f80_0000) {
+        const quiet: u32 = (bits & 0xffff_0000) | 0x0040_0000;
+        return @bitCast(quiet);
+    } else {
+        assert(magnitude <= 0x7f80_0000);
+    }
+    // 0x7fff is the largest remainder that must round up, and the extra bit
+    // breaks exact ties towards an even mantissa.
+    const rounded = bits +% (0x7fff +% ((bits >> 16) & 1));
+    const half: u32 = rounded & 0xffff_0000;
+    const result: f32 = @bitCast(half);
+    assert(@as(u32, @bitCast(result)) == half);
+    return result;
+}
+
 /// Single-vector matrix product: `out[o] = sum_i x[i] * weight[o][i]`.
 pub fn gemv(
     x: []const f32,

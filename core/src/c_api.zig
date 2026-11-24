@@ -255,6 +255,8 @@ test "inferno_version is a NUL terminated C string" {
 }
 
 test "the cubin table holds at least the probe kernel" {
+    _ = @import("hw/kernel.zig");
+    _ = @import("kernels/attention.zig");
     const table = cubin_table();
     try std.testing.expect(table.len > 0);
     const probe_cubin = table[0];
