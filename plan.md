@@ -160,7 +160,7 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 |---|---|---|
 | **all worker lanes** (hard and straightforward) | **`opencode-go/deepseek-v4.1-flash`** ("DeepSeek V4.1 Flash 1017", 1M ctx) | **user directive 2026-11-24: workers use the opencode-go provider.** The earlier "one slot only" reservation is superseded — lanes may run concurrently on this provider; watch for rate limits rather than assuming the slot is exclusive |
 | `synthetic/syn:large:text` | **review gate and reviewer roles only** | **the same model as `opencode-go/deepseek-v4.1-flash` on a different provider** — not a second opinion, see below |
-| `desktop` | **OFFLINE** | see the note below |
+| **`desktop`** (`gary-desktop`, Qwen3.8-Flash-Next IQ4_XS) | **AVAILABLE again 2026-11-24** — mechanical lanes, test harnesses, docs, and **cross-family second opinions**. NOT the primary review gate | the only different-family model we have, and after tonight's finding that the gate shares a family with the worker, it is worth using deliberately for spec/gate-design critique |
 | **review gate** | `synthetic/syn:large:text`, always | never downgrade it to a small model. **Correction 2026-11-24: this is the same model as the worker on a different provider**, so the gate is *not* an independent second opinion — see the note below on why it still works |
 
 `local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not
@@ -187,10 +187,16 @@ someone runs the command. It is **not** a check on the model's blind spots, whic
 and reviewer share. Where a genuine second opinion matters (spec interpretation, gate design), the
 only different-family model available was `desktop` (Qwen3.8-Flash-Next), now offline and unavailable.
 
-**`desktop` is offline from 2026-11-24 (user directive): the machine is needed for other
-work.** It served its purpose — I-024 cleanup passed first time with zero blocking, all eight
+**`desktop` was offline 2026-11-24 and is available again (user directive): the machine is
+free.** It is reachable (`gary-desktop.local:1234` answers `/v1/models` with 200). It served its purpose — I-024 cleanup passed first time with zero blocking, all eight
 findings pinned by tests — and must not be dispatched to again. Mechanical work routes to
 `syn:large:text` instead.
+
+**Its role, deliberately:** mechanical lanes and test harnesses — it did I-024's eight findings
+first-pass with zero blocking — plus **cross-family critique on specs and gate design**, which is the
+one thing `syn:large:text` cannot provide because it is the same model as the worker. It is a 4-bit
+local model, so it must **not** replace the primary gate; its value is a genuinely different family's
+read, and its findings get the same verification as anyone's.
 
 **This is an availability decision, not a measurement-hygiene one.** An earlier version of this
 note claimed `desktop` contended for the same GPUs and thereby explained the ~3 % run-to-run

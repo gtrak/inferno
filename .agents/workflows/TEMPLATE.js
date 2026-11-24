@@ -25,7 +25,8 @@ const REVIEW = 'synthetic/syn:large:text'; // SAME MODEL as WORKER, different pr
 // model-diversity. Do not claim a second opinion we do not have.
 const DEEPSEEK = WORKER;                   // kept so older scripts still resolve
 const STRONG = REVIEW;                     // kept so older scripts still resolve
-const DESKTOP = 'desktop';                 // OFFLINE 2026-11-24: do not dispatch. Kept defined.
+const DESKTOP = 'desktop';                 // AVAILABLE again 2026-11-24 (gary-desktop).
+// Mechanical lanes + cross-family critique. NOT the primary review gate (4-bit local model).
 
 const COMMON = 'You are the ONLY writer in your cwd. Never touch /home/gary/dev/inferno (main) '
   + 'or another slot. Do not run git commit. Do not edit core/build.zig or core/src/hw/kernel.zig. '
