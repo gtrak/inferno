@@ -115,3 +115,40 @@ Implemented / Changed files / Validation (error table + the prefill-vs-decode
 invariant result + selected-count evidence) / Open risks (anything ambiguous in
 the indexer: tie-breaking, block pooling of partial blocks, mRoPE positions) /
 Recommended next step.
+
+## Acceptance additions after the first implementation round (binding for the follow-up)
+
+Decisions on the five risks raised by the lane. Two are defects, not preferences.
+
+1. **`attn_prefill` must apply a per-row selection mask (exact QSA).** A shared union
+   working set without masking makes a query attend to keys it did not select, which
+   changes what the model computes — it is a semantic change, not a rounding
+   difference. Keep the union *gather* (per-row gathering is infeasible: 4096 rows ×
+   2048 keys × 1 KB = 8.4 GB per layer per chunk) but carry a per-row bitmap and mask
+   the scores. **Report the union/budget ratio** so chunk size can be tuned to keep it
+   near 1.
+
+2. **The indexer scores buffer must be bounded, independent of context.** It is
+   currently `M × n_blocks` fp32 = **1.07 GB at M=4096, 256K context**. Replace with a
+   streaming top-k: process block groups (e.g. 8192 blocks), keep a running per-row
+   partial top-`block_topk`, and merge. Assert that peak score-buffer bytes do not
+   grow with context length.
+
+3. **`attn_prefill` needs an MMA path; warp-scalar misses the target by 65 %.** At
+   27.5 µs/token/layer × 12 layers = **330 µs/token**, against a 200 µs/token budget
+   for the 5,000 tok/s prefill target. The arithmetic is only 0.60 GFLOP/token, so at
+   the measured 46.3 TFLOPS/GPU fp8 rate this should cost **~3 µs/token**. Use
+   `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` on the gathered K/V directly
+   (lever M5: the working set is already fp8, so no dequantise step). Gate: prefill
+   attention ≤ 5 µs/token/layer at the production shape.
+
+4. **Keep pooled indexer keys in BF16, and document why it is not a compromise.** The
+   reference pools in f32 and then casts to `raw_keys.dtype`, which for the real model
+   **is bf16** — so bf16 pooled keys match the real model more closely than the f32
+   CPU oracle does. The observed 0.1 % selection drift (16380/16396) is an artifact of
+   comparing against our f32 oracle, not a loss. F32 pooled keys are ruled out on cost
+   alone: 33.55 MB vs 16.78 MB at 256 K, and re-reading them per layer would cost
+   ~7 ms/token. State both facts in the test header.
+
+5. **Interleave K and V in the gathered working set**: one `[count, 2, kv_heads,
+   head_dim]` array, so the gather is one H2D and the inner loop has single addressing.
