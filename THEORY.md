@@ -53,6 +53,28 @@ which is the figure for "every weight byte is read once".
 Breakdown (as shipped): experts 10/512 × 67.95 = 1.327 · dense 7.26 · lm_head
 1.271 · PLE projections 0.065.
 
+**Plus the state stream, which the weight accounting above omits.** Measured in
+I-009 (production shape, 48 v-heads × 128×128 fp32 = 3 MiB/layer): the GDN delta +
+gate-norm chain costs **20.3 µs/layer single-GPU = 0.731 ms/token over 36 layers**,
+streaming state at 331 GB/s = 78 % of measured HBM. That figure is **single-GPU**;
+in the distributed design the dense value path is TP=4 and the recurrent state is
+split by v-heads (12 per rank), so each rank streams 1/4 of it ⇒ **≈0.18–0.25
+ms/token**, not 0.731. Both numbers belong in the budget and must not be confused:
+0.731 ms is what a single-GPU port of this model would pay.
+
+Revised single-stream decode estimate (rung 2 weights, 4 GPUs):
+
+| term | ms/token |
+|---|---:|
+| weight read floor (5.00 GB at 1792 GB/s) | 2.79 |
+| GDN state stream, per rank | 0.20 |
+| KV working-set gather (DRAM tier, §7 of the single-stream design) | 0.60–0.90 |
+| 4-GPU comms (fused all-reduce + MoE dispatch/combine) | ~1.0 |
+| **total** | **4.6–4.9** ⇒ **~205–215 tok/s** |
+
+Note the state stream is **context-independent** (a fixed 113 MB/sequence), so it is
+paid identically at 4 K and at 256 K — unlike KV, which scales with context.
+
 **Practical ceiling** = ≈20–40 % of the above (kernel efficiency, 4-GPU latency,
 PCIe comms): **35–70 tok/s single-stream** for the as-shipped layout. Any claim
 above 172 tok/s is a measurement error.
