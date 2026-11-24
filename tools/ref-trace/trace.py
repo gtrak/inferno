@@ -32,7 +32,17 @@ GREEDY_TOKENS = 16
 
 
 def contract_names(config):
-    """The exact tensor names required by issue I-04, derived from the tiny config."""
+    """The exact tensor names required by issue I-04, derived from the tiny config.
+
+    The tiny config yields 104 names per section. The trace holds 120 tensors
+    per section (240 total): `capture.py` also stores 16 diagnostic captures per
+    section that are deliberately NOT contract names, so nothing here checks
+    for them and a consumer must not report them as missing --
+    `layer{L}/gdn/recurrent_state` (3), `layer{L}/moe/shared_out_ungated` and
+    `layer{L}/moe/shared_gate_logit` (4 + 4), `layer{L}/ple/query_normed` and
+    `layer{L}/ple/gated_value_normed` (1 + 1), and `layer{L}/attn/weights`,
+    `layer{L}/attn/indexer/q`, `layer{L}/attn/indexer/num_blocks` (3).
+    """
     names = ["embed/output", "rotary/cos", "rotary/sin", "final/mixer_out", "final/logits"]
     for layer, layer_type in enumerate(config["layer_types"]):
         prefix = f"layer{layer}/"

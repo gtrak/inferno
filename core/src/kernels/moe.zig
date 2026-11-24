@@ -2344,10 +2344,13 @@ fn routeWeights(router: []const f32) ref_moe.Weights {
 
 // The synthetic tie cases below are the router's tie-breaking gate. They
 // compare against `ref/moe.zig`'s `topk_descending`, which selects the lowest
-// index of an equal group. Actual `torch.topk` does not promise that order:
-// torch 2.12 returns arbitrary orders for equal values on both CPU and CUDA,
-// so the oracle is the only deterministic tie contract this kernel can be
-// gated against.
+// index of an equal group. Inferno fixes that order deliberately; torch does
+// not promise one, and says so itself - the `torch.topk` docstring reads "the
+// indices of tied elements are not guaranteed to be stable" - and on CPU
+// torch 2.15.0+cpu the top 10 of 512 equal probabilities is experts 344 337
+// 338 339 340 341 342 343 350 349, not the ten lowest. The repro is in the
+// `moe_router_topk` header in moe.cu. The oracle is therefore the only tie
+// contract this kernel can be gated against.
 test "the router matches the oracle on random and tied logits" {
     const allocator = std.testing.allocator;
     var harness = try Harness.open();

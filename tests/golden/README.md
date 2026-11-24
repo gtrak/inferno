@@ -15,6 +15,35 @@ Provenance (also in `tools/ref-trace/reference/VERSION.txt`):
 | attention | `_attn_implementation="eager"` |
 | kernels | `flash-linear-attention` and `causal_conv1d` are **not** installed, so every reference path is the plain-PyTorch one (`torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule`, `causal_conv1d_fn`, `causal_conv1d_update`) |
 
+## The thread count is part of the fixture
+
+`torch.set_num_threads(1)` is not incidental: the committed tensors are that
+setting's output, and no other setting reproduces them bit for bit.
+
+Measured on this machine (torch 2.15.0+cpu, float32, eager; the default thread
+count here is 12) by re-running the trace and comparing every tensor against the
+committed one:
+
+| condition | observed max abs difference |
+|---|---|
+| re-run at `set_num_threads(1)` — the control, 2 runs | `0.0`: all 112 float tensors of each section are bit-identical |
+| default threads, `final/logits` | 4.5e-8 (prefill), 3.0e-8 (decode) |
+| default threads, worst tensor in a section | 2.4e-7 (`layer2/attn/indexer/q`, `decode/layer3/gdn/g`) |
+| default threads, worst on the scaled bound `max abs err / max(1e-6, max abs golden)` | 2.9e-7 (`layer3/moe/out`), 2.4e-7 (`decode/layer3/moe/shared_out`) |
+
+To reproduce: load `tiny/trace.safetensors`, run the same 12-token prefill and
+1-token decode as `trace.py` (same input ids, the `decode_input_id` from the
+fixture metadata) *without* calling `torch.set_num_threads(1)`, then take
+`max |new - committed|` per tensor. `trace.py` writes the fixture in place, so
+copy it aside first. The 8 integer / bool tensors per section (masks, router
+indices, n-gram ids, indexer ids and counts) matched the fixture in that run
+too, so the drift is confined to the float tensors.
+
+**Consequence for consumers:** compare these fixtures bit-exactly *only* under
+`set_num_threads(1)`; anywhere else use `rtol`/`atol ≈ 1e-6` in fp32, which sits
+above the worst figure observed here (2.4e-7). `core/src/ref/tests.zig` applies
+the scaled bound `2e-5`.
+
 ## Files
 
 | file | what it is |

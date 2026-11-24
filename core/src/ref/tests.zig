@@ -6,12 +6,15 @@
 //!
 //! Tolerances, from the issue:
 //!
-//! * per tensor: `max |err| / max(1e-6, max |golden|) <= 2e-5`; * the fixture
-//! itself is only bit-exact under `torch.set_num_threads(1)` (see
-//! `.agents/tasks/reviewer-followups.md` item 4: at the default thread count
-//! the reference moves by ~4.5e-8), so an fp32 reimplementation can only be
-//! expected to agree to `rtol/atol ~ 1e-6`; the gate above is that bound scaled
-//! by each tensor's magnitude.
+//! * per tensor: `max |err| / max(1e-6, max |golden|) <= 2e-5`;
+//! * the fixture is bit-exact only under `torch.set_num_threads(1)`, the
+//!   setting `tests/golden/README.md` records and re-measures (at 1 thread the
+//!   reference reproduces all 224 float tensors exactly). Left at the default
+//!   thread count the reference itself moves - ~4.5e-8 (prefill) and
+//!   ~3.0e-8 (decode) on `final/logits`, ~2.4e-7 over every captured tensor -
+//!   so compare bit-exactly only against that setting and otherwise use
+//!   `rtol`/`atol` ~ 1e-6 in fp32; the gate above is that bound scaled by
+//!   magnitude.
 //!
 //! The prefill pass is driven layer by layer so every intermediate is still
 //! live when it is compared; a second test then runs the whole model through
@@ -233,8 +236,8 @@ const Harness = struct {
     probe_storage: ProbeStorage,
     saved_hyper: []f32,
     transposed: []f32,
-    /// `[conv_dim, kernel - 1]` staging view of the trace's conv state, which is
-    /// one column wider than the state the reference keeps (see
+    /// `[conv_dim, kernel - 1]` staging view of the trace's conv state,
+    /// which is one column wider than the state the reference keeps (see
     /// `compare_gdn_state`).
     conv_view: []f32,
 
@@ -597,11 +600,12 @@ const Harness = struct {
 
     /// Compares the GDN cache state of layer `index` after the forward.
     ///
-    /// These two tensors are the whole cross-step contract of a linear-attention
-    /// layer - the GDN kernels of I-009 are handed exactly them - and before this
-    /// comparison nothing in the suite read them at all. `recurrent` is
-    /// `[num_v_heads, head_k_dim, head_v_dim]` in both; the conv state needs the
-    /// column drop that `drop_leading_column` explains.
+    /// These two tensors are the whole cross-step contract of a
+    /// linear-attention layer - the GDN kernels of I-009 are handed exactly
+    /// them - and before this comparison nothing in the suite read them at
+    /// all. `recurrent` is `[num_v_heads, head_k_dim, head_v_dim]` in both;
+    /// the conv state needs the column drop that `drop_leading_column`
+    /// explains.
     fn compare_gdn_state(
         self: *Harness,
         prefix: []const u8,
@@ -1198,12 +1202,13 @@ fn expect_non_vacuous(harness: *Harness) !void {
             },
         );
     }
-    // Strict bounds, not the tautologies this check used to hold. With the golden
-    // trace every one of them is live: 5 distinct sets over 12 positions, 6
-    // distinct ordered pairs. So `distinct > 1` fails when every position routes
-    // to the same pair, `distinct < positions` when routing is a bijection, and
-    // `ordered > distinct` when the trace never picks a pair in two different
-    // orders - which is what makes the slot a routed expert lands in observable.
+    // Strict bounds, not the tautologies this check used to hold. With the
+    // golden trace every one of them is live: 5 distinct sets over 12
+    // positions, 6 distinct ordered pairs. So `distinct > 1` fails when every
+    // position routes to the same pair, `distinct < positions` when routing is
+    // a bijection, and `ordered > distinct` when the trace never picks a pair
+    // in two different orders - which is what makes the slot a routed expert
+    // lands in observable.
     try std.testing.expect(distinct > 1);
     try std.testing.expect(distinct < positions);
     try std.testing.expect(ordered > distinct);

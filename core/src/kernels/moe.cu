@@ -340,11 +340,22 @@ moe_router_logits(const __nv_bfloat16 *__restrict__ a,
 //
 // Ties are broken exactly like `ref/moe.zig`'s `topk_descending`: the scan
 // keeps the first maximum, so equal probabilities select the lowest expert
-// index. That is the repo's executable contract for the router. It is *not*
-// what torch.topk does: torch's docs leave the order of equal values
-// unspecified, and torch 2.12 returns arbitrary orders for them (observed:
-// [8,15,14,13,12,11,10,9,2,3] for sixteen equal probabilities on CPU,
-// [7,6,4,5,1,0,2,3,8,9] for 512 on CUDA). The oracle, not torch's tie order,
+// index. Inferno fixes that order deliberately; `torch.topk` does not, and
+// its own docstring says so: "the indices of tied elements are not
+// guaranteed to be stable". Measured on CPU torch 2.15.0+cpu (the version
+// these fixtures were generated with, see tests/golden/README.md); the repro
+// below runs from the repo root and three runs agreed:
+//
+//   cd tools/ref-trace && ./.venv/bin/python - <<'PY'
+//   import torch
+//   f = lambda n: torch.topk(torch.ones(1, n), 10)[1][0].tolist()
+//   print(f(16)); print(f(512))
+//   PY
+//   # -> [8, 15, 14, 13, 12, 11, 10, 9, 2, 3]
+//   #    [344, 337, 338, 339, 340, 341, 342, 343, 350, 349]
+//
+// That venv is CPU-only (`torch.cuda.is_available()` is False), so nothing
+// is claimed here about torch's tie order on a GPU. The oracle, not torch,
 // is what this kernel is gated against. One block per token: 128 threads
 // reduce the max, thread 0 sums the probabilities in index order (the
 // reference's summation order, needed for the 1e-6 weight contract), then
