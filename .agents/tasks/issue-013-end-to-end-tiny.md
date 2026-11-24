@@ -86,3 +86,39 @@ Also decided during that attempt and worth not re-deriving: the tiny config has
 
 If this times out again, the next attempt should be given a **2.5 h budget** and start at
 item 1, not at design: 1,581 lines of wiring already exist.
+
+## Exact remaining blocker (diagnosed 2026-11-24, second timeout)
+
+The tree is at **4,676 lines** across `model/{plan,glue,load,exec,state,generate,tiny_check}.zig`,
+`c_api.zig` is wired, and **185/186 tests pass**. Exactly one test fails, and it is the
+end-to-end one:
+
+```
+error: 'model.tiny_check.test.the tiny model reproduces the golden logits and the golden
+greedy ids' failed: config: cannot parse: MissingField
+```
+
+**Cause, verified against the real checkpoint:** `~/models/qwen38-flash-next-nvfp4/config.json`
+nests the model under `"text_config"` and carries **both** `full_attention_interval: 4` and a
+48-entry `layer_types`. `tests/golden/tiny/config.json` is **flat** (no `text_config` wrapper)
+and has `layer_types` but **no** `full_attention_interval`. The production parser
+(`weights/config.zig`, whose doc comment shows the nested shape) therefore rejects the fixture.
+
+**Do this, and only this:**
+1. In `tiny_check.zig`, wrap the flat fixture as `{ "text_config": { ... } }` before parsing,
+   and derive `full_attention_interval` from `layer_types` (both are present in production, so
+   this is faithful, not a fiction). Put a comment saying the fixture is flat and why the test
+   adapts rather than the loader.
+2. **Do not change `weights/config.zig`** and **do not change the committed fixture** — the
+   fixture regeneration is follow-up work and must not block the architecture gate.
+3. Then run the ids. If they mismatch, bisect per layer against `trace.safetensors` and report
+   the first divergence; do not adjust a kernel to make them agree.
+
+**Budget note:** two 90-minute attempts have died on this task, both after real progress, and
+neither was stuck. Start at step 1 above. Do not re-derive the wiring, the plan, the loader or
+the glue — they exist and 185 tests pin them.
+
+## Prefill numbers in the tree are NOT valid measurements
+
+The lanes ran alongside other GPU work. Any throughput printed by these lanes is indicative
+only; M-001 is the measurement of record.
