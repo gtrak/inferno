@@ -122,3 +122,48 @@ the glue — they exist and 185 tests pin them.
 
 The lanes ran alongside other GPU work. Any throughput printed by these lanes is indicative
 only; M-001 is the measurement of record.
+
+## OPEN: residual nondeterminism (2026-11-24, gauntlet evidence)
+
+Determinism is **NOT** fixed. Sixteen repeat runs of one binary produced:
+
+```
+ulp_error 6.75  x14
+ulp_error 6.70  x 1   (/tmp/run_9.log)
+ulp_error 5.91  x 1   (/tmp/run_8.log)
+```
+
+and a later invocation showed `ulp_error 7.79, max_abs_err 1.522e-2` while all sixteen logs carry
+`max_abs_err 7.652e-3`. The greedy ids are identical in every run, so the ids gate holds; the
+*forward* still varies. Flake rate ~12 %.
+
+The 1.4 MB score-buffer overrun and the missing `applyRope` fence were real and are fixed, but
+they were not the whole story.
+
+### Do these in order, cheapest first
+
+1. **`CUDA_LAUNCH_BLOCKING=1` on the e2e test.** One env var, no code change. If the spread
+   vanishes, the remaining bug is **host-side async ordering** — another unordered dependency
+   between the executor stream and a module stream. If it persists, it is memory (uninitialised
+   read, a second sizing mismatch) or an intra-kernel race.
+2. **`compute-sanitizer --tool racecheck`** — catches shared-memory and warp-sync hazards inside
+   kernels, and names the kernel and line. This is the one tool never run on this path.
+   Then `--tool memcheck`. Note `memcheck` reported 0 errors despite a 1.4 MB overrun, because
+   the write stayed inside a larger allocation, so its silence proves less than it looks.
+3. **Bisect by synchronisation.** If step 1 implicates ordering, add an explicit
+   `cudaStreamSynchronize` after every launch behind an env flag, confirm determinism, then
+   re-add syncs one at a time until the spread returns. That localises the missing dependency
+   to a single launch pair — do not guess which one.
+
+### Verification rule
+
+Flake rate is ~12 %, so three runs cannot clear a fix. Verify the final configuration with
+**>= 20 runs once**, record the count and every distinct value, and do not repeat the loop per
+gate afterwards. See the verification-effort rule in `plan.md`.
+
+### Do not
+
+- Do not widen the ulp ceiling (16) to absorb the spread. The spread is the bug.
+- Do not touch `core/build.zig`, add a `tiny-check` step, or relax any tolerance.
+- Do not "fix" it by adding a blanket `cudaDeviceSynchronize` and calling it done — that hides
+  the dependency rather than stating it, and it would serialise the real pipeline.
