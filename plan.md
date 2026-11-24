@@ -159,10 +159,26 @@ Wave 6 — real model + hill-climb:
 - **I-24** speculative decoding (L7).
 - **I-25** vision tower (deferred, optional).
 
-## 8. Non-negotiables
+## 8. Non-negotiable
 
+0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
+   `tools/gate.sh` "structural invariants": `core/build.zig.zon` must be
+   `.dependencies = .{}`, `Cargo.lock` must hold exactly one package, and no CUDA
+   symbol may appear outside `core/src/hw/`. Rationale: Zig was chosen for the
+   core because our unsafe mass is pointer-shaped (driver handles, mmap'd page
+   tables, intrusive LRU/free-lists, coalesced staging buffers) and Zig wraps more
+   of that behind a smaller surface than Rust, where the same unsafety relocates
+   into index-slab modelling, `Pin`, lifetime workarounds and `unsafe impl Send`.
+   Rust keeps the *other* mass — dataflow between threads and across the network —
+   where `Send`/`Sync` and the type system still buy real guarantees.
+   Corollary: because Zig safety is a build mode (`ReleaseSafe`) rather than a
+   compiler guarantee, the assertion discipline below is load-bearing, not
+   decorative.
 1. Every Zig function: ≥2 assertions, no recursion, no dynamic allocation after
    init, ≤70 lines, explicit integer widths (tiger-style).
+1b. **No `assert`/panic may cross the C ABI.** Exported functions return error
+   codes; a panic on a driver error path would abort the Rust server. (Found by
+   the I-001 gate review.)
 2. Every kernel is validated against the **CPU reference** (I-05) or the **HF
    golden trace** (I-04) — never against another GPU implementation.
 3. No gate may be weakened to make it pass; the orchestrator re-runs every gate.
