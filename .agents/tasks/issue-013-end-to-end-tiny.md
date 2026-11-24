@@ -28,17 +28,26 @@ speed. Treat a mismatch as an architecture bug, never as "numerics".
 ## Gates
 ```
 bash tools/gate.sh ; echo EXIT=$?
-(cd core && timeout 1800 zig build tiny-check) ; echo TINY=$?
+(cd core && timeout 1800 zig build test) ; echo CORETEST=$?
 python3 - <<'EOF'
 import json; d=json.load(open("tests/golden/tiny/greedy_ids.json"))
 print("golden greedy:", d["ids"]); assert len(d["ids"]) >= 16
 EOF
 ```
-`tiny-check` must print and assert:
+**Amended after a lane escalation:** the original gate named `(cd core && zig build tiny-check)`,
+which contradicted this spec's own "do not edit core/build.zig" and, worse, is a command
+`tools/gate.sh` never runs — it would have made the architecture gate a test that CI silently
+skips. The check is therefore a **normal `test` block** reachable from `core/src/c_api.zig`'s
+merged import list, so `bash tools/gate.sh` → `zig build test` executes it. No new build step.
+It must **assert**, and report its wall time.
+
+It must print and assert:
 1. **Prefill logits** vs `tests/golden/tiny/trace.safetensors::final/logits`:
    `max_abs_err/max|ref| <= 4e-3` (bf16 GPU vs fp32 oracle).
 2. **Greedy ids: EXACT equality** with `tests/golden/tiny/greedy_ids.json` for 16
    tokens, both (a) full-recompute each step and (b) with the incremental caches.
+   Assert with `expectEqualSlices` and put the first mismatching index and both ids in the
+   failure message — a printed id list is not a gate.
    Doubling as a cache-correctness check: (a) and (b) must also agree with each other.
 3. **Non-vacuity**: print the 16 ids, the number of distinct ids (must be >1), the
    max |logit|, and the KV length after generation (must equal prompt+16).
