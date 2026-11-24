@@ -52,6 +52,34 @@ Two live models, both bound correctly:
 - prefill the same prompt through `a` and `b` and require identical logits;
 - `a.reset(); a.forward()` after `b` exists must equal the same run in a fresh process.
 
+## Why Rust would have prevented this, and what we do instead
+
+This is the one bug class in this project where the borrow checker earns its keep. A self-referential
+struct cannot be *constructed* in safe Rust — there is no lifetime meaning "inside myself" — so the
+workarounds all require an explicit act (`Box::pin`, `self_cell`, `Rc<RefCell<_>>`, or indices instead
+of pointers). The bug could not have drifted in. For the device-memory bugs (the 1.4 MB overrun, the
+stride mismatch, the missing fence) Rust helps essentially not at all, because CUDA buffers and stream
+ordering sit outside its model. This one is entirely host-side, in safe code, in its domain.
+
+Zig's answer is discipline plus a guard. So, in addition to the out-parameter `init`:
+
+**A self-containment assertion, debug-only, at the end of `init`:**
+
+```zig
+// Every interior pointer must lie inside the Model that now owns them.
+assert(inRange(self, &self.ple.stream));
+assert(inRange(self, &self.ple));
+assert(inRange(self, &self.table));
+```
+
+where `inRange` is `@intFromPtr(ptr) >= @intFromPtr(base) and @intFromPtr(ptr) < @intFromPtr(base) + @sizeOf(Model)`.
+This is the §7d rule 2 case: a bounded runtime guard that fires on the **first** run and names the
+field, instead of a probe written after the fact. It would have caught the by-value return the first
+time any caller built a second model, and it costs nothing in release.
+
+Add it to every self-referential struct in the tree, not just `Model` — `State`, `Block`, `Pool` and
+anything else that stores a pointer to a sibling. Grep for `= &self.` and `= &model.` to find them.
+
 ## Gates
 
 ```
