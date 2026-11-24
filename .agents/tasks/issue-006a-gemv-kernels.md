@@ -102,15 +102,19 @@ Design requirements:
 
 ```
 bash tools/gate.sh ; echo EXIT=$?
-(cd core && timeout 600 zig build fp4probe && cat ../bench/fp4-mma-probe.txt) ; echo PROBE=$?
 (cd core && timeout 1200 zig build test) ; echo CORETEST=$?
 ```
 
-`gemvtest` must print, per shape/kernel: `max_abs_err / max|ref|` (must be
-`<= 2e-2` for NVFP4 — 4-bit weights, the *dequantised float* is the reference so
-the error must be much smaller: assert `<= 2e-3` against `ref` computing from the
-**dequantised** weights; also report the error against the original fp32 weights
-as information) and **achieved GB/s** with the median of ≥6 iterations.
+The test suite (reached through the `c_api.zig` import — there is no per-kernel build
+step) must print, per shape/kernel, `max_abs_err / max|ref|` on a **three-tier
+ladder** (see `.agents/tasks/review-gate.md` §5):
+- tier 1 operand-exact (both sides get the kernel's own quantised operands):
+  **assert ≤ 1e-6** — repack, LUT decode, block-scale application.
+- tier 2 vs `ref` on the **dequantised** weights: **assert ≤ 2e-3**.
+- tier 3 vs the **original fp32** weights: **report only, never assert**. Per-16
+  E2M1 on Gaussian data cannot beat ~8-10 %; the earlier `<= 2e-2` wording in this
+  spec was an error (it describes the exact path, not 4-bit weights).
+Plus **achieved GB/s**, median of ≥6 iterations.
 
 Acceptance: for `gemv_nvfp4_bf16` at `[10240,2560]` (3.3 MB of weights) the
 achieved bandwidth must be **≥ 55 % of the measured single-GPU HBM bandwidth**
