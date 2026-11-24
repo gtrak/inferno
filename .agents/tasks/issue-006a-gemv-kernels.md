@@ -108,8 +108,12 @@ bash tools/gate.sh ; echo EXIT=$?
 The test suite (reached through the `c_api.zig` import — there is no per-kernel build
 step) must print, per shape/kernel, `max_abs_err / max|ref|` on a **three-tier
 ladder** (see `.agents/tasks/review-gate.md` §5):
-- tier 1 operand-exact (both sides get the kernel's own quantised operands):
-  **assert ≤ 1e-6** — repack, LUT decode, block-scale application.
+- tier 1 operand-exact (both sides get the kernel's own quantised operands): the
+  output is **bf16**, so the criterion is **correctly-rounded output,
+  `ulp_error <= 0.5`** (observed 0.249–0.500 across 14 cases), plus
+  `dequantised.ratio <= 2^-7` for scale application, plus **bit-exact operand
+  decode** pinned by the committed golden fixtures. An absolute 1e-6 was
+  unsatisfiable at bf16 and was a spec defect.
 - tier 2 vs `ref` on the **dequantised** weights: **assert ≤ 2e-3**.
 - tier 3 vs the **original fp32** weights: **report only, never assert**. Per-16
   E2M1 on Gaussian data cannot beat ~8-10 %; the earlier `<= 2e-2` wording in this

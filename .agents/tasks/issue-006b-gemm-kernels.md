@@ -114,7 +114,9 @@ Acceptance:
    dtype policy are different questions (`.agents/tasks/review-gate.md` §5):
    - **tier 1, operand-exact** (both sides get the kernel's own quantised
      operands): the kernel machinery — repack, fragment layouts, SFA/SFB, epilogue —
-     must match to **≤ 1e-6**. This is the real correctness gate.
+     must match at **the output format's precision**: `ulp_error <= 0.5` (correctly
+     rounded bf16), or ≤1e-6 only if the output is f32. This is the real correctness
+     gate.
    - **tier 2, W4A16** (`gemm_nvfp4_bf16` vs the oracle on dequantised weights,
      activations bf16): `max_abs_err/max|ref| <= 5e-4`.
    - **tier 3, W4A4 vs the original fp32 weights**: **reported, NOT asserted.**

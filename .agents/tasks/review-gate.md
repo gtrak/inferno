@@ -51,7 +51,16 @@ Never force-kill a process; use `timeout`.
    - `zig fmt --check` clean.
 5. **Numerics — two questions, never conflated.** A kernel test must answer
    "is the kernel's *math* right?", i.e. both sides get **identical inputs**
-   (round the oracle's inputs to the kernel's dtype first). The effect of the
+   (round the oracle's inputs to the kernel's dtype first).
+   **Tier-1 tolerance is expressed in the OUTPUT format's precision, not as a
+   blanket absolute epsilon.** For a reduced-precision store (bf16/fp16 output) the
+   correct criterion is **correctly-rounded output: `ulp_error <= 0.5`** against an
+   f32 reference — at |y|max ≈ 11 one bf16 step is 0.0625, so an absolute 1e-6
+   assertion is unsatisfiable by construction and is a spec defect, not a kernel
+   defect. Use a tight absolute epsilon only when the kernel's output really is f32.
+   Operand decode should be pinned separately and bit-exactly (committed golden
+   fixtures), and a `dequantised.ratio <= 2^-7`-style bound covers scale application.
+   (This rule exists because I twice wrote "assert <= 1e-6" for a bf16-output kernel.) The effect of the
    engine's dtype policy (bf16 activations, fp8 KV, ...) is a *model-level*
    question, measured against the HF golden trace at I-013 and later, never
    folded into a kernel comparison. Why this matters: with bf16 output the
