@@ -68,6 +68,59 @@ is rejected — rare-token logits are exactly where 4 bits hurts.
 ### Hyper-connections → E4M3 per output row (1.272 → 0.636 GB)
 Pure value paths. Second-cheapest rung only if needed.
 
+## 2b. Host DRAM as an expert tier (L4) — measured, and promoted to primary
+
+EP does **not** stream weights: it routes token *activations* to the expert-owner.
+Per layer per token that is 10 experts × 2560 × 2 B ≈ 50 KB of activation (≤4 peer
+copies) against **2.7 MB** for one cold expert's weights — ~500× more. EP is not
+precedent for weight streaming, but its machinery (async peer copy + event-ordered
+consumption) is exactly what an async weight prefetch needs, so the tier reuses
+infrastructure we must build anyway.
+
+Measured (I-002): PCIe 6.73 GiB/s per GPU, 26.9 GiB/s aggregate, P2P 6.8 µs;
+host `memcpy` 25.7 GiB/s (read+write). DRAM and PCIe are comparable, so they
+pipeline rather than one dominating.
+
+**Why the earlier "2.7 ms/token forever" estimate was wrong** — three errors:
+offload sized at 3.77 GB instead of the 2.8 GB actually needed; cold-*byte* share
+assumed equal to cold-*invocation* share (routing is skewed); and the per-GPU link
+plus per-layer hiding budget ignored.
+
+Corrected arithmetic for 2.8 GB offloaded (4.1 % of expert bytes, ~2.5 % of
+invocations with a statistics-chosen cold set):
+
+| quantity | value |
+|---|---:|
+| cold fetch per token | ≈ 33 MB |
+| per GPU per layer | ≈ 0.17 MB |
+| per-layer hiding budget (115 µs × 7.2 GB/s) | ≈ 0.83 MB |
+| headroom | **≈ 5×** ⇒ mostly hidden |
+
+So the expected cost is **0–0.5 ms/token**, not 2.7 ms — and it is *overlappable*
+rather than additive.
+
+**Ordering consequence:** the DRAM tier goes *before* the expert requant. DRAM
+tiering risks latency (measurable, tunable, revertible); expert requant risks
+quality on the dominant compute path (harder to bound). Tiering also barely
+penalises prefill, because a prefill chunk touches essentially every expert, so the
+fetch amortises over thousands of tokens.
+
+### The caveat that decides it: batch size
+
+At decode batch B the distinct experts touched per layer grows ≈ min(10·B, 512), so
+the cold set's invocation share rises while the per-layer hiding budget is fixed.
+Tiering is **batch-sensitive**; requant is not. Measure both at B=1 and B=8 before
+committing.
+
+### Sizing must come from data, not guesses
+
+Cache *capacity* is not the constraint (≈50 GB of DRAM is free; the 51.2 GB n-gram
+table lives on NVMe). Miss *rate* is. Overshooting is a real trap: offloading 30 %
+of expert bytes raises the invocation share to ~10–15 %, i.e. 130–200 MB/token →
+4.5–7 ms. So: build an **expert-frequency histogram** on a calibration corpus
+(routing depends only on hidden states) and choose the hot/cold split from it.
+That measurement is a required step of I-021, not an optimisation.
+
 ## 3. The ladder — stop at the cheapest rung that fits
 
 | rung | change | weights | +state ≈1.5 | fits 66.6? | decode bytes/token |
@@ -76,7 +129,7 @@ Pure value paths. Second-cheapest rung only if needed.
 | 1 | dense + lm_head → E4M3 | 72.23 | 73.7 | no (−7.1) | 6.34 GB |
 | 2 | + experts → MXFP4 per-32 | 68.46 | 70.0 | no (−3.4) | 5.62 GB |
 | 3 | + hyper-connections → E4M3 | 67.83 | 69.3 | no (−2.7) | 5.30 GB |
-| 4 | + 2.8 GB of coldest experts offloaded (L4/L5) | 65.03 | 66.5 | **yes** | 5.30 GB |
+| 4 | + 2.8 GB of coldest experts in DRAM (L4) | 65.03 | 66.5 | **yes** | 5.30 GB + ≤0.5 ms hidden |
 
 Rung 4 only fits by moving ~4 % of expert bytes out of VRAM. That is why **L5
 (compute cold experts on the idle CPU) is the preferred closer**: 14 cold
@@ -121,3 +174,16 @@ revertible without re-downloading.
 - The converted weights are validated by re-running the **manifest** gate
   (I-003's `total_bytes == index_total_size` equivalent) plus the decoders'
   oracle tests, before any model load.
+
+## 6. Revised decision order (supersedes §3's implied order)
+
+1. **L2 dense + lm_head → E4M3** (pure win, no behavioural risk: halves dense
+   decode bytes, ~×1.8 decode ceiling).
+2. **L4 DRAM expert tier** for the VRAM remainder — primary closer, prefer it over
+   L3 because its risk is measurable latency rather than unbounded quality.
+3. **L3 expert → MXFP4** only if L4 measures worse than the 0–0.5 ms prediction,
+   or if decode batch ≥ 8 is the target and the tier's miss share breaks the
+   hiding budget.
+4. **L5 CPU-computed cold experts** as a refinement of L4 (avoids contending with
+   the all-reduce/dispatch traffic on the same link) — no longer a stretch goal,
+   but not on the critical path either.
