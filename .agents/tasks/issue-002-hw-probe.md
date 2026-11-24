@@ -66,15 +66,50 @@ python3 - <<'EOF'
 import json
 d = json.load(open("bench/hw-probe.json"))
 assert len(d["device_info"]) == 4, d["device_info"]
-assert all(v > 10 for v in d["h2d_bw_gib_s"]), d["h2d_bw_gib_s"]
-assert all(v > 300 for v in d["d2d_bw_gib_s"]), d["d2d_bw_gib_s"]
+# Per-GPU floors are LINK-bound: Gen4 x4 = 7.88 GB/s = 7.34 GiB/s raw, so ~6.7 GiB/s
+# is the honest ceiling. >=5 catches a host-bounce or a wrong-direction measurement.
+assert all(v >= 5.0 for v in d["h2d_bw_gib_s"]), d["h2d_bw_gib_s"]
+assert all(v >= 5.0 for v in d["d2h_bw_gib_s"]), d["d2h_bw_gib_s"]
+# This is the floor with teeth: it proves all four x4 links are usable CONCURRENTLY,
+# which the TP=4/EP=4 design depends on. Gen4 x16 = 31.5 GB/s = 29.3 GiB/s raw.
+assert d["aggregate_h2d_gib_s"] >= 20.0, d["aggregate_h2d_gib_s"]
+# Device-local copy, two explicit bases (never one number with a basis string):
+# copied-once must be 20x any PCIe path; HBM traffic (read+write) must approach spec.
+assert all(v >= 150.0 for v in d["d2d_copied_gib_s"]), d["d2d_copied_gib_s"]
+assert all(v >= 300.0 for v in d["d2d_hbm_gib_s"]), d["d2d_hbm_gib_s"]
 assert len(d["p2p"]) == 16, "expected a 4x4 matrix"
 print("probe OK")
 EOF
 ```
 
-The d2d assertion (>300 GiB/s) is a real floor: it must beat the PCIe link,
-proving the copy is device-local. If it fails, the measurement is wrong — fix it.
+### Reporting bases (mandatory, no ambiguity)
+
+Every bandwidth field carries an explicit name that states its basis, and the
+JSON also carries a `basis` object of one-line strings:
+
+| field | basis |
+|---|---|
+| `h2d_bw_gib_s`, `d2h_bw_gib_s` | bytes moved across the link, counted **once** |
+| `aggregate_h2d_gib_s` | same basis, 4 GPUs on 4 concurrent streams |
+| `d2d_copied_gib_s` | device-local copy, bytes copied **once** |
+| `d2d_hbm_gib_s` | device-local copy, HBM traffic = read + write = 2 × copied |
+| `p2p[i][j].bw_gib_s` | bytes copied **once**, over the P2P link |
+| `p2p[i][j].latency_us` | median of 200, 4 KiB transfer, round trip |
+
+Also record `link_gib_s_theoretical` per GPU (computed from the reported
+`pcie.link.gen`/`width`, Gen4 x4 = 7.34) and print the achieved percentage, so the
+number can be audited rather than believed. `d2d_hbm_gib_s` is the figure that
+goes into THEORY.md §2's decode ceiling (every weight byte is read once);
+`d2d_copied_gib_s` must never be used for that.
+
+The d2d floors are real floors, not decoration: they must beat every PCIe path by
+an order of magnitude, proving the copy is device-local. If one fails, the
+measurement is wrong — fix it. Do not lower a floor: if physics makes a floor
+impossible, report it to the orchestrator instead (this happened: the original
+`h2d > 10` floor was above the x4 Gen4 ceiling and was corrected).
+
+Additionally, you may update `THEORY.md` §1 and §2 with the measured numbers
+(the M-todo rows), since no other lane writes that file.
 
 ## Report format
 
