@@ -166,6 +166,46 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 `local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not
 be used for dispatched work until it answers `/v1/models` again.
 
+## 7c. Measured baselines and the bar we are chasing
+
+Two external reference points, recorded as targets (the peer engine on this box is
+deliberately unidentified — do not go looking for it, the numbers are what matter):
+
+| platform | decode | prefill | notes |
+|---|---|---|---|
+| 1x RTX 4090, 64 GB DDR5 | 75 tok/s | 1,200 tok/s | Flash-Next IQ4_XS, weight offload implied |
+| **this box, peer engine** | **100-150 tok/s** | **5,000 tok/s** | Flash-Next, 4x 5060 Ti, full 256K context |
+
+**Where inferno is, from measured components only:**
+
+| | value | vs bar |
+|---|---|---|
+| decode at **full 262,144 context** | **131 tok/s** (7.65 ms/token) | **in band** |
+| prefill, M=2048 | **2,690 tok/s** (upper bound) | **2x behind** |
+
+The decode figure is measured, not modelled: the indexer's 3,183.8 us/token is at
+65,536 blocks = 262,144 tokens x block 4, i.e. the *full* advertised context, and GDN is
+measured, and experts are arithmetic. It rests on one assumption that I-026 Item 1 must
+confirm: that QSA's 2048-key cap actually bounds `attn_decode`. If that cap is not enforced
+on the decode path, the 2,349.6 us/token attention term grows with context and this number
+is void.
+
+The prefill figure is an **upper bound**: GDN and elementwise prefill are not yet measured.
+Prefill, not decode, is where we trail.
+
+### The three levers, in payoff order
+
+1. **MoE prefill runs at 17 % of FP4 peak** (32.1 TFLOPS routed of 192.5), and **3.3 ms of
+   its 9.5509 ms block is the BF16 shared expert on the FFMA path** — 35 % of the block doing
+   scalar math because the 5e-4 exactness gate forbids quantising it. A tensor-core shared
+   path plus better grouped-GEMM occupancy is worth ~3x and is the only route to 5,000.
+2. **Batch the PLE gather.** 90 us/token x 2,048 = 184 ms per chunk, i.e. 24 % of prefill,
+   for a table lookup. One batched gather replaces 2,048 serialised ones.
+3. **Speculation** stays the decode lever: k=4 at ~2.5 accepted takes 131 tok/s to ~330, with
+   the known landmine that GDN state updates in place and needs a 113 MB/seq snapshot per round.
+
+Quality-neutral, all three. The quantisation ceiling does not move.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
