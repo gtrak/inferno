@@ -1,0 +1,31 @@
+# Exactly the environment that produced tests/golden/tiny/noise_floor.json and every
+# trace reported in REAL_REFERENCE.md, on gary-agents, 2026-11-24.
+#
+# Bootstrap (offline from the uv cache on this box, ~1 s):
+#
+#     cd tools/ref-trace
+#     /home/gary/.local/bin/uv venv -p 3.13 .venv
+#     /home/gary/.local/bin/uv pip install --python .venv/bin/python \
+#         --index-url https://download.pytorch.org/whl/cpu torch==2.15.0+cpu
+#     /home/gary/.local/bin/uv pip install --python .venv/bin/python \
+#         -r requirements-real.txt
+#     /home/gary/.local/bin/uv pip install --python .venv/bin/python -e . --no-deps
+#
+# The transformers pin is not optional. The committed fixtures were produced at
+# d8f10a82213a3a9db48385aba3a4b57ab535de50 and `run.sh` fails its own byte-identical
+# check against reference/*.py if the checkout moves; transformers HEAD was already at
+# fa9c04ea60c5e1d2ecc38064442973fa1ddccc72 when this file was written.
+#
+# `torch` must come from the CPU index (2.15.0+cpu), matching tests/golden/README.md.
+
+transformers @ git+https://github.com/huggingface/transformers@d8f10a82213a3a9db48385aba3a4b57ab535de50
+safetensors==0.8.0
+numpy==2.5.5
+tokenizers==0.23.3
+huggingface-hub==2.4.0
+filelock==4.2.4
+fsspec==2026.9.0
+# `--device-map auto` additionally needs accelerate (`uv pip install --python .venv/bin/python
+# accelerate`, or `uv pip install -e '.[real]'`). It was not installed for the tiny-fixture work
+# recorded in REAL_REFERENCE.md, so it carries no pin here: whatever version a real run uses is
+# stamped into that run's metadata as `accelerate_version`.

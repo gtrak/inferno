@@ -1,0 +1,110 @@
+{
+  "transformers_version": "5.24.0.dev0",
+  "transformers_commit": "d8f10a82213a3a9db48385aba3a4b57ab535de50",
+  "accelerate_version": "<not installed>",
+  "torch_version": "2.15.0+cpu",
+  "numpy_version": "2.5.5",
+  "python_version": "3.13.12",
+  "hostname": "gary-agents",
+  "os": "Linux 7.0.0-43-generic",
+  "cpu_count": 24,
+  "repo_revision": "af2bb38b5e593c3aecf953d25ab2a7d20f8896bb",
+  "omp_num_threads": "<unset>",
+  "mkl_num_threads": "<unset>",
+  "cuda_visible_devices": "<unset>",
+  "cuda_available": false,
+  "cudnn_version": "<no cuda>",
+  "mode": "noise-floor",
+  "model_path": "tests/golden/tiny",
+  "model_config_sha256": "49794f28c6235ff9755e50d52a39ae817974062e34a9c5dbee2bcc39e1b89897",
+  "prompt_file": "tools/ref-trace/prompts/tiny-v1.json",
+  "prompt_file_sha256": "e2458fcba306ad33e685b393bee5a6811524af4ea40f2b8dd2f4ca8498156777",
+  "positions": 16,
+  "dtype": "float32",
+  "attn_implementation": "eager",
+  "device_map_requested": "none",
+  "load_seconds": 2.6350139430724084,
+  "run_a_threads": 1,
+  "run_b_threads": 12,
+  "runs_bit_identical": false,
+  "aggregate": {
+    "max_abs_logit_diff": 4.470348358154297e-08,
+    "mean_abs_logit_diff": 3.4047502595058177e-09,
+    "kl_mean": -5.4034896209605114e-17,
+    "kl_p50": -4.745478631898208e-18,
+    "kl_p99": 5.130855915317683e-16,
+    "kl_max": 5.52216812784103e-16,
+    "argmax_agreement_min": 1.0,
+    "delta_ppl_floor_max": 9.706027412903495e-07,
+    "tensors": 2
+  },
+  "per_tensor": {
+    "p0/gen_logits": {
+      "positions": 16,
+      "max_abs_logit_diff": 2.9802322387695312e-08,
+      "mean_abs_logit_diff": 3.1758844443174894e-09,
+      "kl_mean": -5.4034896209605114e-17,
+      "kl_p50": -4.745478631898208e-18,
+      "kl_p99": 5.130855915317683e-16,
+      "kl_max": 5.52216812784103e-16,
+      "argmax_agreement": 1.0,
+      "ppl_reference": 255.35183993782564,
+      "ppl_repeated": 255.35183971288149,
+      "delta_ppl_floor": 2.249441592994117e-07,
+      "note": "KL is quadratic in a logit perturbation: max|dlogit| ~4.5e-8 implies KL ~1e-15, which is why every reduction here is float64. At that magnitude a mean KL can still come out slightly negative from float64 cancellation -- read it as zero, the reference's own noise is not measurable in KL. The sensitive quantities at this scale are top-1 agreement, because two logits inside the noise flip the argmax, and dPPL."
+    },
+    "p0/prompt_logits": {
+      "positions": 12,
+      "max_abs_logit_diff": 4.470348358154297e-08,
+      "mean_abs_logit_diff": 3.4047502595058177e-09,
+      "kl_mean": -7.033101840478472e-17,
+      "kl_p50": -7.582395377904191e-17,
+      "kl_p99": 4.995614191890234e-16,
+      "kl_max": 5.003230651118941e-16,
+      "argmax_agreement": 1.0,
+      "ppl_reference": 261.3037435924251,
+      "ppl_repeated": 261.30374456302786,
+      "delta_ppl_floor": 9.706027412903495e-07,
+      "note": "KL is quadratic in a logit perturbation: max|dlogit| ~4.5e-8 implies KL ~1e-15, which is why every reduction here is float64. At that magnitude a mean KL can still come out slightly negative from float64 cancellation -- read it as zero, the reference's own noise is not measurable in KL. The sensitive quantities at this scale are top-1 agreement, because two logits inside the noise flip the argmax, and dPPL."
+    }
+  },
+  "per_prompt_facts": {
+    "canonical": {
+      "tiny12": {
+        "prompt_tokens": 12,
+        "generated_tokens": 16,
+        "first_generated_ids": [
+          169,
+          252,
+          39,
+          151,
+          132,
+          239,
+          223,
+          20
+        ],
+        "logits_max": 0.3232078552246094,
+        "logits_min": -0.29679274559020996
+      }
+    },
+    "repeated": {
+      "tiny12": {
+        "prompt_tokens": 12,
+        "generated_tokens": 16,
+        "first_generated_ids": [
+          169,
+          252,
+          39,
+          151,
+          132,
+          239,
+          223,
+          20
+        ],
+        "logits_max": 0.3232078552246094,
+        "logits_min": -0.29679274559020996
+      }
+    }
+  },
+  "how_to_read": "aggregate is the worst tensor per metric. Every quality threshold (KL mean/p99, dPPL, top-1 agreement) must sit above these numbers by a stated margin, or it is measuring the reference's own reduction order rather than the engine under test."
+}

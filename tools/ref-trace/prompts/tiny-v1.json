@@ -1,0 +1,17 @@
+{
+  "name": "tiny-v1",
+  "note": [
+    "Prompt set for the tiny random-weight fixture (tests/golden/tiny). Token ids are literal:",
+    "the fixture's vocab is 256 and it has no tokenizer, so no text field exists.",
+    "These are exactly the INPUT_IDS of tools/ref-trace/trace.py, which produced",
+    "tests/golden/tiny/trace.safetensors, so a generated logits trace is directly comparable",
+    "against the committed `final/logits` and `decode/final/logits` tensors.",
+    "Run with --positions 16 to also reproduce tests/golden/tiny/greedy_ids.json."
+  ],
+  "prompts": [
+    {
+      "id": "tiny12",
+      "input_ids": [13, 4, 199, 42, 7, 88, 211, 30, 96, 155, 61, 240]
+    }
+  ]
+}

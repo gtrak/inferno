@@ -11,6 +11,12 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+# `reference_trace.py --device-map auto` (a checkpoint too big for one device). Not a default
+# dependency: run.sh, the tiny fixture and `io-probe` never need it, and keeping the bootstrap
+# CPU-only and small is what lets the fixtures regenerate on a box with no CUDA toolkit.
+real = ["accelerate"]
+
 [tool.setuptools]
 py-modules = []
 

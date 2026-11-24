@@ -1,0 +1,6 @@
+# Generated reference traces and probe reports live here and are NOT committed.
+# A real-model logits trace is ~1.2 GiB per 1k positions at fp32; the committed
+# goldens stay in tests/golden/. Regenerate anything in this directory with
+# reference_trace.py (see REAL_REFERENCE.md).
+*
+!.gitignore
