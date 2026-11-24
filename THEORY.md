@@ -141,6 +141,11 @@ Three ways to widen it, in order of expected payoff:
    rates, so ~2–3 GB is the practical maximum before decode latency degrades
    noticeably.
 
+**Resolved by directive:** single-stream, full-context operation means KV is FP8
+and stored **once** (attention replicated instead of tensor-parallel); see
+`.agents/design/full-context-single-stream.md`. Decode speed is then a curve from
+~200 tok/s at short context to ~125-145 tok/s at 256 K.
+
 **Therefore the expert-frequency histogram is the highest-value unmeasured
 number in the project**: routing skew decides whether VRAM can hold a much smaller
 hot expert set (freeing tens of GB for state) or whether we are stuck near 65 GB.
