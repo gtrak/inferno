@@ -182,6 +182,19 @@ remains unexplained and must not be attributed to this box.
 would have pointed at a step that either does not exist or that CI never invokes. All gates are
 now normal test blocks wired through `c_api.zig`.
 
+**Verification effort is proportional to evidence (user directive 2026-11-24).** Do not run slow
+repeat loops by ritual. A single gate run plus `zig build test` is the default. Repeat-run
+determinism checks are justified **only** by evidence:
+
+- a result that differed between two runs (the I-013 case: `max_abs_err` 1.423e-2 / 7.814e-3 /
+  9.803e-3 from one tree — that warranted 16 runs),
+- a change touching async ordering, stream fences, allocation sizing or shared device buffers,
+- or a new failure nobody can reproduce on demand.
+
+Once determinism has been established for a component, record the evidence and stop re-proving
+it. Re-establish only when one of the above fires again. Sixteen identical runs a second time
+proves nothing that the first sixteen did not, and it costs twelve minutes per gate.
+
 The real benchmark rule is unchanged and independent: **no kernel or benchmark lane may run
 concurrently with another on `gary-agents`.** Conflating the two cost a false causal claim in
 this file, which is the same error class as the earlier bandwidth-tier mistakes — asserting a
