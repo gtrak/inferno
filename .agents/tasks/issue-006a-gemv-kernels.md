@@ -91,7 +91,7 @@ Design requirements:
 - Typed launch wrappers (`launchGemvNvfp4(stream, ...)`) that check every
   dimension, alignment and buffer-size precondition with assertions and return a
   closed error set on driver failure.
-- `zig build gemvtest` runs, for each kernel: random matrices at the **real
+- The test suite runs, for each kernel: random matrices at the **real
   shapes** — `[10240,2560]`, `[6144,2560]`, `[2560,6144]`, `[12288,2560]`,
   `[640,2560]`, `[2560,640]`, `[512,2560]`, `[248320,2560]` (subsample if VRAM
   is tight, min 2 shapes per kernel), input from `torch.randn`-equivalent
