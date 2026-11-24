@@ -177,6 +177,11 @@ spread that forced a perf guard widening. That was wrong: `desktop` is `gary-des
 **separate machine** from `gary-agents`, sharing no GPU, VRAM or PCIe with it. The spread
 remains unexplained and must not be attributed to this box.
 
+**Spec defect pattern, recorded:** three issues (I-013, I-014, I-014b) specified a named
+`zig build <something>` gate. `tools/gate.sh` only ever runs `zig build test`, so every such gate
+would have pointed at a step that either does not exist or that CI never invokes. All gates are
+now normal test blocks wired through `c_api.zig`.
+
 The real benchmark rule is unchanged and independent: **no kernel or benchmark lane may run
 concurrently with another on `gary-agents`.** Conflating the two cost a false causal claim in
 this file, which is the same error class as the earlier bandwidth-tier mistakes — asserting a
