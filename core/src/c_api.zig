@@ -246,6 +246,7 @@ test {
     _ = @import("weights/quant.zig");
     _ = @import("weights/safetensors.zig");
     _ = @import("kernels/attention.zig");
+    _ = @import("kernels/elementwise.zig");
     _ = @import("kernels/gdn.zig");
     _ = @import("kernels/gemm.zig");
     _ = @import("kernels/gemv.zig");
