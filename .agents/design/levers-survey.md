@@ -53,13 +53,27 @@ per-candidate rollback of intermediate states — measure before choosing.
 |---|---|---|---|
 | M1 | **Kernel fusion / graph node budget** | ~1 000 nodes × 1–2 µs GPU-side dispatch = **1.0–2.0 ms**, comparable to the entire 2.79 ms floor. CUDA graphs remove *CPU* launch overhead, not per-node GPU dispatch. Target **≤300 nodes** (≤6–7 fused kernels per layer) and measure replay overhead. | engineering |
 | M2 | **Prefix caching** (dropped with batching — wrongly) | interactive chat re-prefills the whole conversation every turn. Caching the prefix makes TTFT ≈ 0 for turn N+1. Prefix KV already lives in the DRAM tier, so it composes with §7 KV tiering. | small |
-| M3 | **Dense value path → NVFP4** (extend L2) | at FP8 the dense path is 3.575 GB = **3.575 GB/token** of the 5.00. FP4 halves it: floor 2.79 → **1.79 ms**, and frees 1.79 GB VRAM. Quality risk sits on the GDN projections (recurrent), so gate on long-context stability + ΔNLL. | requant + eval |
+| ~~M3~~ | ~~Dense value path → NVFP4~~ | **REJECTED by owner (2026-11-24): a quality hit.** The dense path feeds the GDN recurrence, where 4-bit error compounds over thousands of steps; FP8 is the quality floor for it. Cost of rejecting: the decode floor stays 2.79 ms (not 1.79) and 1.79 GB of VRAM stays committed, so the DRAM expert tier carries ~4.2 GB instead of ~2.4 GB at 256 K. Accepted. | — |
 | M4 | **GPUDirect Storage for the 51 GB n-gram table** | the PLE gather currently needs a CPU round trip plus H2D. GPU-initiated NVMe reads remove both. Only worth it if I-011's measured gather latency is a real fraction of the token time. | medium |
 | M5 | **FP8 K/V in the attention MMA** | gathered K/V are already fp8, so QK^T can use `mma.sync.m16n8k32.e4m3` at 2× bf16 rate instead of dequantising to bf16. Pure win at long context where attention share grows. | small |
 | M6 | **GDN state in bf16** | 113 → 56.6 MB per sequence; frees ~57 MB/seq for the expert tier. Needs an equivalence gate (recurrence, so it compounds). | small |
 | M7 | **L2 persistence window on hot expert weights** | ~30 MB of L2 per GPU; pinning the most-read weight pages may shave a few % of HBM traffic. Free to try, measure or drop. | tiny |
 | M8 | **Decode megakernel** (persistent kernel looping all 48 layers) | eliminates node dispatch entirely; the "optimal" answer to M1. Very high complexity, and it fights per-layer data-dependent routing (top-k ids). Stretch only. | large |
 | M9 | **UVM/`cuMemAllocManaged` for the KV tail** | could replace explicit prefetch. Likely worse on consumer parts (migration heuristics), but one experiment settles it. | small |
+
+## 2b. Consequence of rejecting M3: the quality budget is now closed
+
+Quantisation stops at **FP8 weights** (dense path + `lm_head`) and **FP8 KV**
+(both sanctioned, both standard). Experts stay at their native 4-bit, requantised
+only to a coarser *block* (per-16 → per-32 MXFP4, same 4-bit grid, no extra
+activation quantisation). **No further quantisation lever is available.**
+
+Therefore every remaining speed lever must be **quality-neutral**:
+speculation, kernel fusion / graph-node reduction, prefix caching, FP8-KV MMA,
+GPUDirect Storage, L2 persistence, GDN-state bf16. That is a useful constraint: it
+removes the whole class of "faster but a bit worse" decisions from the hill-climb
+and makes the ledger honest — any future gain is either mechanical or it is a
+quality trade requiring the owner's sign-off.
 
 ## 3. Deliberately not doing (so they are decisions, not omissions)
 
@@ -69,4 +83,6 @@ per-candidate rollback of intermediate states — measure before choosing.
 - **Medusa / trained EAGLE heads** — we cannot train.
 - **Structured sparsity, prompt compression, int4 *activation* calibration** — either
   model-changing or of unproven payoff here.
+- **Any quantisation beyond FP8 weights / FP8 KV / native 4-bit experts** (M3 in
+  particular) — rejected on quality grounds; see §2b.
 - **Interleaved prefill/decode overlap** — meaningless with one sequence.
