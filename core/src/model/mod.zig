@@ -15,5 +15,7 @@ test {
     _ = @import("state.zig");
     _ = @import("exec.zig");
     _ = @import("generate.zig");
+    _ = @import("snapshot.zig");
     _ = @import("tiny_check.zig");
+    _ = @import("runtime_check.zig");
 }
