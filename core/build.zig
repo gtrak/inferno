@@ -375,6 +375,20 @@ fn create_core_module(
             .root_source_file = b.path(fixture[1]),
         });
     }
+
+    // The kernel lanes gate against the CPU reference in `src/ref/`, and that
+    // reference reads the committed golden fixtures through an anonymous
+    // `fixtures_dir` option. The reference module declares the same option for
+    // `refcheck`; the core module needs it too, otherwise importing `ref/` from
+    // a kernel test fails with "no module named 'fixtures_dir'". The path is
+    // absolute, so tests never depend on the working directory.
+    const fixtures_path = b.addOptions();
+    fixtures_path.addOption(
+        []const u8,
+        "path",
+        b.pathFromRoot("../" ++ fixtures_directory),
+    );
+    module.addOptions("fixtures_dir", fixtures_path);
     return module;
 }
 
