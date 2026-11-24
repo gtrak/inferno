@@ -2,6 +2,46 @@
 
 Written 2026-11-24, after five seam bugs and one self-referential-struct bug, all in the same layer.
 
+## The refined principle (user, 2026-11-24)
+
+> Zig is about **composing larger unsafe subsections and removing allocation from the hot path**. It
+> is not about the perf ceiling - maximum perf is simply reached sooner, unless we chase our tails for
+> things a type system could prove.
+
+This is the right frame and it supersedes a looser version of this document. Zig's value here is
+**mechanism inside a big unsafe region with no hot-path allocation**; Rust's is **ownership policy
+across calls**. So the boundary is drawn at a *coarse unit of work* - per token, per sequence - not
+per launch. Rust hands Zig an arena and says "run N tokens"; Zig runs 48 layers x ~10 launches inside
+it without crossing the line, with direct pointer arithmetic and no allocator.
+
+### Which bugs were actually type-system-catchable
+
+Seven bugs on 2026-11-24, and the honest accounting matters more than the principle:
+
+| bug | shape | Rust would catch it | caught instead by |
+|---|---|---|---|
+| `indexScoreBytes` drift (256 vs 32768) | two sizing formulas | **no** | **comptime `Layout`** |
+| `routedExpert` stride mismatch | writer/reader disagree on layout | **no** | **comptime `Layout`** |
+| missing `applyRope` fence | cross-stream ordering | **no** | launch wrapper |
+| mRoPE tables zeroed on reset | lifecycle | partial | `epochs` + `fillVoid` |
+| `conv_state` chunk offset | arithmetic | **no** | guard band |
+| `Model.init` dangling interior pointer | ownership across a move | **yes** | borrowck |
+| `epochs` registry aliases across devices | global registry keyed by pointer | **yes**, designable | context-scoped handles |
+
+**2 of 7.** An earlier version of this document claimed "every bug that was not a kernel was in the
+region Rust's borrow checker covers". That was wrong. Four of the seven are arithmetic, layout or
+ordering, which **no type system catches**.
+
+**The type system that would have helped most tonight was comptime, not borrowck.** A single `Layout`
+definition generating both the host byte size and a header the `.cu` includes makes bugs 1 and 2
+unrepresentable - and that is Zig's strength. So the split is not "prove in Rust, do in Zig", it is:
+
+| tool | catches |
+|---|---|
+| **comptime** | layout and sizing disagreement (the two most common failures) |
+| **borrowck (Rust)** | ownership across calls: dangling interiors, use-after-move, lifecycle |
+| **runtime guards (Zig)** | arithmetic, ordering, write-before-read - bounded cost, first-run failure |
+
 ## The principle
 
 **Put the boundary where data is bulk or batched and latency-irrelevant; keep it coarse; let exactly
@@ -31,7 +71,18 @@ of splitting it across the server and the core.
 
 This is the cheapest real win available and it is already in flight as I-015.
 
-### 2. Buffer ownership and launch orchestration → Rust (highest absolute payoff)
+### 2. Buffer lifetime policy → Rust; launch sequencing stays in Zig (revised)
+
+**Revised per the refinement above.** Moving the launch sequence into Rust is the wrong move: it would
+put every kernel call behind an `unsafe` block and force borrow gymnastics over device handles that
+are not Rust's to reason about - fighting the language in exactly the place it is weakest and Zig is
+fastest. The launch sequence is a **large unsafe region with no allocation**, which is Zig's purpose.
+
+What *should* move is the **lifetime policy around it**: which arena is live, when a sequence may
+reset, when buffers die, what a handle's validity scope is. Those are the two type-system-catchable
+bugs above (`Model.init`'s dangling interior, the cross-context registry aliasing), and both are
+ownership-across-calls, which is precisely Rust's domain. Rust owns handles with lifetimes; Zig gets
+raw pointers into an arena it may not allocate from or outlive.
 
 This is the big one, and it is where **all five seam bugs of 2026-11-24 lived**:
 
