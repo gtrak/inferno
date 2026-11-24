@@ -363,6 +363,28 @@ row-parallel + all-reduce of a 2,560-wide activation is ~7,680 B/token/rank - bu
 duplicates the whole down-projection on every rank (~53 ms per 48-layer 16K chunk of redundant
 compute). Either can win; **measure it, do not derive it from a test property.**
 
+## 7f. Two layers of assurance (user direction 2026-11-24)
+
+Everything gated in this project so far is **kernel validation**: a kernel against the fp32 oracle
+with identical inputs, in ulp/relative terms. That answers *"does this kernel implement the same
+math."* It does not answer *"is the approximating pipeline still the same model"* — which is what FP8
+KV, NVFP4 experts and a TP split actually risk.
+
+Both layers are required and they are not interchangeable:
+
+| layer | question | instrument |
+|---|---|---|
+| kernel validation | is the math right? | fp32 oracle, identical inputs, ulp/relative bounds |
+| **model quality** | is it still the same model? | **KL vs reference, ΔPPL, per-layer relative RMS, router top-k agreement** (I-031) |
+
+**KL is the grader; per-layer cosine is the localiser.** Cosine is scale-invariant and saturates —
+a quietly degraded model still reads 0.999+ — so it may be gated only on regression against a
+recorded baseline, never on an absolute value. 0.99 → 0.5 is a real signal; 0.9995 → 0.9985 is not.
+
+Any quality threshold must be derived from the **reference's own two-run noise floor**, not invented.
+An earlier tolerance here was set at 1e-6 when the reference legitimately moved 4.5e-8 with thread
+count; a gate tighter than the reference's variance is decoration.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
