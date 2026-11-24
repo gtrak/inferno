@@ -50,6 +50,120 @@ pub const Timings = struct {
     }
 };
 
+/// Tokens one forward may cover; the executor's own bound, re-exported so a
+/// multi-rank driver can size its exchange buffers from one spelling.
+pub const tokens_max: u32 = state_module.tokens_max;
+
+/// The device bytes of one expert the tier has placed: `gate_up` then `down`,
+/// in the layout the loading path already uses, so a shard is a byte range and
+/// not a re-interpretation.
+pub const ExpertSlice = struct {
+    gate_up: load.Matrix,
+    down: load.Matrix,
+};
+
+/// The tensor-parallel slices and peer hooks of a graph split across ranks.
+///
+/// A `null` cluster on `Model` is the single-device graph I-013 gates, and every
+/// branch that reads this field is skipped. A non-null cluster means this rank
+/// owns an output-row slice of the projections that are tensor parallel, a
+/// range of the experts and a vocabulary slice, and it must exchange them with
+/// its peers through `model/multi.zig`.
+///
+/// **Why column parallel and gathered, not row parallel and reduced: it is a
+/// bandwidth decision.** At the measured 7.2 GB/s PCIe (M-001, cold tier) one
+/// gathered boundary costs 3/4 of an activation per rank - 3,840 B for a
+/// 2,560-wide bf16 stream - against 7,680 B for a ring all-reduce of the same
+/// boundary. Over 48 layers that is ~32 us/token gathered against ~51-102
+/// us/token reduced for the same activations. The price is redundant compute:
+/// the shared expert's down projection would be row parallel and is instead
+/// run whole on every rank - 3 extra copies, ~53 ms per 48-layer 16K chunk at
+/// tensor-core rates (indicative; two lanes hold the GPUs) against ~629 ms of
+/// PCIe saved per chunk. At the measured FFMA shared-expert rate the
+/// redundancy would cost ~1.3 s per chunk and flip the decision, which is why
+/// moving that block off FFMA is a registered lever (plan.md 7c, L6). I-030
+/// registers the reduction kernel and the all-reduce path this tree lacks.
+///
+/// A property worth recording for a bisect, but not the reason: every slice is
+/// a complete dot product over the full contraction, so a gathered slice equals
+/// the same rows of the single-device product. That is a consequence of the
+/// split, not its justification.
+pub const Cluster = struct {
+    /// The rank's hook state, opaque to the graph.
+    user: *anyopaque,
+    /// This rank's first output row and row count of the GDN `out_proj`.
+    dense_first: u32,
+    dense_rows: u32,
+    /// This rank's first intermediate column and column count of the shared
+    /// expert's gate and up projections.
+    shared_first: u32,
+    shared_rows: u32,
+    /// One weight shard per layer, `[2 * shared_rows, hidden]`: this rank's
+    /// gate rows followed by this rank's up rows, in the gate-up layout
+    /// `moe_silu_mul` reads.
+    shared_gate_up: []const load.Matrix,
+    /// This rank's first logit row and row count of `lm_head`.
+    head_first: u32,
+    head_rows: u32,
+    /// The half-open expert range this rank owns.
+    expert_first: u32,
+    expert_count: u32,
+    /// Scratch the graph writes and the hooks gather out of.
+    dense_slice: cuda_context.DeviceBuffer,
+    shared_gate_up_slice: cuda_context.DeviceBuffer,
+    shared_act_slice: cuda_context.DeviceBuffer,
+    head_slice: cuda_context.DeviceBuffer,
+    /// Copy every rank's slice into `target`'s column band, then return with
+    /// the copy complete. Called with this rank's compute stream current.
+    gather_dense: *const fn (
+        user: *anyopaque,
+        target: *const cuda_context.DeviceBuffer,
+        tokens: u32,
+        columns: u32,
+    ) anyerror!void,
+    gather_shared: *const fn (
+        user: *anyopaque,
+        target: *const cuda_context.DeviceBuffer,
+        tokens: u32,
+        columns: u32,
+    ) anyerror!void,
+    gather_head: *const fn (
+        user: *anyopaque,
+        target: *const cuda_context.DeviceBuffer,
+        tokens: u32,
+        columns: u32,
+    ) anyerror!void,
+    /// Fetches the experts `selected` names that this rank owns into their
+    /// device slots. Called before the layer's expert products run.
+    prepare_experts: *const fn (
+        user: *anyopaque,
+        layer: u32,
+        selected: []const u32,
+    ) anyerror!void,
+    /// The weights of an expert this rank owns, from the tier's device slot.
+    expert_weights: *const fn (
+        user: *anyopaque,
+        layer: u32,
+        expert: u32,
+    ) anyerror!ExpertSlice,
+    /// Copies every rank's expert range of `moe_expert_out` into `target`.
+    gather_experts: *const fn (
+        user: *anyopaque,
+        target: *const cuda_context.DeviceBuffer,
+        tokens: u32,
+        hidden: u32,
+    ) anyerror!void,
+
+    /// Whether `expert` belongs to this rank's shard.
+    pub fn ownsExpert(self: *const Cluster, expert: u32) bool {
+        assert(expert < std.math.maxInt(u32));
+        assert(self.expert_count > 0);
+
+        return expert >= self.expert_first and
+            expert < self.expert_first + self.expert_count;
+    }
+};
+
 /// The whole text model on one device.
 pub const Model = struct {
     allocator: std.mem.Allocator,
@@ -83,10 +197,23 @@ pub const Model = struct {
     positions_host: []i32,
     /// Host scratch: the sequence a recompute-form step forwards.
     sequence: []i64,
+    /// Host scratch: the router's selected expert ids of one forward, read
+    /// back so the expert tier can prefetch them.
+    moe_selected: []u32,
+    /// Non-null when the graph runs split across ranks; see `Cluster`.
+    cluster: ?Cluster = null,
     timings: Timings,
 
-    /// Opens the device, loads the checkpoint and builds the caches.
+    /// Opens device 0, loads the checkpoint and builds the caches.
     pub fn init(allocator: std.mem.Allocator) !Model {
+        return initOnDevice(allocator, 0);
+    }
+
+    /// Opens one device by index: one rank's copy of the graph. Every buffer,
+    /// module and stream this model owns belongs to that device's context.
+    pub fn initOnDevice(allocator: std.mem.Allocator, device_index: u32) !Model {
+        assert(device_index < cuda_driver.device_count_max);
+
         const config = try fixtures.load_config(allocator);
         const plan = try plan_module.Plan.init(config);
 
@@ -95,7 +222,10 @@ pub const Model = struct {
         if (count == 0) {
             return error.NoDevice;
         }
-        const context = try cuda_context.Context.retain(&devices[0]);
+        if (device_index >= count) {
+            return error.NoDevice;
+        }
+        const context = try cuda_context.Context.retain(&devices[device_index]);
         errdefer context.release();
         try context.set_current();
 
@@ -125,6 +255,8 @@ pub const Model = struct {
             .ngram_ids = &[_]i64{},
             .positions_host = &[_]i32{},
             .sequence = &[_]i64{},
+            .moe_selected = &[_]u32{},
+            .cluster = null,
             .timings = .{},
         };
         errdefer model.release();
@@ -174,6 +306,10 @@ pub const Model = struct {
     fn release(self: *Model) void {
         assert(self.allocator.vtable != undefined);
 
+        if (self.moe_selected.len > 0) {
+            self.allocator.free(self.moe_selected);
+            self.moe_selected = &[_]u32{};
+        }
         if (self.sequence.len > 0) {
             self.allocator.free(self.sequence);
             self.sequence = &[_]i64{};
@@ -355,6 +491,10 @@ pub const Model = struct {
         self.sequence = try self.allocator.alloc(
             i64,
             self.config.max_position_embeddings,
+        );
+        self.moe_selected = try self.allocator.alloc(
+            u32,
+            tokens * self.config.num_experts_per_tok,
         );
         assert(self.sequence.len >= tokens);
     }
@@ -585,12 +725,45 @@ pub const Model = struct {
         assert(self.weights.lm_head.rows == self.config.vocab_size);
 
         var timer = try std.time.Timer.start();
-        try self.project(
-            &self.state.mixed,
-            self.weights.lm_head,
-            &self.state.logits,
-            tokens,
-        );
+        if (self.cluster) |cluster| {
+            // Row split by vocabulary. The fixture's 256-wide head is gathered
+            // whole because it is 1 KiB; at the production vocabulary that
+            // gather would be ~745 KB/token/rank and is NOT the production
+            // path - the row-split head needs the on-device top-k reduction
+            // registered in I-030.
+            assert(cluster.head_rows > 0);
+            assert(self.config.vocab_size % cluster.head_rows == 0);
+            assert(cluster.head_first + cluster.head_rows <= self.config.vocab_size);
+            const hidden: u64 = self.config.hidden_size;
+            const sliced = load.Matrix{
+                .data = state_module.view(
+                    &self.weights.lm_head.data,
+                    @as(u64, cluster.head_first) * hidden * 4,
+                    @as(u64, cluster.head_rows) * hidden * 4,
+                ),
+                .rows = cluster.head_rows,
+                .cols = self.config.hidden_size,
+            };
+            try self.project(
+                &self.state.mixed,
+                sliced,
+                &cluster.head_slice,
+                tokens,
+            );
+            try cluster.gather_head(
+                cluster.user,
+                &self.state.logits,
+                tokens,
+                self.config.vocab_size,
+            );
+        } else {
+            try self.project(
+                &self.state.mixed,
+                self.weights.lm_head,
+                &self.state.logits,
+                tokens,
+            );
+        }
         const vocab: u64 = self.config.vocab_size;
         const last = state_module.view(
             &self.state.logits,
@@ -657,9 +830,46 @@ pub const Model = struct {
             self.config.num_experts,
             self.config.num_experts_per_tok,
         );
-        try self.sharedExpert(weights, tokens);
-        for (0..self.config.num_experts) |expert| {
-            try self.routedExpert(weights, @intCast(expert), tokens);
+        try self.sharedExpert(index, weights, tokens);
+        if (self.cluster) |cluster| {
+            // Expert parallel: this rank computes the experts of its shard that
+            // the router selected, from the bytes the expert tier placed, and
+            // every rank gathers all shards' slots before combining. The
+            // combine reads only the selected slots, so an unselected slot's
+            // staleness is unobservable, and no partial sum is added: each
+            // selected slot is computed exactly once, by its owner.
+            const selected = try self.selectedExperts(tokens);
+            try cluster.prepare_experts(cluster.user, index, selected);
+            var local: u32 = 0;
+            while (local < cluster.expert_count) : (local += 1) {
+                const expert = cluster.expert_first + local;
+                assert(expert < self.config.num_experts);
+                if (selectedExpert(selected, expert)) {
+                    const slice = try cluster.expert_weights(
+                        cluster.user,
+                        index,
+                        expert,
+                    );
+                    try self.routedExpertMatrices(
+                        slice.gate_up,
+                        slice.down,
+                        expert,
+                        tokens,
+                    );
+                } else {
+                    assert(!selectedExpert(selected, expert));
+                }
+            }
+            try cluster.gather_experts(
+                cluster.user,
+                &self.state.moe_expert_out,
+                tokens,
+                self.config.hidden_size,
+            );
+        } else {
+            for (0..self.config.num_experts) |expert| {
+                try self.routedExpert(weights, @intCast(expert), tokens);
+            }
         }
         try glue.launchMoeCombine(
             &self.glue_kernels,
@@ -679,40 +889,108 @@ pub const Model = struct {
     }
 
     /// The sigmoid-gated shared expert: `shared_out` without the gate.
-    fn sharedExpert(self: *Model, weights: *const load.MoeWeights, tokens: u32) !void {
+    ///
+    /// Split across ranks this is column parallel over the intermediate width:
+    /// each rank computes its gate and up rows over the full hidden (so each
+    /// product is complete), the silu product of its own columns, and the
+    /// gather rebuilds the whole activation before the shared down projection
+    /// runs. The down projection therefore reads exactly the single-device
+    /// activation, in the same column order.
+    fn sharedExpert(
+        self: *Model,
+        index: u32,
+        weights: *const load.MoeWeights,
+        tokens: u32,
+    ) !void {
+        assert(index < self.plan.layer_count);
         assert(tokens > 0);
         assert(weights.shared_gate_up.rows ==
             2 * self.config.shared_expert_intermediate_size);
 
-        try self.project(
-            &self.state.stream_in,
-            weights.shared_gate_up,
-            &self.state.moe_shared_gate_up,
-            tokens,
-        );
-        try moe.launchSiluMul(
-            &self.moe_kernels,
-            &self.ple.stream,
-            &self.state.moe_shared_gate_up,
-            tokens,
-            self.config.shared_expert_intermediate_size,
-            &self.state.moe_shared_act,
-        );
-        try self.project(
-            &self.state.moe_shared_act,
-            weights.shared_down,
-            &self.state.moe_shared_out,
-            tokens,
-        );
+        if (self.cluster) |cluster| {
+            assert(index < cluster.shared_gate_up.len);
+            assert(cluster.shared_rows > 0);
+            assert(self.config.shared_expert_intermediate_size %
+                cluster.shared_rows == 0);
+            assert(cluster.shared_first + cluster.shared_rows <=
+                self.config.shared_expert_intermediate_size);
+            const shard = cluster.shared_gate_up[index];
+            try self.project(
+                &self.state.stream_in,
+                shard,
+                &cluster.shared_gate_up_slice,
+                tokens,
+            );
+            try moe.launchSiluMul(
+                &self.moe_kernels,
+                &self.ple.stream,
+                &cluster.shared_gate_up_slice,
+                tokens,
+                cluster.shared_rows,
+                &cluster.shared_act_slice,
+            );
+            try cluster.gather_shared(
+                cluster.user,
+                &self.state.moe_shared_act,
+                tokens,
+                self.config.shared_expert_intermediate_size,
+            );
+            try self.project(
+                &self.state.moe_shared_act,
+                weights.shared_down,
+                &self.state.moe_shared_out,
+                tokens,
+            );
+        } else {
+            try self.project(
+                &self.state.stream_in,
+                weights.shared_gate_up,
+                &self.state.moe_shared_gate_up,
+                tokens,
+            );
+            try moe.launchSiluMul(
+                &self.moe_kernels,
+                &self.ple.stream,
+                &self.state.moe_shared_gate_up,
+                tokens,
+                self.config.shared_expert_intermediate_size,
+                &self.state.moe_shared_act,
+            );
+            try self.project(
+                &self.state.moe_shared_act,
+                weights.shared_down,
+                &self.state.moe_shared_out,
+                tokens,
+            );
+        }
         assert(self.state.moe_shared_out.bytes >=
             @as(u64, tokens) * self.config.hidden_size * 4);
     }
 
-    /// One routed expert, written into its slot of the `[expert][token]`
-    /// combine buffer. The engine runs every expert densely: the router's
-    /// weights are what select, and `moe_combine` applies them, so the sum is
-    /// the reference's slot-order sum even when two experts would have been
-    /// dispatched.
+    /// The router's selected expert ids of this forward, read back to the host.
+    ///
+    /// The ids are what the expert tier prefetches on; the combine still reads
+    /// them on the device, so this copy exists for the placement decision, not
+    /// for the arithmetic.
+    fn selectedExperts(self: *Model, tokens: u32) ![]const u32 {
+        assert(tokens > 0);
+        assert(self.cluster != null);
+        assert(self.config.num_experts_per_tok > 0);
+
+        const count: usize = @as(usize, tokens) *
+            self.config.num_experts_per_tok;
+        assert(self.moe_selected.len >= count);
+        try self.state.downloadRaw(
+            &self.state.moe_indices,
+            std.mem.sliceAsBytes(self.moe_selected[0..count]),
+        );
+        for (self.moe_selected[0..count]) |expert| {
+            assert(expert < self.config.num_experts);
+        }
+        return self.moe_selected[0..count];
+    }
+
+    /// One routed expert, from the checkpoint's own matrices.
     fn routedExpert(
         self: *Model,
         weights: *const load.MoeWeights,
@@ -722,8 +1000,34 @@ pub const Model = struct {
         assert(expert < self.config.num_experts);
         assert(tokens > 0);
 
+        try self.routedExpertMatrices(
+            weights.expert_gate_up[expert],
+            weights.expert_down[expert],
+            expert,
+            tokens,
+        );
+    }
+
+    /// One routed expert, written into its slot of the `[expert][token]`
+    /// combine buffer. The engine runs every expert densely on one device: the
+    /// router's weights are what select, and `moe_combine` applies them, so the
+    /// sum is the reference's slot-order sum even when two experts would have
+    /// been dispatched. Split across ranks the matrices come from the expert
+    /// tier's device slot instead, but the arithmetic is the same one.
+    fn routedExpertMatrices(
+        self: *Model,
+        gate_up: load.Matrix,
+        down: load.Matrix,
+        expert: u32,
+        tokens: u32,
+    ) !void {
+        assert(expert < self.config.num_experts);
+        assert(tokens > 0);
+        assert(gate_up.rows == 2 * self.config.moe_intermediate_size);
+        assert(down.rows == self.config.hidden_size);
+        assert(down.cols == self.config.moe_intermediate_size);
+
         const hidden: u64 = self.config.hidden_size;
-        const intermediate: u64 = self.config.moe_intermediate_size;
         // `model_moe_combine` reads `[experts][token][hidden]` packed by this
         // forward's token count, so the slot stride is `tokens`, not the
         // buffer's `tokens_max` capacity: a wider stride would make the
@@ -737,7 +1041,7 @@ pub const Model = struct {
         );
         try self.project(
             &self.state.stream_in,
-            weights.expert_gate_up[expert],
+            gate_up,
             &self.state.moe_gate_up,
             tokens,
         );
@@ -749,14 +1053,7 @@ pub const Model = struct {
             self.config.moe_intermediate_size,
             &self.state.moe_act,
         );
-        try self.ple.project(.{
-            .x = self.state.moe_act.pointer,
-            .weight = weights.expert_down[expert].data.pointer,
-            .out = slot.pointer,
-            .rows = tokens,
-            .in_features = @intCast(intermediate),
-            .out_features = @intCast(hidden),
-        });
+        try self.project(&self.state.moe_act, down, &slot, tokens);
         assert(self.state.moe_expert_out.bytes >= offset + tokens * hidden * 4);
     }
 
@@ -1231,14 +1528,41 @@ pub const Model = struct {
             tokens * value_dim,
             &target,
         );
-        try self.ple.project(.{
-            .x = target.pointer,
-            .weight = weights.out_proj.data.pointer,
-            .out = self.state.stream_out.pointer,
-            .rows = tokens,
-            .in_features = value_dim,
-            .out_features = config.hidden_size,
-        });
+        if (self.cluster) |cluster| {
+            // Column parallel: this rank computes its output rows over the
+            // full contraction, then the peers' rows are gathered in. The
+            // gathered stream feeds the residual add, so nothing downstream
+            // re-projects it and no compute is duplicated here (see
+            // `Cluster`'s note on the shared expert, where one is).
+            assert(cluster.dense_rows > 0);
+            assert(config.hidden_size % cluster.dense_rows == 0);
+            assert(cluster.dense_first + cluster.dense_rows <= config.hidden_size);
+            const sliced = load.Matrix{
+                .data = state_module.view(
+                    &weights.out_proj.data,
+                    @as(u64, cluster.dense_first) * value_dim * 4,
+                    @as(u64, cluster.dense_rows) * value_dim * 4,
+                ),
+                .rows = cluster.dense_rows,
+                .cols = value_dim,
+            };
+            try self.project(&target, sliced, &cluster.dense_slice, tokens);
+            try cluster.gather_dense(
+                cluster.user,
+                &self.state.stream_out,
+                tokens,
+                config.hidden_size,
+            );
+        } else {
+            try self.ple.project(.{
+                .x = target.pointer,
+                .weight = weights.out_proj.data.pointer,
+                .out = self.state.stream_out.pointer,
+                .rows = tokens,
+                .in_features = value_dim,
+                .out_features = config.hidden_size,
+            });
+        }
         self.timings.attention_ns += timer.lap();
         assert(self.state.gdn_query.bytes >= @as(u64, tokens) * k_heads * k_head * 4);
     }
@@ -1338,6 +1662,22 @@ pub const Model = struct {
 /// The indexer keeps `min(blocks, block_topk)` complete blocks plus the
 /// incomplete trailing block, which is the prefix of `selected` it writes; the
 /// rest of the slot list stays at its -1 fill and must not be gathered.
+/// Whether the router selected `expert` for one of this forward's tokens.
+fn selectedExpert(selected: []const u32, expert: u32) bool {
+    assert(selected.len > 0);
+    assert(expert < std.math.maxInt(u32));
+
+    for (selected) |candidate| {
+        if (candidate == expert) {
+            return true;
+        } else {
+            assert(candidate != expert);
+        }
+    }
+    return false;
+}
+
+/// How many tokens one row's indexer selection lists.
 pub fn selectionCount(visible: u32, ratio: u32, block_topk: u32) u32 {
     assert(visible > 0);
     assert(ratio > 0);
