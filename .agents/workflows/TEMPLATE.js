@@ -20,7 +20,9 @@ const ART = '/home/gary/.pi/agent/sessions/--home-gary-dev-inferno--/subagent-ar
 // Every model the routing table may use. Define all of them, always.
 // User directive 2026-11-24: WORKERS use the opencode-go provider.
 const WORKER = 'opencode-go/deepseek-v4.1-flash';
-const REVIEW = 'synthetic/syn:large:text'; // review gate stays a DIFFERENT family from the worker
+const REVIEW = 'synthetic/syn:large:text'; // SAME MODEL as WORKER, different provider.
+// The gate's independence is procedural (separate context, must execute, read-only), not
+// model-diversity. Do not claim a second opinion we do not have.
 const DEEPSEEK = WORKER;                   // kept so older scripts still resolve
 const STRONG = REVIEW;                     // kept so older scripts still resolve
 const DESKTOP = 'desktop';                 // OFFLINE 2026-11-24: do not dispatch. Kept defined.

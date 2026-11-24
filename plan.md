@@ -159,12 +159,33 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 | work class | model | notes |
 |---|---|---|
 | **all worker lanes** (hard and straightforward) | **`opencode-go/deepseek-v4.1-flash`** ("DeepSeek V4.1 Flash 1017", 1M ctx) | **user directive 2026-11-24: workers use the opencode-go provider.** The earlier "one slot only" reservation is superseded — lanes may run concurrently on this provider; watch for rate limits rather than assuming the slot is exclusive |
-| `synthetic/syn:large:text` | **review gate and reviewer roles only** | no longer used for implementation work |
+| `synthetic/syn:large:text` | **review gate and reviewer roles only** | **the same model as `opencode-go/deepseek-v4.1-flash` on a different provider** — not a second opinion, see below |
 | `desktop` | **OFFLINE** | see the note below |
-| **review gate** | `synthetic/syn:large:text`, always | the gate has caught 3+ real defects; never downgrade it to a small model, and prefer a *different* family from the implementer to avoid same-model blind spots |
+| **review gate** | `synthetic/syn:large:text`, always | never downgrade it to a small model. **Correction 2026-11-24: this is the same model as the worker on a different provider**, so the gate is *not* an independent second opinion — see the note below on why it still works |
 
 `local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not
 be used for dispatched work until it answers `/v1/models` again.
+
+### Why the review gate works even though it is the same model
+
+I claimed for most of a night that the gate was a *different family* from the implementer. It is
+not: `synthetic/syn:large:text` and `opencode-go/deepseek-v4.1-flash` are the same model on
+different providers. Every reviewer on a deepseek lane — I-010 MoE, I-013, I-014 — was the same
+model grading its own work.
+
+The gate nevertheless caught the MoE gate-2 spec defect, the `max_logit`-over-reference vacuity,
+the I-014 prefetch race, the "torch is not installed" false claim, and the 1,000x-too-loose perf
+gate. So its value is **procedural, not model-diverse**:
+
+- a **fresh context** with no memory of the implementer's reasoning or its self-justifications,
+- an **adversarial instruction** ("judge the tree by execution, not the report"),
+- **read-only** access, so it cannot fix what it finds and must report it,
+- and the orchestrator **re-runs every gate** independently afterwards.
+
+That is a real check on *claim quality* — a report that says "torch is not installed" dies because
+someone runs the command. It is **not** a check on the model's blind spots, which the implementer
+and reviewer share. Where a genuine second opinion matters (spec interpretation, gate design), the
+only different-family model available was `desktop` (Qwen3.8-Flash-Next), now offline and unavailable.
 
 **`desktop` is offline from 2026-11-24 (user directive): the machine is needed for other
 work.** It served its purpose — I-024 cleanup passed first time with zero blocking, all eight
