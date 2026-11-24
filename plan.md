@@ -254,49 +254,47 @@ unfair to us in two separate ways:
    That is a serialised table lookup per token; batched it is ~0.1 ms for the whole chunk.
    Charging it per token made prefill look 24 % worse than the design intends.
 
-**Projection at M=16384, in us/token**, holding measured efficiency where measured:
+### Measured at last: MoE across chunk sizes (M-001, 1 GPU, EP=1, warm cache)
 
-| term | at measured | at 31 % of FP4 peak | at 52 % |
-|---|---|---|---|
-| routed MoE | 147 (32.1 TFLOPS, 17 %) | 78.6 | 47.2 |
-| shared expert (FFMA) | 77 | 77 | 77 |
-| attention prefill | 57.8 | 57.8 | 57.8 |
-| PLE (batched) | ~0 | ~0 | ~0 |
-| **total** | **282 → 3,550 tok/s** | **213 → 4,690** | **182 → 5,494** |
+| M | block us | routed us | routed TFLOPS | % of 192.5 | shared us | dispatch us | combine us | block x48 us/token | MoE-only tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2,048 | 9,321.6 | 4,647.9 | 43.32 | 22.5 % | 2,573.0 | 1,528.4 | 587.3 | 218.5 | 4,577 |
+| 8,192 | 29,486.9 | 11,294.7 | 71.30 | 37.0 % | 10,189.5 | 5,777.0 | 2,355.8 | 172.8 | 5,788 |
+| 16,384 | 57,728.4 | 21,477.4 | **74.99** | **39.0 %** | 20,261.8 | 11,466.0 | 4,708.4 | **169.1** | **5,913** |
+| 32,768 | 116,348.2 | 41,887.7 | 76.90 | 39.9 % | 40,569.5 | 24,645.8 | 9,416.3 | 170.4 | 5,867 |
 
-So the bar is reachable at 16 K but not comfortably: routed efficiency must roughly double
-from the measured 17 %, *and* the shared expert's 77 us/token (27 % of the token) must come
-off the FFMA path. Killing that alone is worth ~8,300 tok/s.
+Term sum vs block is 100.1-100.4 % at every size, so the decomposition is a control, not a guess.
 
-### Metric definition — non-negotiable before quoting any number
+**Three corrections to this file, all of them mine:**
 
-A throughput figure is meaningless without its parallel strategy, its batch model and its
-cache state. Every number in this file must carry all three, or it does not go in.
+1. **"MoE runs at 17 % of FP4 peak" was wrong** — 32.1 TFLOPS was *dispatch + routed*, not the GEMMs.
+   Routed alone is **43.3 TFLOPS (22.5 %)** at 2K and **75.0 (39.0 %)** at 16K. I conflated a
+   composite with a kernel efficiency, which is the same error as conflating whole-block with
+   routed-only.
+2. **The chunk-size lever is not 8x for warm compute.** Warm block throughput rises 219.7 K to
+   283.8 K tok/s (+29 %); routed-only rises +73 %. The block is **occupancy/compute-bound, not
+   weight-read-bound**. The 8x argument applies to the *DRAM tier*: cold fetch falls from 95.7 to
+   11.96 us/token between 2K and 16K.
+3. **The 3,550 tok/s projection was too pessimistic.** Anchored at 16K: MoE 169.1-176.0 us/token
+   + attention 57.8 + ~0 PLE = **226.9-233.8 us/token = 4,277-4,407 tok/s** on **one GPU**.
 
-| | peer engine | inferno |
-|---|---|---|
-| parallelism | pipeline (layers split across ranks) | TP dense + EP experts + replicated attention |
-| decode batch | must be > 1 to fill the pipeline | **1, by requirement** |
-| decode metric | **aggregate over concurrent sequences** | **single-sequence latency** |
-| KV format | fp16 | fp8 |
-| KV at 256K | **6.00 GiB**, unreplicated, 1.50/rank | **12.00 GiB**, replicated x4 |
+**Topology caveat, stated because it is the whole comparison:** all rows are **1 GPU, EP=1, no TP,
+no replication**. The peer engine's 5,000 tok/s is a **4-GPU** warm figure. We are at ~4.3-4.4 K
+prefill on a single card; a like-for-like comparison is not yet available and must not be implied.
 
-**The peer's 100-150 tok/s decode and our 131 tok/s are not the same measurement.** Pipeline
-parallel at batch 1 leaves 3 of 4 ranks idle on every token, so a PP engine cannot be tuned
-for single-stream: its number must be aggregate across concurrent requests (>= 4 micro-batches
-to fill 4 stages). Ours is single-stream, which is what this project requires. Do not compare
-them until the peer's batch model is known.
+**Cold tier, measured rather than assumed:** 7.2 GB/s across pinned host DRAM (near the Gen4 x4 link
+rate of ~7.9 GB/s). The production 4.30 GB per-rank overflow therefore costs **0.595 s/chunk =
+36.4 us/token at 16K** (290.5 us/token at 2K) — per rank. The all-cold rows are an upper bound
+(1.4156 GB/layer is ~16x the production overflow) and must not be multiplied by 48 as a production
+figure.
 
-**The KV comparison is fair, and it goes against us:** fp8 halves our footprint but replication
-multiplies it by four, so we hold **2x** their KV at full context. This is the second measured
-cost of replicating attention, after the 5.5 ms/token serial term. It is affordable only because
-QSA caps live attention at 2,048 keys: the hot window is 30 MB fp8 replicated and the tail
-lives in DRAM. Without tiering, 2x would be a blocker.
+**The one lever that reaches 5,000:** at 16K, shared expert + combine is **73-76 us/token (43 % of
+the block)** with pure shared at 59-62 us/token across 48 layers. Killing the shared FFMA cost is
+worth up to 59-62 us/token and even halving it reaches **~4,930-5,070 tok/s**. That is the single
+highest-value prefill change and it remains quality-neutral: the BF16 shared expert only sits on the
+FFMA path because the 5e-4 exactness gate forbids quantising it.
 
-Prefill *is* comparable: pipeline parallel has no bubble at chunk 16,384 (4,096 tokens per
-stage), so their 5,000 tok/s stands as a like-for-like target and M-001 must answer it.
-
-**Cache warmth is our DRAM tier, and they pay it too.** The peer engine's 5,000 is a warm
+**Cache warmth is our DRAM tier, and they pay it too.****Cache warmth is our DRAM tier, and they pay it too.** The peer engine's 5,000 is a warm
 number. Our 4.30 GB expert overflow is read once per chunk: 2.1 MB/token at chunk 2,048
 versus 262 KB/token at 16,384. Large chunks are not a tuning knob — they are what makes the
 DRAM tier survivable at all. Every prefill figure we report must state cold or warm.
