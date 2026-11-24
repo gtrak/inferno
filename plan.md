@@ -293,6 +293,28 @@ DRAM tier survivable at all. Every prefill figure we report must state cold or w
 
 Quality-neutral, all three. The quantisation ceiling does not move.
 
+## 7d. Invariant triage (user directive 2026-11-24)
+
+When a bug is found, the fix is not the fix. Classify the *hazard*, then pick the cheapest
+mechanism that makes recurrence impossible or loud, in this order:
+
+1. **Make the invalid state unrepresentable.** Comptime-checked shapes, capability handles whose
+   methods do not exist in the wrong state, single-owner types with private fields. Zero runtime
+   cost, so prefer it whenever it is expressible.
+2. **Runtime guard, if cheap.** A per-launch epoch check, a canary band, a NaN poison, an
+   assertion on a declared invariant. Accept it when the cost is bounded and it fires on the first
+   run rather than the fourteenth. Debug-only is fine when release cost is not acceptable, provided
+   the debug form fails loudly.
+3. **Documented contract + a test that can see the violation.** Last resort, and only for hazards
+   where 1 and 2 are genuinely inexpressible — device-side OOB is the standing example.
+
+**Never accept a blanket operation that hides a class of bug.** Zeroing every buffer before use is
+the worked example: it makes a missing write invisible, converts a crash into a plausible wrong
+answer, and costs 3 GiB per reset at full context. It is rule 3 masquerading as rule 2.
+
+Corollary: the guard must be easier to satisfy than the workaround, or lanes route around it.
+Three lanes asked to edit `core/build.zig` to dodge a fence in one night.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
