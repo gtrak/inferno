@@ -167,3 +167,33 @@ gate afterwards. See the verification-effort rule in `plan.md`.
 - Do not touch `core/build.zig`, add a `tiny-check` step, or relax any tolerance.
 - Do not "fix" it by adding a blanket `cudaDeviceSynchronize` and calling it done — that hides
   the dependency rather than stating it, and it would serialise the real pipeline.
+
+## OPEN after the determinism fix: `reset()` zeroes the whole KV cache
+
+`State.reset` currently zeroes **every tracked allocation**:
+
+```zig
+for (self.allocations.items) |buffer| { try self.zero(buffer.pointer, buffer.bytes); }
+```
+
+Every per-layer cache is tracked via `push`, so at 262,144 tokens this is the KV cache:
+**3 GiB per rank, ~7.5 ms at the measured 397.6 GiB/s** — against a 5.3 ms decode step. It is
+invisible on the tiny fixture (a few MB), which is exactly why the test passes.
+
+**This is a band-aid over an unidentified read-before-write.** Zeros are indistinguishable from
+correct data, so a kernel reading unwritten KV contributes 0.0, the model is quietly wrong, and
+nothing fails. That is worse than a crash, and it is the same class as the reviewer's
+`max_logit > 0.0` finding — a check that passes on an all-zero model.
+
+Correct treatment, by case:
+
+| case | treatment |
+|---|---|
+| real data (KV, activations, expert slabs) | write before read; zeroing hides the bug |
+| padding / masked regions (MoE 16-row pad, KV tile tails) | zero **once at allocation**; never re-zero |
+| conditionally-written accumulators | zero in the kernel, where the bound is small and known |
+| debug builds | poison with **NaN**, so an uninitialised read fails loudly |
+
+Follow-up work, in order: name the buffer that was being read unwritten (the 240-tensor bisect
+can), fix that read, zero only true padding at allocation, and add NaN poisoning in debug.
+Keep the blanket reset-zeroing no longer than it takes to find the real read.
