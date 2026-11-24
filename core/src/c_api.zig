@@ -9,6 +9,8 @@ const std = @import("std");
 const cuda_driver = @import("hw/cuda_driver.zig");
 const generated_cubins = @import("generated_cubins");
 
+const Cubin = generated_cubins.Cubin;
+
 const assert = std.debug.assert;
 
 /// Reported by `inferno_version`; kept in step with the Cargo workspace.
@@ -20,12 +22,35 @@ const document_bytes_max: u32 = 16 * 1024;
 /// Below this a document cannot describe even one device.
 const document_bytes_min: u32 = 512;
 
-// Zig only emits data something references, so the cubin table is exported:
-// this keeps every `@embedFile`d cubin inside the static library, which is
-// where the module loader reads it from (no run-time file lookups).
-comptime {
+/// Every cubin embedded in the static library, with its length.
+///
+/// Zig only emits data something references, so the C accessors below are what
+/// keeps every `@embedFile`d cubin inside the archive the module loader reads
+/// from (no run-time file lookups).
+pub fn cubin_table() *const [generated_cubins.cubins.len]Cubin {
     assert(generated_cubins.cubins.len > 0);
-    @export(&generated_cubins.cubins, .{ .name = "inferno_cubin_table" });
+    assert(@sizeOf(Cubin) > 0);
+    return &generated_cubins.cubins;
+}
+
+/// Number of cubins in the table, so no exported symbol lacks its length.
+export fn inferno_cubin_count() u32 {
+    assert(generated_cubins.cubins.len > 0);
+    assert(generated_cubins.cubins.len <= std.math.maxInt(u32));
+    return generated_cubins.cubins.len;
+}
+
+/// One embedded cubin, or null when `index` is past the end. Each entry carries
+/// its own length, and `inferno_cubin_count` gives the entry count.
+export fn inferno_cubin_at(index: u32) ?*const Cubin {
+    assert(@sizeOf(Cubin) > 0);
+    assert(generated_cubins.cubins.len > 0);
+
+    if (index < generated_cubins.cubins.len) {
+        return &generated_cubins.cubins[index];
+    } else {
+        return null;
+    }
 }
 
 /// Version string of the core library, as a NUL terminated C string.
@@ -38,11 +63,16 @@ export fn inferno_version() [*:0]const u8 {
 /// Writes a JSON description of every CUDA device into `buffer`.
 ///
 /// Returns the number of bytes written, excluding the NUL terminator, or 0 if
-/// the driver could not be queried. The document is always NUL terminated and
-/// never writes past `capacity`.
+/// the driver could not be queried or `capacity` is 0. A zero capacity returns
+/// 0 without touching `buffer`: asserting here would abort a C caller across
+/// the FFI boundary. The document is always NUL terminated and never writes
+/// past `capacity`.
 export fn inferno_probe_devices(buffer: [*]u8, capacity: u32) u32 {
-    assert(@intFromPtr(buffer) != 0);
-    assert(capacity > 0);
+    if (capacity == 0) {
+        return 0;
+    } else {
+        assert(@intFromPtr(buffer) != 0);
+    }
 
     buffer[0] = 0;
     var document: [document_bytes_max]u8 = undefined;
@@ -205,6 +235,9 @@ fn copy_truncated(source: []const u8, target: []u8) u32 {
 test {
     _ = @import("hw/dl.zig");
     _ = @import("hw/cuda_driver.zig");
+    _ = @import("hw/cuda_context.zig");
+    _ = @import("hw/pcie_link.zig");
+    _ = @import("hw/bench.zig");
 }
 
 test "inferno_version is a NUL terminated C string" {
@@ -213,10 +246,28 @@ test "inferno_version is a NUL terminated C string" {
 }
 
 test "the cubin table holds at least the probe kernel" {
-    try std.testing.expect(generated_cubins.cubins.len > 0);
-    const probe_cubin = generated_cubins.cubins[0];
+    const table = cubin_table();
+    try std.testing.expect(table.len > 0);
+    const probe_cubin = table[0];
     try std.testing.expectEqualStrings("probe", std.mem.span(probe_cubin.name));
     try std.testing.expect(probe_cubin.length > 0);
+    try std.testing.expectEqual(
+        @as(u32, @intCast(table.len)),
+        inferno_cubin_count(),
+    );
+}
+
+test "inferno_cubin_at bounds its index" {
+    const first = inferno_cubin_at(0) orelse return error.TestExpectedCubin;
+    try std.testing.expect(first.length > 0);
+    try std.testing.expect(inferno_cubin_at(inferno_cubin_count()) == null);
+}
+
+test "inferno_probe_devices with zero capacity writes nothing" {
+    var buffer: [8]u8 = [_]u8{0xaa} ** 8;
+    const written = inferno_probe_devices(&buffer, 0);
+    try std.testing.expectEqual(@as(u32, 0), written);
+    try std.testing.expectEqual([_]u8{0xaa} ** 8, buffer);
 }
 
 test "copy_truncated NUL terminates a short buffer" {
@@ -240,6 +291,18 @@ test "render_document produces the documented JSON" {
         .compute_capability_major = 12,
         .compute_capability_minor = 0,
         .vram_bytes = 16660430848,
+        .multiprocessor_count = 36,
+        .l2_cache_bytes = 32 * 1024 * 1024,
+        .clock_khz = 2602000,
+        .memory_clock_khz = 14001000,
+        .pci_bus_id = blk: {
+            var bus_id: [cuda_driver.pci_bus_id_bytes_max]u8 =
+                [_]u8{0} ** cuda_driver.pci_bus_id_bytes_max;
+            @memcpy(bus_id[0.."0000:05:00.0".len], "0000:05:00.0");
+            break :blk bus_id;
+        },
+        .pci_bus_id_length = "0000:05:00.0".len,
+        .handle = 0,
     }};
     const driver_version = cuda_driver.DriverVersion{
         .text = blk: {

@@ -1,8 +1,9 @@
-//! Minimal CUDA driver API layer: enough to enumerate this host's GPUs.
+//! CUDA driver API surface: the ABI, the symbol table and the error taxonomy.
 //!
-//! Only the symbols the probe needs are resolved (see `Functions`). Every call
-//! checks its `CUresult` and maps failures into `DriverError`, so callers see a
-//! closed set of errors instead of raw driver codes.
+//! `hw/cuda_context.zig` wraps these raw entry points in typed handles, so the
+//! rest of the engine never passes a bare `CUcontext` or `CUstream` around.
+//! Every entry point returns a `CUresult`; `check_result` maps it onto the
+//! closed `DriverError` set, so no driver code is ever silently dropped.
 
 const std = @import("std");
 
@@ -23,15 +24,25 @@ const procfs_version_bytes_max = 512;
 /// Version text used when procfs cannot be read.
 const unknown_version_text = "unknown";
 
-/// Values from `cuda.h` (CUDA 13.2).
+/// `CUresult` values from `cuda.h` (CUDA 13.2) that this layer maps.
 const cu_success: CuResult = 0;
 const cu_error_invalid_value: CuResult = 1;
 const cu_error_out_of_memory: CuResult = 2;
 const cu_error_not_initialized: CuResult = 3;
+const cu_error_no_device: CuResult = 100;
 const cu_error_invalid_device: CuResult = 101;
+const cu_error_invalid_context: CuResult = 201;
+const cu_error_invalid_handle: CuResult = 400;
+const cu_error_peer_access_already_enabled: CuResult = 704;
+const cu_error_peer_access_not_enabled: CuResult = 705;
+const cu_error_not_permitted: CuResult = 800;
 const cu_error_not_supported: CuResult = 801;
 
-/// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` and `..._MINOR`.
+/// `CUdevice_attribute` values queried for the hardware probe.
+const attribute_clock_khz: c_int = 13;
+const attribute_multiprocessor_count: c_int = 16;
+const attribute_memory_clock_khz: c_int = 36;
+const attribute_l2_cache_bytes: c_int = 38;
 const attribute_compute_capability_major: c_int = 75;
 const attribute_compute_capability_minor: c_int = 76;
 
@@ -44,17 +55,35 @@ pub const device_name_bytes_max: u32 = 128;
 /// Long enough for a driver version such as "610.57.04".
 pub const driver_version_bytes_max: u32 = 32;
 
+/// Long enough for a bus id such as "0000:05:00.0" plus its terminator.
+pub const pci_bus_id_bytes_max: u32 = 16;
+
 /// C types from `cuda.h` that cross this boundary.
 pub const CuResult = c_int;
 pub const CuDevice = c_int;
+pub const CuContext = *anyopaque;
+pub const CuStream = *anyopaque;
+pub const CuEvent = *anyopaque;
+pub const DevicePtr = u64;
+
+/// Enabling peer access twice is not a failure; the caller ignores this code.
+pub const peer_access_already_enabled_result: CuResult =
+    cu_error_peer_access_already_enabled;
 
 pub const DriverError = error{
     driver_library_missing,
     driver_symbol_missing,
     driver_not_initialized,
+    driver_no_device,
     driver_invalid_value,
     driver_invalid_device,
+    driver_invalid_context,
+    driver_invalid_handle,
     driver_out_of_memory,
+    /// Peer access was already on, or is not on, when the call needed the
+    /// other state.
+    driver_peer_access,
+    driver_not_permitted,
     driver_not_supported,
     driver_unknown_failure,
 };
@@ -71,11 +100,25 @@ pub const Device = struct {
     compute_capability_major: u32,
     compute_capability_minor: u32,
     vram_bytes: u64,
+    multiprocessor_count: u32,
+    l2_cache_bytes: u64,
+    clock_khz: u32,
+    memory_clock_khz: u32,
+    pci_bus_id: [pci_bus_id_bytes_max]u8,
+    pci_bus_id_length: u32,
+    handle: CuDevice,
 
     pub fn name_slice(device: *const Device) []const u8 {
         assert(device.name_length <= device_name_bytes_max);
         assert(device.name_length > 0);
         return device.name[0..device.name_length];
+    }
+
+    /// PCI address, for example "0000:05:00.0"; also the sysfs directory name.
+    pub fn pci_bus_id_slice(device: *const Device) []const u8 {
+        assert(device.pci_bus_id_length <= pci_bus_id_bytes_max);
+        assert(device.pci_bus_id_length > 0);
+        return device.pci_bus_id[0..device.pci_bus_id_length];
     }
 };
 
@@ -105,6 +148,137 @@ pub const DriverVersion = struct {
     }
 };
 
+/// `cuDevice*` entry points.
+pub const DeviceFunctions = struct {
+    count_get: *const fn (*c_int) callconv(.c) CuResult,
+    get: *const fn (*CuDevice, c_int) callconv(.c) CuResult,
+    name_get: *const fn ([*]u8, c_int, CuDevice) callconv(.c) CuResult,
+    attribute_get: *const fn (
+        *c_int,
+        c_int,
+        CuDevice,
+    ) callconv(.c) CuResult,
+    total_memory_get: *const fn (*u64, CuDevice) callconv(.c) CuResult,
+    pci_bus_id_get: *const fn ([*]u8, c_int, CuDevice) callconv(.c) CuResult,
+    can_access_peer: *const fn (
+        *c_int,
+        CuDevice,
+        CuDevice,
+    ) callconv(.c) CuResult,
+};
+
+/// `cuCtx*` and primary context entry points.
+pub const ContextFunctions = struct {
+    retain_primary: *const fn (*CuContext, CuDevice) callconv(.c) CuResult,
+    release_primary: *const fn (CuDevice) callconv(.c) CuResult,
+    set_current: *const fn (CuContext) callconv(.c) CuResult,
+    get_current: *const fn (*CuContext) callconv(.c) CuResult,
+    enable_peer_access: *const fn (
+        CuContext,
+        c_uint,
+    ) callconv(.c) CuResult,
+};
+
+/// `cuMem*` allocation and copy entry points.
+pub const MemoryFunctions = struct {
+    alloc: *const fn (*DevicePtr, usize) callconv(.c) CuResult,
+    free: *const fn (DevicePtr) callconv(.c) CuResult,
+    info: *const fn (*usize, *usize) callconv(.c) CuResult,
+    host_alloc: *const fn (
+        *?*anyopaque,
+        usize,
+        c_uint,
+    ) callconv(.c) CuResult,
+    host_free: *const fn (*anyopaque) callconv(.c) CuResult,
+    copy_h_to_d_async: *const fn (
+        DevicePtr,
+        *const anyopaque,
+        usize,
+        CuStream,
+    ) callconv(.c) CuResult,
+    copy_d_to_h_async: *const fn (
+        *anyopaque,
+        DevicePtr,
+        usize,
+        CuStream,
+    ) callconv(.c) CuResult,
+    copy_d_to_d_async: *const fn (
+        DevicePtr,
+        DevicePtr,
+        usize,
+        CuStream,
+    ) callconv(.c) CuResult,
+};
+
+/// `cuStream*` entry points.
+pub const StreamFunctions = struct {
+    create: *const fn (*CuStream, c_uint) callconv(.c) CuResult,
+    destroy: *const fn (CuStream) callconv(.c) CuResult,
+    synchronize: *const fn (CuStream) callconv(.c) CuResult,
+};
+
+/// `cuEvent*` entry points.
+pub const EventFunctions = struct {
+    create: *const fn (*CuEvent, c_uint) callconv(.c) CuResult,
+    destroy: *const fn (CuEvent) callconv(.c) CuResult,
+    record: *const fn (CuEvent, CuStream) callconv(.c) CuResult,
+    synchronize: *const fn (CuEvent) callconv(.c) CuResult,
+    elapsed_ms: *const fn (*f32, CuEvent, CuEvent) callconv(.c) CuResult,
+};
+
+/// Driver entry points resolved from `cuda_library_name`. Signatures are the C
+/// ones from `cuda.h`, so `size_t` stays `usize` and flags stay `c_uint`.
+pub const Functions = struct {
+    init: *const fn (c_uint) callconv(.c) CuResult,
+    driver_version_get: *const fn (*c_int) callconv(.c) CuResult,
+    device: DeviceFunctions,
+    context: ContextFunctions,
+    memory: MemoryFunctions,
+    stream: StreamFunctions,
+    event: EventFunctions,
+};
+
+/// A symbol table is a dense array of function pointers; a field with any
+/// other layout would break the size invariants asserted below.
+fn is_pointer_table(comptime Table: type) bool {
+    assert(@sizeOf(*const anyopaque) > 0);
+    assert(std.meta.fields(Table).len > 0);
+
+    return @sizeOf(Table) ==
+        std.meta.fields(Table).len * @sizeOf(*const anyopaque);
+}
+
+comptime {
+    // The top-level table is two function pointers plus the five groups.
+    assert(@sizeOf(Functions) == @sizeOf(DeviceFunctions) +
+        @sizeOf(ContextFunctions) +
+        @sizeOf(MemoryFunctions) +
+        @sizeOf(StreamFunctions) +
+        @sizeOf(EventFunctions) +
+        2 * @sizeOf(*const anyopaque));
+    assert(is_pointer_table(DeviceFunctions));
+    assert(is_pointer_table(ContextFunctions));
+    assert(is_pointer_table(MemoryFunctions));
+    assert(is_pointer_table(StreamFunctions));
+    assert(is_pointer_table(EventFunctions));
+}
+
+const LoadState = enum { unloaded, loaded, failed };
+
+/// The symbol table is resolved once per process and then read-only.
+var driver_functions: Functions = undefined;
+var load_state: LoadState = .unloaded;
+var load_error: DriverError = error.driver_library_missing;
+var load_mutex: std.Thread.Mutex = .{};
+
+/// Returns the cached driver symbol table, loading it on first use.
+pub fn functions() DriverError!*const Functions {
+    assert(cuda_library_name.len > 0);
+    assert(@sizeOf(Functions) > 0);
+
+    return load();
+}
+
 /// Fills `devices` with every device the driver reports, returning the count.
 ///
 /// The driver is initialized on first use; devices beyond `devices.len` are not
@@ -116,7 +290,7 @@ pub fn query_devices(devices: []Device) DriverError!u32 {
     const table = try load();
     try check_result(table.init(0));
     var driver_device_count: c_int = 0;
-    try check_result(table.device_count_get(&driver_device_count));
+    try check_result(table.device.count_get(&driver_device_count));
     if (driver_device_count > 0) {
         const reported: u32 = @intCast(driver_device_count);
         const used = @min(reported, @as(u32, @intCast(devices.len)));
@@ -125,6 +299,23 @@ pub fn query_devices(devices: []Device) DriverError!u32 {
         }
         assert(used > 0);
         return used;
+    } else {
+        return DriverError.driver_no_device;
+    }
+}
+
+/// Whether `from` may reach `to` over peer-to-peer copy.
+pub fn can_access_peer(from: CuDevice, to: CuDevice) DriverError!bool {
+    assert(from >= 0);
+    assert(to >= 0);
+
+    const table = try load();
+    var can_access: c_int = 0;
+    try check_result(table.device.can_access_peer(&can_access, from, to));
+    if (can_access == 0) {
+        return false;
+    } else if (can_access == 1) {
+        return true;
     } else {
         return DriverError.driver_unknown_failure;
     }
@@ -174,29 +365,10 @@ pub fn display_driver_version(version: *DriverVersion) DriverVersionError!void {
     assert(version.length > 0);
 }
 
-/// Driver entry points resolved from `cuda_library_name`.
-const Functions = struct {
-    init: *const fn (c_uint) callconv(.c) CuResult,
-    driver_version_get: *const fn (*c_int) callconv(.c) CuResult,
-    device_count_get: *const fn (*c_int) callconv(.c) CuResult,
-    device_get: *const fn (*CuDevice, c_int) callconv(.c) CuResult,
-    device_name_get: *const fn ([*]u8, c_int, CuDevice) callconv(.c) CuResult,
-    attribute_get: *const fn (*c_int, c_int, CuDevice) callconv(.c) CuResult,
-    total_memory_get: *const fn (*u64, CuDevice) callconv(.c) CuResult,
-};
-
-const LoadState = enum { unloaded, loaded, failed };
-
-/// The symbol table is resolved once per process and then read-only.
-var driver_functions: Functions = undefined;
-var load_state: LoadState = .unloaded;
-var load_error: DriverError = error.driver_library_missing;
-var load_mutex: std.Thread.Mutex = .{};
-
 /// Returns the cached driver symbol table, loading it on first use.
 fn load() DriverError!*const Functions {
-    assert(@sizeOf(Functions) == 7 * @sizeOf(*const anyopaque));
     assert(cuda_library_name.len > 0);
+    assert(@sizeOf(Functions) > 0);
 
     load_mutex.lock();
     defer load_mutex.unlock();
@@ -245,11 +417,111 @@ fn resolve_symbols(library: *const dl.Library) dl.DlError!Functions {
         .driver_version_get = @ptrCast(
             try library.symbol("cuDriverGetVersion"),
         ),
-        .device_count_get = @ptrCast(try library.symbol("cuDeviceGetCount")),
-        .device_get = @ptrCast(try library.symbol("cuDeviceGet")),
-        .device_name_get = @ptrCast(try library.symbol("cuDeviceGetName")),
-        .attribute_get = @ptrCast(try library.symbol("cuDeviceGetAttribute")),
-        .total_memory_get = @ptrCast(try library.symbol("cuDeviceTotalMem_v2")),
+        .device = try resolve_device_symbols(library),
+        .context = try resolve_context_symbols(library),
+        .memory = try resolve_memory_symbols(library),
+        .stream = try resolve_stream_symbols(library),
+        .event = try resolve_event_symbols(library),
+    };
+}
+
+fn resolve_device_symbols(
+    library: *const dl.Library,
+) dl.DlError!DeviceFunctions {
+    assert(cuda_library_name.len > 0);
+    assert(@sizeOf(DeviceFunctions) > 0);
+
+    return .{
+        .count_get = @ptrCast(try library.symbol("cuDeviceGetCount")),
+        .get = @ptrCast(try library.symbol("cuDeviceGet")),
+        .name_get = @ptrCast(try library.symbol("cuDeviceGetName")),
+        .attribute_get = @ptrCast(
+            try library.symbol("cuDeviceGetAttribute"),
+        ),
+        .total_memory_get = @ptrCast(
+            try library.symbol("cuDeviceTotalMem_v2"),
+        ),
+        .pci_bus_id_get = @ptrCast(
+            try library.symbol("cuDeviceGetPCIBusId"),
+        ),
+        .can_access_peer = @ptrCast(
+            try library.symbol("cuDeviceCanAccessPeer"),
+        ),
+    };
+}
+
+fn resolve_context_symbols(
+    library: *const dl.Library,
+) dl.DlError!ContextFunctions {
+    assert(cuda_library_name.len > 0);
+    assert(@sizeOf(ContextFunctions) > 0);
+
+    return .{
+        .retain_primary = @ptrCast(
+            try library.symbol("cuDevicePrimaryCtxRetain"),
+        ),
+        .release_primary = @ptrCast(
+            try library.symbol("cuDevicePrimaryCtxRelease_v2"),
+        ),
+        .set_current = @ptrCast(try library.symbol("cuCtxSetCurrent")),
+        .get_current = @ptrCast(try library.symbol("cuCtxGetCurrent")),
+        .enable_peer_access = @ptrCast(
+            try library.symbol("cuCtxEnablePeerAccess"),
+        ),
+    };
+}
+
+fn resolve_memory_symbols(
+    library: *const dl.Library,
+) dl.DlError!MemoryFunctions {
+    assert(cuda_library_name.len > 0);
+    assert(@sizeOf(MemoryFunctions) > 0);
+
+    return .{
+        .alloc = @ptrCast(try library.symbol("cuMemAlloc_v2")),
+        .free = @ptrCast(try library.symbol("cuMemFree_v2")),
+        .info = @ptrCast(try library.symbol("cuMemGetInfo_v2")),
+        .host_alloc = @ptrCast(try library.symbol("cuMemHostAlloc")),
+        .host_free = @ptrCast(try library.symbol("cuMemFreeHost")),
+        .copy_h_to_d_async = @ptrCast(
+            try library.symbol("cuMemcpyHtoDAsync_v2"),
+        ),
+        .copy_d_to_h_async = @ptrCast(
+            try library.symbol("cuMemcpyDtoHAsync_v2"),
+        ),
+        .copy_d_to_d_async = @ptrCast(
+            try library.symbol("cuMemcpyDtoDAsync_v2"),
+        ),
+    };
+}
+
+fn resolve_stream_symbols(
+    library: *const dl.Library,
+) dl.DlError!StreamFunctions {
+    assert(cuda_library_name.len > 0);
+    assert(@sizeOf(StreamFunctions) > 0);
+
+    return .{
+        .create = @ptrCast(try library.symbol("cuStreamCreate")),
+        .destroy = @ptrCast(try library.symbol("cuStreamDestroy_v2")),
+        .synchronize = @ptrCast(
+            try library.symbol("cuStreamSynchronize"),
+        ),
+    };
+}
+
+fn resolve_event_symbols(
+    library: *const dl.Library,
+) dl.DlError!EventFunctions {
+    assert(cuda_library_name.len > 0);
+    assert(@sizeOf(EventFunctions) > 0);
+
+    return .{
+        .create = @ptrCast(try library.symbol("cuEventCreate")),
+        .destroy = @ptrCast(try library.symbol("cuEventDestroy_v2")),
+        .record = @ptrCast(try library.symbol("cuEventRecord")),
+        .synchronize = @ptrCast(try library.symbol("cuEventSynchronize")),
+        .elapsed_ms = @ptrCast(try library.symbol("cuEventElapsedTime")),
     };
 }
 
@@ -262,44 +534,91 @@ fn fill_device(
     assert(index < device_count_max);
     assert(device.name.len == device_name_bytes_max);
 
-    var driver_device: CuDevice = 0;
-    try check_result(table.device_get(&driver_device, @intCast(index)));
+    var handle: CuDevice = 0;
+    try check_result(table.device.get(&handle, @intCast(index)));
 
     var name: [device_name_bytes_max]u8 = [_]u8{0} ** device_name_bytes_max;
     const name_bytes: c_int = @intCast(name.len);
-    try check_result(table.device_name_get(&name, name_bytes, driver_device));
-
-    var major: c_int = 0;
-    var minor: c_int = 0;
-    try check_result(table.attribute_get(
-        &major,
-        attribute_compute_capability_major,
-        driver_device,
-    ));
-    try check_result(table.attribute_get(
-        &minor,
-        attribute_compute_capability_minor,
-        driver_device,
-    ));
+    try check_result(table.device.name_get(&name, name_bytes, handle));
 
     var vram_bytes: u64 = 0;
-    try check_result(table.total_memory_get(&vram_bytes, driver_device));
+    try check_result(table.device.total_memory_get(&vram_bytes, handle));
+
+    var bus_id: [pci_bus_id_bytes_max]u8 = [_]u8{0} ** pci_bus_id_bytes_max;
+    try check_result(table.device.pci_bus_id_get(
+        &bus_id,
+        @intCast(bus_id.len),
+        handle,
+    ));
+
+    const major = try attribute_u32(
+        table,
+        handle,
+        attribute_compute_capability_major,
+    );
+    const minor = try attribute_u32(
+        table,
+        handle,
+        attribute_compute_capability_minor,
+    );
+    const multiprocessor_count = try attribute_u32(
+        table,
+        handle,
+        attribute_multiprocessor_count,
+    );
+    const l2_cache_bytes: u64 = try attribute_u32(
+        table,
+        handle,
+        attribute_l2_cache_bytes,
+    );
+    const clock_khz = try attribute_u32(table, handle, attribute_clock_khz);
+    const memory_clock_khz = try attribute_u32(
+        table,
+        handle,
+        attribute_memory_clock_khz,
+    );
 
     device.* = .{
         .index = index,
         .name = name,
         .name_length = name_length_of(&name),
-        .compute_capability_major = @intCast(major),
-        .compute_capability_minor = @intCast(minor),
+        .compute_capability_major = major,
+        .compute_capability_minor = minor,
         .vram_bytes = vram_bytes,
+        .multiprocessor_count = multiprocessor_count,
+        .l2_cache_bytes = l2_cache_bytes,
+        .clock_khz = clock_khz,
+        .memory_clock_khz = memory_clock_khz,
+        .pci_bus_id = bus_id,
+        .pci_bus_id_length = name_length_of(&bus_id),
+        .handle = handle,
     };
     assert(device.name_length > 0);
+    assert(device.multiprocessor_count > 0);
 }
 
-/// Length of the NUL terminated name inside the fixed-size buffer.
-fn name_length_of(name: *const [device_name_bytes_max]u8) u32 {
-    assert(name.len == device_name_bytes_max);
-    assert(device_name_bytes_max > 0);
+/// Reads one device attribute the driver reports as a non-negative integer.
+fn attribute_u32(
+    table: *const Functions,
+    handle: CuDevice,
+    attribute: c_int,
+) DriverError!u32 {
+    assert(attribute >= 0);
+    assert(@sizeOf(c_int) == 4);
+
+    var value: c_int = 0;
+    try check_result(table.device.attribute_get(&value, attribute, handle));
+    if (value >= 0) {
+        return @intCast(value);
+    } else {
+        return DriverError.driver_unknown_failure;
+    }
+}
+
+/// Length of a NUL terminated string inside its fixed-size buffer.
+fn name_length_of(name: anytype) u32 {
+    assert(name.len > 0);
+    assert(name.len <= device_name_bytes_max);
 
     const length = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
     assert(length <= name.len);
@@ -325,7 +644,7 @@ fn first_version_token(contents: []const u8) ?[]const u8 {
 }
 
 /// Turns a driver result code into an error.
-fn check_result(result: CuResult) DriverError!void {
+pub fn check_result(result: CuResult) DriverError!void {
     assert(@sizeOf(CuResult) == @sizeOf(c_int));
     assert(cu_success == 0);
 
@@ -345,7 +664,13 @@ fn map_result(result: CuResult) DriverError {
         cu_error_invalid_value => DriverError.driver_invalid_value,
         cu_error_out_of_memory => DriverError.driver_out_of_memory,
         cu_error_not_initialized => DriverError.driver_not_initialized,
+        cu_error_no_device => DriverError.driver_no_device,
         cu_error_invalid_device => DriverError.driver_invalid_device,
+        cu_error_invalid_context => DriverError.driver_invalid_context,
+        cu_error_invalid_handle => DriverError.driver_invalid_handle,
+        cu_error_peer_access_already_enabled => DriverError.driver_peer_access,
+        cu_error_peer_access_not_enabled => DriverError.driver_peer_access,
+        cu_error_not_permitted => DriverError.driver_not_permitted,
         cu_error_not_supported => DriverError.driver_not_supported,
         else => DriverError.driver_unknown_failure,
     };
@@ -372,6 +697,15 @@ test "query_devices enumerates this machine's GPUs" {
     try std.testing.expect(count <= device_count_max);
     try std.testing.expect(devices[0].name_length > 0);
     try std.testing.expect(devices[0].vram_bytes > 0);
+    try std.testing.expect(devices[0].multiprocessor_count > 0);
+    try std.testing.expect(devices[0].l2_cache_bytes > 0);
+    try std.testing.expect(devices[0].clock_khz > 0);
+    try std.testing.expect(devices[0].memory_clock_khz > 0);
+    try std.testing.expect(devices[0].pci_bus_id_length > 0);
+    try std.testing.expectEqual(
+        @as(u8, '0'),
+        devices[0].pci_bus_id_slice()[0],
+    );
 }
 
 test "the symbol table is resolved once and cached" {
@@ -410,6 +744,10 @@ test "map_result covers representative driver codes" {
     try std.testing.expectEqual(
         DriverError.driver_invalid_value,
         map_result(cu_error_invalid_value),
+    );
+    try std.testing.expectEqual(
+        DriverError.driver_out_of_memory,
+        map_result(cu_error_out_of_memory),
     );
     try std.testing.expectEqual(
         DriverError.driver_unknown_failure,
