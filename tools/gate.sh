@@ -83,27 +83,34 @@ if [ ! -f tools/ref-trace/quant_oracle.py ]; then
 elif [ ! -x tools/ref-trace/.venv/bin/python ]; then
     echo "SKIP quant fixture drift guard: no venv (run tools/ref-trace/run.sh)"
 else
-    # quant_oracle.py takes no arguments and writes tests/golden/quant in place,
-    # so copy the committed bytes aside, regenerate, compare, then restore. The
-    # tree is left exactly as it was, whether or not drift is detected.
+    # quant_oracle.py takes no arguments and writes tests/golden/quant in place, so
+    # copy the committed bytes aside, regenerate, compare, and ALWAYS restore. The
+    # trap matters: without it an interrupt or a failed cmp after the rewrite would
+    # leave regenerated fixtures in the tree, and a later run would then "pass"
+    # against bytes nobody reviewed.
     drift_dir="$(mktemp -d)"
-    cp tests/golden/quant/*.safetensors "$drift_dir/"
-    ( cd tools/ref-trace && ./.venv/bin/python quant_oracle.py >/dev/null ) || {
-        echo "FAIL could not regenerate quant fixtures"
-        cp "$drift_dir"/*.safetensors tests/golden/quant/
+    restore_fixtures() {
+        cp "$drift_dir"/*.safetensors tests/golden/quant/ 2>/dev/null || true
         rm -rf "$drift_dir"
-        exit 1
     }
+    trap restore_fixtures EXIT INT TERM
+    cp tests/golden/quant/*.safetensors "$drift_dir/"
     drift_status=0
-    for fixture in nvfp4_case fp8_blockwise_case; do
-        if ! cmp -s "$drift_dir/$fixture.safetensors" \
-            "tests/golden/quant/$fixture.safetensors"; then
-            echo "FAIL tests/golden/quant/$fixture.safetensors is not reproducible from quant_oracle.py"
-            drift_status=1
-        fi
-    done
-    cp "$drift_dir"/*.safetensors tests/golden/quant/
-    rm -rf "$drift_dir"
+    if ! ( cd tools/ref-trace && ./.venv/bin/python quant_oracle.py >/dev/null ); then
+        echo "FAIL could not regenerate quant fixtures"
+        drift_status=1
+    fi
+    if [ "$drift_status" -eq 0 ]; then
+        for fixture in nvfp4_case fp8_blockwise_case; do
+            if ! cmp -s "$drift_dir/$fixture.safetensors" \
+                "tests/golden/quant/$fixture.safetensors"; then
+                echo "FAIL tests/golden/quant/$fixture.safetensors is not reproducible from quant_oracle.py"
+                drift_status=1
+            fi
+        done
+    fi
+    restore_fixtures
+    trap - EXIT INT TERM
     if [ "$drift_status" -ne 0 ]; then
         exit 1
     fi
