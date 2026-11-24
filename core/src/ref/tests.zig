@@ -233,6 +233,10 @@ const Harness = struct {
     probe_storage: ProbeStorage,
     saved_hyper: []f32,
     transposed: []f32,
+    /// `[conv_dim, kernel - 1]` staging view of the trace's conv state, which is
+    /// one column wider than the state the reference keeps (see
+    /// `compare_gdn_state`).
+    conv_view: []f32,
 
     /// Opens the fixtures and builds the model.
     fn init(allocator: std.mem.Allocator) !Harness {
@@ -253,6 +257,7 @@ const Harness = struct {
             .probe_storage = undefined,
             .saved_hyper = &[_]f32{},
             .transposed = &[_]f32{},
+            .conv_view = &[_]f32{},
         };
         try harness.model.init(allocator, &harness.checkpoint);
         harness.scratch = try model.Scratch.init(
@@ -269,7 +274,13 @@ const Harness = struct {
             f32,
             config.max_position_embeddings * config.hyper_size(),
         );
+        assert(config.linear_conv_kernel_dim >= 2);
+        harness.conv_view = try allocator.alloc(
+            f32,
+            config.conv_dim() * (config.linear_conv_kernel_dim - 1),
+        );
         assert(harness.scratch.hyper.len > 0);
+        assert(harness.conv_view.len > 0);
         return harness;
     }
 
@@ -277,7 +288,9 @@ const Harness = struct {
     fn deinit(self: *Harness) void {
         assert(self.scratch.hyper.len > 0);
         assert(self.saved_hyper.len > 0);
+        assert(self.conv_view.len > 0);
 
+        self.allocator.free(self.conv_view);
         self.allocator.free(self.transposed);
         self.allocator.free(self.saved_hyper);
         self.probe_storage.deinit(self.allocator);
@@ -579,6 +592,80 @@ const Harness = struct {
         }
         assert(k_heads * k_head > 0);
         assert(heads * v_head > 0);
+        try self.compare_gdn_state(prefix, index);
+    }
+
+    /// Compares the GDN cache state of layer `index` after the forward.
+    ///
+    /// These two tensors are the whole cross-step contract of a linear-attention
+    /// layer - the GDN kernels of I-009 are handed exactly them - and before this
+    /// comparison nothing in the suite read them at all. `recurrent` is
+    /// `[num_v_heads, head_k_dim, head_v_dim]` in both; the conv state needs the
+    /// column drop that `drop_leading_column` explains.
+    fn compare_gdn_state(
+        self: *Harness,
+        prefix: []const u8,
+        index: u32,
+    ) !void {
+        assert(index < self.model.config.num_hidden_layers);
+        assert(self.model.config.layer_types[index] == .linear_attention);
+
+        const state = &self.model.cache.layers[index].gdn;
+        assert(state.conv.len > 0);
+        assert(state.recurrent.len > 0);
+
+        var buffers: [2][name_bytes_max]u8 = undefined;
+        const recurrent_label = try sections(
+            prefix,
+            &buffers[0],
+            "layer{d}/gdn/recurrent_state",
+            .{index},
+        );
+        try self.report.tensor_f32(
+            recurrent_label,
+            try self.golden(recurrent_label),
+            state.recurrent,
+        );
+        const conv_label = try sections(
+            prefix,
+            &buffers[1],
+            "layer{d}/gdn/conv_state",
+            .{index},
+        );
+        const golden_conv = try self.golden(conv_label);
+        try self.report.tensor_f32(
+            conv_label,
+            self.drop_leading_column(golden_conv),
+            state.conv,
+        );
+    }
+
+    /// Returns `captured` without the leading column that no conv reads.
+    ///
+    /// The HF cache keeps `linear_conv_kernel_dim` columns of conv input - one
+    /// more than a causal conv of that kernel needs - while the reference keeps
+    /// exactly `kernel - 1`, the minimum a continuation requires. The extra
+    /// column is one step of history we never read: `gdn/conv_out` matches
+    /// through prefill *and* the decode step on `kernel - 1` columns alone. So
+    /// the comparable part is the trailing `kernel - 1` columns of every
+    /// channel, repacked into `conv_view`.
+    fn drop_leading_column(
+        self: *Harness,
+        captured: []const f32,
+    ) []const f32 {
+        const config = &self.model.config;
+        const channels: usize = config.conv_dim();
+        const history: usize = config.linear_conv_kernel_dim - 1;
+        const stored: usize = config.linear_conv_kernel_dim;
+        assert(captured.len == channels * stored);
+        assert(self.conv_view.len == channels * history);
+
+        for (0..channels) |channel| {
+            const source = captured[channel * stored + 1 ..][0..history];
+            @memcpy(self.conv_view[channel * history ..][0..history], source);
+        }
+        assert(self.conv_view.len == channels * history);
+        return self.conv_view;
     }
 
     /// Compares the indexed-attention intermediates of layer `index`.
@@ -1111,9 +1198,15 @@ fn expect_non_vacuous(harness: *Harness) !void {
             },
         );
     }
-    try std.testing.expect(distinct > 0);
-    try std.testing.expect(distinct <= positions);
-    try std.testing.expect(ordered >= distinct);
+    // Strict bounds, not the tautologies this check used to hold. With the golden
+    // trace every one of them is live: 5 distinct sets over 12 positions, 6
+    // distinct ordered pairs. So `distinct > 1` fails when every position routes
+    // to the same pair, `distinct < positions` when routing is a bijection, and
+    // `ordered > distinct` when the trace never picks a pair in two different
+    // orders - which is what makes the slot a routed expert lands in observable.
+    try std.testing.expect(distinct > 1);
+    try std.testing.expect(distinct < positions);
+    try std.testing.expect(ordered > distinct);
 
     var largest: f32 = 0.0;
     var greatest: f32 = -std.math.floatMax(f32);

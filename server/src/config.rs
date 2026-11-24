@@ -16,6 +16,14 @@ use serde::{Deserialize, Serialize};
 /// Prefix of the environment overrides (`INFERNO_LOG__LEVEL=debug`).
 const ENV_PREFIX: &str = "INFERNO_";
 
+/// The bare `INFERNO_LOG` name, which is *not* a `[log]` configuration key.
+///
+/// `telemetry::init` reads it as the log filter override it documents, so the
+/// config layer must not fold it onto the `log` struct: `INFERNO_LOG=debug`
+/// used to abort startup with "expected struct LogConfig". `INFERNO_LOG__LEVEL`
+/// and `INFERNO_LOG__FORMAT` are unaffected - only the exact bare name is dropped.
+const LOG_FILTER_VARIABLE: &str = "log";
+
 /// Where a configuration value came from, for the startup log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueSource {
@@ -128,6 +136,16 @@ fn default_model_path() -> PathBuf {
         Ok(home) => PathBuf::from(home).join("models/qwen38-flash-next-nvfp4"),
         Err(_) => PathBuf::from("/models/qwen38-flash-next-nvfp4"),
     }
+}
+
+/// The `INFERNO_*` environment layer: `INFERNO_A__B` maps onto the `a.b` key.
+///
+/// `ignore` runs after `split`, so it drops exactly the bare `log` name and
+/// every nested `log__*` key still reaches the `[log]` section.
+fn env_layer() -> Env {
+    Env::prefixed(ENV_PREFIX)
+        .split("__")
+        .ignore(&[LOG_FILTER_VARIABLE])
 }
 
 impl Default for Config {
@@ -275,7 +293,7 @@ impl Config {
             figment = figment.merge(Toml::file(path));
             sources.file = Some(path.display().to_string());
         }
-        figment = figment.merge(Env::prefixed(ENV_PREFIX).split("__"));
+        figment = figment.merge(env_layer());
         if std::env::vars().any(|(name, _)| name.starts_with(ENV_PREFIX)) {
             sources.environment = true;
         }

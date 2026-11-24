@@ -321,7 +321,8 @@ pub fn parseHeader(
             ));
         }
     }
-    assert(tensors.items.len + @intFromBool(has_metadata) == document.object.count());
+    const accounted = tensors.items.len + @intFromBool(has_metadata);
+    assert(accounted == document.object.count());
     if (tensors.items.len == 0) {
         return error.empty_header;
     } else {
@@ -373,7 +374,10 @@ fn parseTensor(
     assert(file_index < std.math.maxInt(u32));
 
     if (value != .object) {
-        std.debug.print("safetensors: {s}: tensor entry is not an object\n", .{name});
+        std.debug.print(
+            "safetensors: {s}: tensor entry is not an object\n",
+            .{name},
+        );
         return error.malformed_header;
     } else {
         assert(value == .object);
@@ -465,7 +469,10 @@ fn parseDims(name: []const u8, shape_field: std.json.Value) !Dims {
 const Range = struct { start: u64, end: u64 };
 
 /// Reads `data_offsets`, which must be two ascending non-negative integers.
-fn parseOffsets(shape_field: std.json.Value, offsets_field: std.json.Value) !Range {
+fn parseOffsets(
+    shape_field: std.json.Value,
+    offsets_field: std.json.Value,
+) !Range {
     assert(offsets_field != .null);
     assert(shape_field != .null);
 
@@ -540,12 +547,15 @@ fn validatePlacement(
     for (order) |index| {
         const tensor = tensors[index];
         if (tensor.file_offset != cursor) {
-            std.debug.print("safetensors: {s}: {s} starts at {d}, expected {d}\n", .{
-                file.path,
-                tensor.name,
-                tensor.file_offset,
-                cursor,
-            });
+            std.debug.print(
+                "safetensors: {s}: {s} starts at {d}, expected {d}\n",
+                .{
+                    file.path,
+                    tensor.name,
+                    tensor.file_offset,
+                    cursor,
+                },
+            );
             return error.overlapping_offsets;
         } else {
             assert(tensor.file_offset == cursor);
@@ -595,7 +605,12 @@ fn composeImage(
 
     const total = length_prefix_bytes + header_text.len + payload_bytes;
     const image = try allocator.alloc(u8, @intCast(total));
-    std.mem.writeInt(u64, image[0..length_prefix_bytes], header_text.len, .little);
+    std.mem.writeInt(
+        u64,
+        image[0..length_prefix_bytes],
+        header_text.len,
+        .little,
+    );
     @memcpy(image[length_prefix_bytes..][0..header_text.len], header_text);
     @memset(image[@intCast(length_prefix_bytes + header_text.len)..][0..], 0);
     assert(image.len == total);
@@ -650,7 +665,8 @@ fn composeFile(
     var cursor = data_start;
     for (specs, 0..) |spec, index| {
         for (0..@intCast(spec.byte_len)) |position| {
-            image[@intCast(cursor + position)] = payloadByte(@intCast(index), position);
+            const byte = payloadByte(@intCast(index), position);
+            image[@intCast(cursor + position)] = byte;
         }
         cursor += spec.byte_len;
     }
@@ -664,7 +680,12 @@ test "a two tensor file maps both tensors" {
     const allocator = arena.allocator();
 
     const specs = [_]TestSpec{
-        .{ .name = "weight", .dtype = "BF16", .shape = &.{ 2, 3 }, .byte_len = 12 },
+        .{
+            .name = "weight",
+            .dtype = "BF16",
+            .shape = &.{ 2, 3 },
+            .byte_len = 12,
+        },
         .{ .name = "scale_2", .dtype = "F32", .shape = &.{}, .byte_len = 4 },
     };
     const image = try composeFile(allocator, specs[0..], "");
@@ -688,8 +709,14 @@ test "a two tensor file maps both tensors" {
         image[@intCast(header.tensors[0].file_offset)..][0..12],
         file.tensorBytes(&header.tensors[0]),
     );
-    try std.testing.expectEqual(@as(u8, 0x40), file.tensorBytes(&header.tensors[0])[0]);
-    try std.testing.expectEqual(@as(u8, 0x47), file.tensorBytes(&header.tensors[1])[0]);
+    try std.testing.expectEqual(
+        @as(u8, 0x40),
+        file.tensorBytes(&header.tensors[0])[0],
+    );
+    try std.testing.expectEqual(
+        @as(u8, 0x47),
+        file.tensorBytes(&header.tensors[1])[0],
+    );
 }
 
 test "a metadata object is not a tensor" {
@@ -721,7 +748,10 @@ test "an unsupported dtype is a hard error" {
     var file = try File.initFromBytes("synthetic.safetensors", image);
     defer file.close();
 
-    try std.testing.expectError(error.unsupported_dtype, parseHeader(allocator, &file, 0));
+    try std.testing.expectError(
+        error.unsupported_dtype,
+        parseHeader(allocator, &file, 0),
+    );
 }
 
 test "a shape that contradicts the byte length is rejected" {
@@ -730,7 +760,12 @@ test "a shape that contradicts the byte length is rejected" {
     const allocator = arena.allocator();
 
     const specs = [_]TestSpec{
-        .{ .name = "weight", .dtype = "BF16", .shape = &.{ 2, 3 }, .byte_len = 11 },
+        .{
+            .name = "weight",
+            .dtype = "BF16",
+            .shape = &.{ 2, 3 },
+            .byte_len = 11,
+        },
     };
     const image = try composeFile(allocator, specs[0..], "");
     var file = try File.initFromBytes("synthetic.safetensors", image);
@@ -771,7 +806,8 @@ test "a shard that is still downloading keeps a complete header" {
     };
     const image = try composeFile(allocator, specs[0..], "");
     // The last four bytes of `b` have not arrived yet.
-    var file = try File.initFromBytes("partial.safetensors", image[0 .. image.len - 4]);
+    const partial = image[0 .. image.len - 4];
+    var file = try File.initFromBytes("partial.safetensors", partial);
     defer file.close();
     const header = try parseHeader(allocator, &file, 0);
 
@@ -796,7 +832,10 @@ test "trailing bytes after the last tensor are rejected" {
     var file = try File.initFromBytes("long.safetensors", longer);
     defer file.close();
 
-    try std.testing.expectError(error.trailing_bytes, parseHeader(allocator, &file, 0));
+    try std.testing.expectError(
+        error.trailing_bytes,
+        parseHeader(allocator, &file, 0),
+    );
 }
 
 test "a header length past the end of the file is rejected" {
@@ -808,7 +847,10 @@ test "a header length past the end of the file is rejected" {
     std.mem.writeInt(u64, image[0..8], 4096, .little);
     @memset(image[8..], 0);
 
-    try std.testing.expectError(error.truncated_header, File.initFromBytes("short", image));
+    try std.testing.expectError(
+        error.truncated_header,
+        File.initFromBytes("short", image),
+    );
 }
 
 test "a rank six shape is rejected" {
@@ -826,5 +868,8 @@ test "a rank six shape is rejected" {
     var file = try File.initFromBytes("synthetic.safetensors", image);
     defer file.close();
 
-    try std.testing.expectError(error.rank_too_deep, parseHeader(allocator, &file, 0));
+    try std.testing.expectError(
+        error.rank_too_deep,
+        parseHeader(allocator, &file, 0),
+    );
 }

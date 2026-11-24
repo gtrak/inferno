@@ -156,6 +156,8 @@ fn render_document(
     try render_f64_array(report.h2d_achieved_percent[0..count], writer);
     try writer.writeAll(",\n  \"vram_leak_bytes\":");
     try render_u64_array(report.vram_leak_bytes[0..count], writer);
+    try writer.writeAll(",\n  \"stability_percent_max\":");
+    try write_optional_percent(report.stability_percent_max, writer);
     try writer.writeAll(",\n  \"basis\":{");
     try render_basis(writer);
     // Closes the basis object, then the document.
@@ -199,7 +201,25 @@ fn render_basis(writer: anytype) !void {
         "PCIe generation x width, raw rate from the kernel's link state",
         writer,
     );
+    try writer.writeAll(",\n    \"stability_percent_max\":");
+    try write_json_string(
+        "worst spread across probe passes, percent of the largest pass; " ++
+            "null until at least two passes ran",
+        writer,
+    );
     try writer.writeAll("\n  ");
+}
+
+/// A percentage, or `null`. Zero would read as a perfectly stable machine,
+/// which is a claim no single pass entitles the document to make.
+fn write_optional_percent(value: ?f64, writer: anytype) !void {
+    if (value) |percent| {
+        assert(percent >= 0);
+        assert(std.math.isFinite(percent));
+        try writer.print("{d:.3}", .{percent});
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn render_devices(report: *const bench.Report, writer: anytype) !void {
@@ -543,5 +563,55 @@ test "render produces valid JSON with the documented schema" {
     try std.testing.expectEqual(
         @as(usize, 1),
         root.get("vram_leak_bytes").?.array.items.len,
+    );
+}
+
+test "stability_percent_max is null until it is measured" {
+    var report = test_report();
+    report.stability_percent_max = null;
+
+    var buffer: [document_bytes_max]u8 = undefined;
+    const length = try render(&report, "2026-11-24T04:00:00Z", buffer[0..]);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        buffer[0..length],
+        .{},
+    );
+    defer parsed.deinit();
+
+    // Present, and explicitly "not measured": a missing key and a zero would
+    // both be misread, one as a schema break and one as a stable machine.
+    const value = parsed.value.object.get("stability_percent_max").?;
+    const unmeasured: bool = switch (value) {
+        .null => true,
+        else => false,
+    };
+    try std.testing.expect(unmeasured);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        buffer[0..length],
+        "\"stability_percent_max\":null",
+    ) != null);
+}
+
+test "a measured stability renders as a number" {
+    var report = test_report();
+    report.stability_percent_max = 0.75;
+
+    var buffer: [document_bytes_max]u8 = undefined;
+    const length = try render(&report, "2026-11-24T04:00:00Z", buffer[0..]);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        buffer[0..length],
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.75),
+        parsed.value.object.get("stability_percent_max").?.float,
+        1e-9,
     );
 }

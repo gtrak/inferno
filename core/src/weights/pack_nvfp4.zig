@@ -1,11 +1,11 @@
 //! Repacking the checkpoint's NVFP4 weights into tensor-core fragment order.
 //!
-//! The checkpoint stores a matrix as `[N, K/2]` packed nibbles (low nibble first,
-//! i.e. ModelOpt's order along the contracted dimension) plus one E4M3 scale per
-//! 16 weights as `[N, K/16]`. The block-scaled MMA on sm_120a wants something
-//! else entirely: every lane holds two 32-bit words of 16 nibbles and one 32-bit
-//! word of four scales, and the mapping from (lane, word) to (n, k) is fixed by
-//! `SFBLayout` in `.agents/design/mma-sm120-nvfp4.md`.
+//! The checkpoint stores a matrix as `[N, K/2]` packed nibbles (low nibble
+//! first, i.e. ModelOpt's order along the contracted dimension) plus one E4M3
+//! scale per 16 weights as `[N, K/16]`. The block-scaled MMA on sm_120a wants
+//! something else entirely: every lane holds two 32-bit words of 16 nibbles
+//! and one 32-bit word of four scales, and the mapping from (lane, word) to
+//! (n, k) is fixed by `SFBLayout` in `.agents/design/mma-sm120-nvfp4.md`.
 //!
 //! Repacking here, once at load, is what lets the hot loop in `gemm.cu` be pure
 //! `ld.shared` + `OMMA.SF`: no shuffles and no nibble surgery per k step. The
@@ -134,7 +134,17 @@ pub fn packWeights(
     for (0..k_tiles) |k_tile_index| {
         for (0..n_tiles) |n_tile_index| {
             const tile: usize = @intCast(k_tile_index * n_tiles + n_tile_index);
-            packWeightTile(packed_weights, scales, k, n, tile, n_tile_index, k_tile_index, fragment, fragment_scales);
+            packWeightTile(
+                packed_weights,
+                scales,
+                k,
+                n,
+                tile,
+                n_tile_index,
+                k_tile_index,
+                fragment,
+                fragment_scales,
+            );
         }
     }
     assert(fragment.len == weightFragmentWords(n, k));
@@ -200,7 +210,17 @@ pub fn unpackWeights(
     for (0..k_tiles) |k_tile_index| {
         for (0..n_tiles) |n_tile_index| {
             const tile: usize = @intCast(k_tile_index * n_tiles + n_tile_index);
-            unpackWeightTile(fragment, fragment_scales, k, n, tile, n_tile_index, k_tile_index, packed_weights, scales);
+            unpackWeightTile(
+                fragment,
+                fragment_scales,
+                k,
+                n,
+                tile,
+                n_tile_index,
+                k_tile_index,
+                packed_weights,
+                scales,
+            );
         }
     }
     assert(packed_weights.len == @as(usize, n) * k / 2);
@@ -230,7 +250,8 @@ fn unpackWeightTile(
         while (word < b_words_per_lane) : (word += 1) {
             const k_start = k_tile_index * k_tile + 8 * quad + 32 * word;
             const destination = column * (k / 2) + k_start / 2;
-            writeWord(packed_weights, destination, fragment[word_base + lane * b_words_per_lane + word]);
+            const word_index = word_base + lane * b_words_per_lane + word;
+            writeWord(packed_weights, destination, fragment[word_index]);
         }
     }
 
@@ -240,7 +261,8 @@ fn unpackWeightTile(
         const column = n_tile_index * n_tile + column_local;
         const destination = column * (k / block_size) +
             k_tile_index * (k_tile / block_size);
-        writeWord(scales, destination, fragment_scales[scale_base + column_local]);
+        const scale_word = fragment_scales[scale_base + column_local];
+        writeWord(scales, destination, scale_word);
     }
     assert(scale_base + b_scale_words_per_tile <= fragment_scales.len);
 }
@@ -292,14 +314,16 @@ test "the repack round-trips every packed_weights weight and scale byte" {
     const buffers = weightBuffers(n, k);
 
     const allocator = std.testing.allocator;
-    const packed_weights = try allocator.alloc(u8, @intCast(buffers.packed_bytes));
+    const packed_weights =
+        try allocator.alloc(u8, @intCast(buffers.packed_bytes));
     defer allocator.free(packed_weights);
     const scales = try allocator.alloc(u8, @intCast(buffers.scale_bytes));
     defer allocator.free(scales);
     fillPseudorandom(packed_weights, 0x5eed);
     fillPseudorandom(scales, 0x1dea);
 
-    const fragment = try allocator.alloc(u32, @intCast(weightFragmentWords(n, k)));
+    const fragment =
+        try allocator.alloc(u32, @intCast(weightFragmentWords(n, k)));
     defer allocator.free(fragment);
     const fragment_scales =
         try allocator.alloc(u32, @intCast(weightScaleWords(n, k)));
@@ -329,7 +353,8 @@ test "the repacked weights dequantise to the same f32 values" {
     fillPseudorandom(packed_weights, 0xc0ffee);
     fillPseudorandom(scales, 0xbadf00d);
 
-    const fragment = try allocator.alloc(u32, @intCast(weightFragmentWords(n, k)));
+    const fragment =
+        try allocator.alloc(u32, @intCast(weightFragmentWords(n, k)));
     defer allocator.free(fragment);
     const fragment_scales =
         try allocator.alloc(u32, @intCast(weightScaleWords(n, k)));
@@ -347,17 +372,19 @@ test "the repacked weights dequantise to the same f32 values" {
     var original_row: [k]f32 = undefined;
     var rebuilt_row: [k]f32 = undefined;
     for (0..n) |row| {
+        const scale_start = row * (k / block_size);
         const packed_row = packed_weights[row * k / 2 ..][0 .. k / 2];
-        const scale_row = scales[row * (k / block_size) ..][0 .. k / block_size];
+        const scale_row = scales[scale_start..][0 .. k / block_size];
         quant.dequant_nvfp4_row(
             packed_row,
             @ptrCast(scale_row),
             scale2,
             original_row[0..],
         );
+        const rebuilt_scale_row = rebuilt_scales[scale_start..];
         quant.dequant_nvfp4_row(
             rebuilt[row * k / 2 ..][0 .. k / 2],
-            @ptrCast(rebuilt_scales[row * (k / block_size) ..][0 .. k / block_size]),
+            @ptrCast(rebuilt_scale_row[0 .. k / block_size]),
             scale2,
             rebuilt_row[0..],
         );

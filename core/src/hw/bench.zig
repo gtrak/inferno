@@ -139,6 +139,10 @@ pub const Report = struct {
     /// Tensor throughput of the four prefill GEMM kernels at M=N=K=4096.
     /// THEORY.md §3's prefill ceiling is stated against these.
     gemm_peak_tflops: gemm_peak.Peaks,
+    /// Worst run-to-run spread over every measured number, as a percentage, or
+    /// null while the probe has not been run enough times to know it. An
+    /// unmeasured stability is never written as a stable machine.
+    stability_percent_max: ?f64 = null,
 };
 
 /// The probe's live state: measured data plus the contexts it must release.
@@ -251,6 +255,7 @@ pub const Probe = struct {
         }
         probe.report.device_count = device_count;
         probe.report.p2p_failure_count = 0;
+        probe.report.stability_percent_max = null;
         for (0..device_count) |index| {
             probe.report.devices[index] = devices[index];
         }

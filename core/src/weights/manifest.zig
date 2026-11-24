@@ -7,12 +7,14 @@
 //! matches no role is a hard error: silently ignoring a weight is how a model
 //! loads with a zeroed gate.
 //!
-//! Nothing here copies weight bytes. A `TensorRef` is `{file_index, file_offset,
+//! Nothing here copies weight bytes. A `TensorRef` is `{file_index,
+//! file_offset,
 //! byte_len, dtype, dims}`, so the whole 132 GB checkpoint is described by
 //! about 12 MB of typed references.
 //!
 //! The real test is reconciliation: the sum of every role's bytes must equal
-//! `metadata.total_size` from the checkpoint's own `model.safetensors.index.json`,
+//! `metadata.total_size` from the checkpoint's own
+//! `model.safetensors.index.json`,
 //! and every file's header must account for its size exactly. A misread layout
 //! (say, scales counted as F32) breaks the total, and a tensor that reached the
 //! wrong role breaks a derived per-role count.
@@ -270,7 +272,8 @@ pub const Manifest = struct {
     files: []FileReport = &.{},
     deferred_tensors: u64 = 0,
     deferred_bytes: u64 = 0,
-    /// `metadata.total_size` of `model.safetensors.index.json`: the checkpoint's
+    /// `metadata.total_size` of `model.safetensors.index.json`: the
+    /// checkpoint's
     /// own statement of how many weight bytes there are. The manifest must
     /// reconcile against it exactly, which is the strongest available check
     /// that every tensor was classified once and its dtype read correctly.
@@ -286,7 +289,10 @@ pub const Manifest = struct {
         assert(self.totals.len == all_roles.len);
 
         var attention: RoleTotal = .{};
-        for ([_]Role{ .q_proj, .k_proj, .v_proj, .o_proj, .attn_norm, .indexer }) |role| {
+        const attention_roles = [_]Role{
+            .q_proj, .k_proj, .v_proj, .o_proj, .attn_norm, .indexer,
+        };
+        for (attention_roles) |role| {
             attention.count += self.totals[@intFromEnum(role)].count;
             attention.bytes += self.totals[@intFromEnum(role)].bytes;
         }
@@ -327,7 +333,9 @@ pub const Loaded = struct {
         assert(ref.file_index < self.files.len);
 
         const file = &self.files[ref.file_index];
-        const bytes = file.bytes[@intCast(ref.file_offset)..][0..@intCast(ref.byte_len)];
+        const offset: usize = @intCast(ref.file_offset);
+        const length: usize = @intCast(ref.byte_len);
+        const bytes = file.bytes[offset..][0..length];
         assert(bytes.len == ref.byte_len);
         return bytes;
     }
@@ -355,8 +363,15 @@ fn readIndexTotalSize(
     assert(model_directory.len > 0);
     assert(index_bytes_max > 0);
 
-    const path = try std.fs.path.join(allocator, &.{ model_directory, index_file_name });
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, index_bytes_max);
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ model_directory, index_file_name },
+    );
+    const bytes = try std.fs.cwd().readFileAlloc(
+        allocator,
+        path,
+        index_bytes_max,
+    );
     // `weight_map` is 300k entries of data we deliberately re-derive from the
     // headers, so it is skipped rather than parsed.
     const parsed = std.json.parseFromSliceLeaky(
@@ -380,7 +395,10 @@ fn readIndexTotalSize(
 }
 
 /// Reads `config.json`, maps every weight file, and types the whole checkpoint.
-pub fn build(allocator: std.mem.Allocator, model_directory: []const u8) !Loaded {
+pub fn build(
+    allocator: std.mem.Allocator,
+    model_directory: []const u8,
+) !Loaded {
     assert(model_directory.len > 0);
     assert(weights_extension.len > 0);
 
@@ -413,9 +431,11 @@ pub fn build(allocator: std.mem.Allocator, model_directory: []const u8) !Loaded 
             if (classified.layer) |layer_index| {
                 layer_counts[layer_index] += 1;
             } else {
-                assert(classified.role == .embed_tokens or classified.role == .lm_head or
+                const unlayered = classified.role == .embed_tokens or
+                    classified.role == .lm_head or
                     classified.role == .hyper_connection_mixer or
-                    classified.role == .deferred);
+                    classified.role == .deferred;
+                assert(unlayered);
             }
         }
         try checkFileTotals(reports[file_index], file, header);
@@ -443,11 +463,17 @@ pub fn unload(loaded: *Loaded) void {
 }
 
 /// Loads `config.json` and validates the text section.
-fn readTextModel(allocator: std.mem.Allocator, model_directory: []const u8) !config.TextModel {
+fn readTextModel(
+    allocator: std.mem.Allocator,
+    model_directory: []const u8,
+) !config.TextModel {
     assert(model_directory.len > 0);
     assert(model_directory.len > 1);
 
-    const path = try std.fs.path.join(allocator, &.{ model_directory, "config.json" });
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ model_directory, "config.json" },
+    );
     const file_config = try config.load(allocator, path);
     const text = try config.TextModel.init(file_config.text_config);
     assert(text.config.num_hidden_layers > 0);
@@ -462,7 +488,10 @@ fn listWeightsFiles(
     assert(model_directory.len > 0);
     assert(partial_extension.len > weights_extension.len);
 
-    var directory = try std.fs.cwd().openDir(model_directory, .{ .iterate = true });
+    var directory = try std.fs.cwd().openDir(
+        model_directory,
+        .{ .iterate = true },
+    );
     defer directory.close();
 
     var names = std.ArrayList([]const u8).init(allocator);
@@ -515,7 +544,10 @@ fn mapFiles(
     assert(names.len == headers.len);
 
     for (names, 0..) |name, file_index| {
-        const path = try std.fs.path.join(allocator, &.{ model_directory, name });
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ model_directory, name },
+        );
         files[file_index] = try safetensors.File.open(path);
         headers[file_index] = try safetensors.parseHeader(
             allocator,
@@ -550,7 +582,10 @@ fn initLayers(allocator: std.mem.Allocator, manifest: *Manifest) !void {
         layer.* = .{
             .index = @intCast(index),
             .kind = manifest.text.layerType(@intCast(index)),
-            .experts = try allocator.alloc(Expert, manifest.text.config.num_experts),
+            .experts = try allocator.alloc(
+                Expert,
+                manifest.text.config.num_experts,
+            ),
         };
         for (layer.experts) |*expert| {
             expert.* = .{};
@@ -570,7 +605,11 @@ fn initLayers(allocator: std.mem.Allocator, manifest: *Manifest) !void {
 }
 
 /// Attributes one tensor to a role and to the byte total of that role.
-fn record(manifest: *Manifest, classified: Classified, tensor: *const safetensors.Tensor) void {
+fn record(
+    manifest: *Manifest,
+    classified: Classified,
+    tensor: *const safetensors.Tensor,
+) void {
     assert(tensor.byte_len > 0);
     assert(@intFromEnum(classified.role) < manifest.totals.len);
 
@@ -593,7 +632,8 @@ fn checkFileTotals(
     assert(report.tensor_bytes > 0);
 
     if (report.data_present) {
-        const expected = safetensors.length_prefix_bytes + file.header_len + report.tensor_bytes;
+        const expected = safetensors.length_prefix_bytes + file.header_len +
+            report.tensor_bytes;
         if (expected != file.bytes.len) {
             std.debug.print("manifest: {s}: header says {d}, file is {d}\n", .{
                 report.name,
@@ -664,7 +704,10 @@ fn place(
 }
 
 /// Classifies one top-level tensor name.
-fn classify(manifest: *Manifest, tensor: *const safetensors.Tensor) !Classified {
+fn classify(
+    manifest: *Manifest,
+    tensor: *const safetensors.Tensor,
+) !Classified {
     assert(tensor.name.len > 0);
     assert(manifest.layers.len > 0);
 
@@ -727,7 +770,13 @@ fn fillFinalMixer(
     const hidden = model.config.hidden_size;
     const lowrank = model.config.hc_lowrank;
     if (std.mem.eql(u8, tail, "hc_norm.weight")) {
-        try place(&mixer.norm, tensor, .hyper_connection_mixer, .bf16, .{model.hc_hidden_size});
+        try place(
+            &mixer.norm,
+            tensor,
+            .hyper_connection_mixer,
+            .bf16,
+            .{model.hc_hidden_size},
+        );
     } else if (std.mem.eql(u8, tail, "input_mix_weight_down.weight")) {
         try place(&mixer.mix_down, tensor, .hyper_connection_mixer, .bf16, .{
             lowrank,
@@ -739,14 +788,20 @@ fn fillFinalMixer(
             lowrank,
         });
     } else {
-        std.debug.print("manifest: unexpected final mixer tensor {s}\n", .{tail});
+        std.debug.print(
+            "manifest: unexpected final mixer tensor {s}\n",
+            .{tail},
+        );
         return error.unknown_tensor;
     }
     assert(model.hc_hidden_size == model.config.hc_count * hidden);
 }
 
 /// A layer tensor: dispatch on the module that owns it.
-fn classifyLayer(manifest: *Manifest, tensor: *const safetensors.Tensor) !Classified {
+fn classifyLayer(
+    manifest: *Manifest,
+    tensor: *const safetensors.Tensor,
+) !Classified {
     assert(std.mem.startsWith(u8, tensor.name, layers_prefix));
     assert(manifest.layers.len == manifest.text.config.num_hidden_layers);
 
@@ -766,9 +821,19 @@ fn classifyLayer(manifest: *Manifest, tensor: *const safetensors.Tensor) !Classi
 
     var role: Role = .deferred;
     if (std.mem.startsWith(u8, tail, linear_attn_prefix)) {
-        role = try fillLinearAttention(layer, tensor, tail[linear_attn_prefix.len..], model);
+        role = try fillLinearAttention(
+            layer,
+            tensor,
+            tail[linear_attn_prefix.len..],
+            model,
+        );
     } else if (std.mem.startsWith(u8, tail, self_attn_prefix)) {
-        role = try fillSelfAttention(layer, tensor, tail[self_attn_prefix.len..], model);
+        role = try fillSelfAttention(
+            layer,
+            tensor,
+            tail[self_attn_prefix.len..],
+            model,
+        );
     } else if (std.mem.startsWith(u8, tail, attn_hc_prefix)) {
         role = try fillHyperConnection(
             &layer.attn_hyper_connection,
@@ -790,7 +855,12 @@ fn classifyLayer(manifest: *Manifest, tensor: *const safetensors.Tensor) !Classi
     } else if (std.mem.startsWith(u8, tail, ple_prefix)) {
         role = try fillPle(layer, tensor, tail[ple_prefix.len..], model);
     } else if (std.mem.startsWith(u8, tail, shared_expert_prefix)) {
-        role = try fillSharedExpert(layer, tensor, tail[shared_expert_prefix.len..], model);
+        role = try fillSharedExpert(
+            layer,
+            tensor,
+            tail[shared_expert_prefix.len..],
+            model,
+        );
     } else if (std.mem.eql(u8, tail, router_gate_tail)) {
         try place(&layer.router_gate, tensor, .router_gate, .bf16, .{
             model.config.num_experts,
@@ -798,13 +868,19 @@ fn classifyLayer(manifest: *Manifest, tensor: *const safetensors.Tensor) !Classi
         });
         role = .router_gate;
     } else if (std.mem.eql(u8, tail, shared_expert_gate_tail)) {
-        try place(&layer.shared_expert_gate, tensor, .shared_expert_gate, .bf16, .{
-            1,
-            model.config.hidden_size,
-        });
+        try place(
+            &layer.shared_expert_gate,
+            tensor,
+            .shared_expert_gate,
+            .bf16,
+            .{ 1, model.config.hidden_size },
+        );
         role = .shared_expert_gate;
     } else {
-        std.debug.print("manifest: unrecognised layer tensor {s}\n", .{tensor.name});
+        std.debug.print(
+            "manifest: unrecognised layer tensor {s}\n",
+            .{tensor.name},
+        );
         return error.unknown_tensor;
     }
     assert(role != .deferred);
@@ -880,9 +956,17 @@ fn fillLinearAttention(
             hidden,
         });
     } else if (std.mem.eql(u8, tail, "in_proj_a.weight")) {
-        try place(&attention.in_proj_a, tensor, .linear_attn, .bf16, .{ value_heads, hidden });
+        try place(&attention.in_proj_a, tensor, .linear_attn, .bf16, .{
+            value_heads, hidden,
+        });
     } else if (std.mem.eql(u8, tail, "in_proj_b.weight")) {
-        try place(&attention.in_proj_b, tensor, .linear_attn, .bf16, .{ value_heads, hidden });
+        try place(
+            &attention.in_proj_b,
+            tensor,
+            .linear_attn,
+            .bf16,
+            .{ value_heads, hidden },
+        );
     } else if (std.mem.eql(u8, tail, "out_proj.weight")) {
         try place(&attention.out_proj, tensor, .linear_attn, .bf16, .{
             hidden,
@@ -895,13 +979,28 @@ fn fillLinearAttention(
             model.config.linear_conv_kernel_dim,
         });
     } else if (std.mem.eql(u8, tail, "A_log")) {
-        try place(&attention.a_log, tensor, .linear_attn, .bf16, .{value_heads});
+        try place(
+            &attention.a_log,
+            tensor,
+            .linear_attn,
+            .bf16,
+            .{value_heads},
+        );
     } else if (std.mem.eql(u8, tail, "dt_bias")) {
-        try place(&attention.dt_bias, tensor, .linear_attn, .bf16, .{value_heads});
+        try place(
+            &attention.dt_bias,
+            tensor,
+            .linear_attn,
+            .bf16,
+            .{value_heads},
+        );
     } else if (std.mem.eql(u8, tail, "norm.weight")) {
         try place(&attention.norm, tensor, .linear_attn, .bf16, .{head_dim});
     } else {
-        std.debug.print("manifest: unexpected linear_attn tensor {s}\n", .{tail});
+        std.debug.print(
+            "manifest: unexpected linear_attn tensor {s}\n",
+            .{tail},
+        );
         return error.unknown_tensor;
     }
     assert(layer.kind == .linear_attention or layer.kind == .full_attention);
@@ -924,16 +1023,40 @@ fn fillSelfAttention(
     const indexer_dim = model.config.indexer_head_dim;
     if (std.mem.eql(u8, tail, "q_proj.weight")) {
         // A query block and an output gate per head, interleaved.
-        try place(&attention.q_proj, tensor, .q_proj, .bf16, .{ model.q_proj_rows, hidden });
+        try place(
+            &attention.q_proj,
+            tensor,
+            .q_proj,
+            .bf16,
+            .{ model.q_proj_rows, hidden },
+        );
         return .q_proj;
     } else if (std.mem.eql(u8, tail, "k_proj.weight")) {
-        try place(&attention.k_proj, tensor, .k_proj, .bf16, .{ model.kv_proj_rows, hidden });
+        try place(
+            &attention.k_proj,
+            tensor,
+            .k_proj,
+            .bf16,
+            .{ model.kv_proj_rows, hidden },
+        );
         return .k_proj;
     } else if (std.mem.eql(u8, tail, "v_proj.weight")) {
-        try place(&attention.v_proj, tensor, .v_proj, .bf16, .{ model.kv_proj_rows, hidden });
+        try place(
+            &attention.v_proj,
+            tensor,
+            .v_proj,
+            .bf16,
+            .{ model.kv_proj_rows, hidden },
+        );
         return .v_proj;
     } else if (std.mem.eql(u8, tail, "o_proj.weight")) {
-        try place(&attention.o_proj, tensor, .o_proj, .bf16, .{ hidden, model.o_proj_cols });
+        try place(
+            &attention.o_proj,
+            tensor,
+            .o_proj,
+            .bf16,
+            .{ hidden, model.o_proj_cols },
+        );
         return .o_proj;
     } else if (std.mem.eql(u8, tail, "q_norm.weight")) {
         try place(&attention.q_norm, tensor, .attn_norm, .bf16, .{head_dim});
@@ -948,10 +1071,22 @@ fn fillSelfAttention(
         });
         return .indexer;
     } else if (std.mem.eql(u8, tail, "indexer.q_layernorm.weight")) {
-        try place(&attention.indexer_q_norm, tensor, .indexer, .bf16, .{indexer_dim});
+        try place(
+            &attention.indexer_q_norm,
+            tensor,
+            .indexer,
+            .bf16,
+            .{indexer_dim},
+        );
         return .indexer;
     } else if (std.mem.eql(u8, tail, "indexer.k_layernorm.weight")) {
-        try place(&attention.indexer_k_norm, tensor, .indexer, .bf16, .{indexer_dim});
+        try place(
+            &attention.indexer_k_norm,
+            tensor,
+            .indexer,
+            .bf16,
+            .{indexer_dim},
+        );
         return .indexer;
     } else {
         std.debug.print("manifest: unexpected self_attn tensor {s}\n", .{tail});
@@ -984,7 +1119,10 @@ fn fillHyperConnection(
     } else if (std.mem.eql(u8, tail, "input_mix_weight_up.weight")) {
         try place(&target.mix_up, tensor, role, .bf16, .{ width, lowrank });
     } else {
-        std.debug.print("manifest: unexpected hyper connection tensor {s}\n", .{tail});
+        std.debug.print(
+            "manifest: unexpected hyper connection tensor {s}\n",
+            .{tail},
+        );
         return error.unknown_tensor;
     }
     assert(role == .attn_hyper_connection or role == .mlp_hyper_connection);
@@ -1005,13 +1143,34 @@ fn fillSharedExpert(
     const hidden = model.config.hidden_size;
     const intermediate = model.config.shared_expert_intermediate_size;
     if (std.mem.eql(u8, tail, "gate_proj.weight")) {
-        try place(&shared.gate_proj, tensor, .shared_expert, .bf16, .{ intermediate, hidden });
+        try place(
+            &shared.gate_proj,
+            tensor,
+            .shared_expert,
+            .bf16,
+            .{ intermediate, hidden },
+        );
     } else if (std.mem.eql(u8, tail, "up_proj.weight")) {
-        try place(&shared.up_proj, tensor, .shared_expert, .bf16, .{ intermediate, hidden });
+        try place(
+            &shared.up_proj,
+            tensor,
+            .shared_expert,
+            .bf16,
+            .{ intermediate, hidden },
+        );
     } else if (std.mem.eql(u8, tail, "down_proj.weight")) {
-        try place(&shared.down_proj, tensor, .shared_expert, .bf16, .{ hidden, intermediate });
+        try place(
+            &shared.down_proj,
+            tensor,
+            .shared_expert,
+            .bf16,
+            .{ hidden, intermediate },
+        );
     } else {
-        std.debug.print("manifest: unexpected shared expert tensor {s}\n", .{tail});
+        std.debug.print(
+            "manifest: unexpected shared expert tensor {s}\n",
+            .{tail},
+        );
         return error.unknown_tensor;
     }
     assert(intermediate == model.config.shared_expert_intermediate_size);
@@ -1020,7 +1179,8 @@ fn fillSharedExpert(
 
 /// One routed expert's NVFP4 projection: packed pairs plus three scales.
 ///
-/// Every expert tensor is `{proj}.{field}`; the three projections differ only in
+/// Every expert tensor is `{proj}.{field}`; the three projections differ only
+/// in
 /// which extent is contracted, so the field handling is shared.
 fn fillExpert(
     layer: *Layer,
@@ -1085,7 +1245,13 @@ fn placeExpertField(
     const packed_columns = contracted / 2;
     const scale_columns = contracted / quant.nvfp4_block_size;
     if (std.mem.eql(u8, field, "weight")) {
-        try place(&projection.weight, tensor, .expert, .u8, .{ rows, packed_columns });
+        try place(
+            &projection.weight,
+            tensor,
+            .expert,
+            .u8,
+            .{ rows, packed_columns },
+        );
     } else if (std.mem.eql(u8, field, "weight_scale")) {
         try place(
             &projection.weight_scale,
@@ -1116,7 +1282,10 @@ fn fillPle(
     assert(model.ngram_heads > 0);
 
     const ple = if (layer.ple) |*payload| payload else {
-        std.debug.print("manifest: {s} is not on a PLE layer\n", .{tensor.name});
+        std.debug.print(
+            "manifest: {s} is not on a PLE layer\n",
+            .{tensor.name},
+        );
         return error.unknown_tensor;
     };
     const width = model.hc_hidden_size;
@@ -1124,7 +1293,13 @@ fn fillPle(
     const heads = model.ngram_heads;
     var role: Role = .ple_projection;
     if (std.mem.eql(u8, tail, "key_proj.weight")) {
-        try place(&ple.key_proj, tensor, .ple_projection, .bf16, .{ width, embed_dim });
+        try place(
+            &ple.key_proj,
+            tensor,
+            .ple_projection,
+            .bf16,
+            .{ width, embed_dim },
+        );
     } else if (std.mem.eql(u8, tail, "value_proj.weight")) {
         try place(&ple.value_proj, tensor, .ple_projection, .bf16, .{
             model.config.hidden_size,
@@ -1152,12 +1327,21 @@ fn fillPle(
             model.config.ngram_size,
         });
         role = .ngram_index;
-    } else if (std.mem.eql(u8, tail, "ple_embedding.ngram_embedding.weight_scale")) {
+    } else if (std.mem.eql(
+        u8,
+        tail,
+        "ple_embedding.ngram_embedding.weight_scale",
+    )) {
         // One BF16 scale for the whole table.
         try place(&ple.embedding_scale, tensor, .ngram_scale, .bf16, .{1});
         role = .ngram_scale;
     } else if (std.mem.startsWith(u8, tail, shard_prefix)) {
-        role = try placeNgramShard(ple, tensor, tail[shard_prefix.len..], model);
+        role = try placeNgramShard(
+            ple,
+            tensor,
+            tail[shard_prefix.len..],
+            model,
+        );
     } else {
         std.debug.print("manifest: unexpected PLE tensor {s}\n", .{tail});
         return error.unknown_tensor;
@@ -1247,7 +1431,8 @@ fn readI64(allocator: std.mem.Allocator, bytes: []const u8) ![]i64 {
 /// The head sizes are primes, so the concatenated table is padded up to a
 /// multiple of `make_ngram_vocab_size_divisible_by` and then split into
 /// `split_ngram_parts` equal row ranges. That is how the reference builds it,
-/// and the padding is why the shard row count is not a round number of millions.
+/// and the padding is why the shard row count is not a round number of
+/// millions.
 /// Sum of the per-head vocabularies, with the offset buffer cross-checked
 /// against them: the table is one array of rows, so offsets must be prefixes.
 fn ngramTableRowCount(
@@ -1260,8 +1445,14 @@ fn ngramTableRowCount(
     assert(loaded.files.len > 0);
 
     const head_count: usize = @intCast(model.ngram_heads);
-    const sizes = try readI64(allocator, loaded.tensorBytes(ple.heads_vocab_sizes));
-    const offsets = try readI64(allocator, loaded.tensorBytes(ple.heads_offsets));
+    const sizes = try readI64(
+        allocator,
+        loaded.tensorBytes(ple.heads_vocab_sizes),
+    );
+    const offsets = try readI64(
+        allocator,
+        loaded.tensorBytes(ple.heads_offsets),
+    );
     if (sizes.len != head_count) {
         return error.wrong_shape;
     } else {
@@ -1301,7 +1492,8 @@ fn validateNgramTable(allocator: std.mem.Allocator, loaded: *Loaded) !void {
 
     const manifest = &loaded.manifest;
     const model = &manifest.text;
-    const ple = if (manifest.layers[model.ple_layer_index].ple) |*payload| payload else {
+    const ple_layer = &manifest.layers[model.ple_layer_index];
+    const ple = if (ple_layer.ple) |*payload| payload else {
         return error.unknown_tensor;
     };
     if (ple.heads_vocab_sizes.isEmpty()) {
@@ -1403,11 +1595,10 @@ fn validateCompleteness(
         const has_ple = index == model.ple_layer_index;
         const layer_expected = expectedLayerTensorCount(model, has_ple);
         if (count != layer_expected) {
-            std.debug.print("manifest: layer {d} has {d} tensors, expected {d}\n", .{
-                index,
-                count,
-                layer_expected,
-            });
+            std.debug.print(
+                "manifest: layer {d} has {d} tensors, expected {d}\n",
+                .{ index, count, layer_expected },
+            );
             return error.incomplete_layer;
         } else {
             assert(count == layer_expected);
@@ -1416,11 +1607,10 @@ fn validateCompleteness(
         expected += layer_expected;
     }
     if (tensor_total != expected + manifest.deferred_tensors) {
-        std.debug.print("manifest: {d} tensors, expected {d} text + {d} deferred\n", .{
-            tensor_total,
-            expected,
-            manifest.deferred_tensors,
-        });
+        std.debug.print(
+            "manifest: {d} tensors, expected {d} text + {d} deferred\n",
+            .{ tensor_total, expected, manifest.deferred_tensors },
+        );
         return error.incomplete_model;
     } else {
         assert(tensor_total == expected + manifest.deferred_tensors);
@@ -1502,7 +1692,8 @@ fn allEmpty(comptime T: type, value: *const T) bool {
     return true;
 }
 
-/// Checks that the slots this layer's kind uses are filled and the others empty.
+/// Checks that the slots this layer's kind uses are filled and the others
+/// empty.
 fn checkLayerSlots(layer: *const Layer, model: *const config.TextModel) !void {
     assert(layer.index < model.config.num_hidden_layers);
     assert(layer.experts.len == model.config.num_experts);
@@ -1581,11 +1772,20 @@ fn writeDims(writer: anytype, manifest: *const Manifest) !void {
     const model = &manifest.text;
     const config_values = &model.config;
     try writer.print("  \"dims\": {{\n", .{});
-    try writer.print("    \"num_hidden_layers\": {d},\n", .{config_values.num_hidden_layers});
-    try writer.print("    \"hidden_size\": {d},\n", .{config_values.hidden_size});
+    try writer.print(
+        "    \"num_hidden_layers\": {d},\n",
+        .{config_values.num_hidden_layers},
+    );
+    try writer.print(
+        "    \"hidden_size\": {d},\n",
+        .{config_values.hidden_size},
+    );
     try writer.print("    \"head_dim\": {d},\n", .{config_values.head_dim});
     try writer.print("    \"vocab_size\": {d},\n", .{config_values.vocab_size});
-    try writer.print("    \"num_experts\": {d},\n", .{config_values.num_experts});
+    try writer.print(
+        "    \"num_experts\": {d},\n",
+        .{config_values.num_experts},
+    );
     try writer.print("    \"num_experts_per_tok\": {d},\n", .{
         config_values.num_experts_per_tok,
     });
@@ -1601,21 +1801,42 @@ fn writeDims(writer: anytype, manifest: *const Manifest) !void {
     try writer.print("    \"q_proj_rows\": {d},\n", .{model.q_proj_rows});
     try writer.print("    \"kv_proj_rows\": {d},\n", .{model.kv_proj_rows});
     try writer.print("    \"o_proj_cols\": {d},\n", .{model.o_proj_cols});
-    try writer.print("    \"linear_qkv_rows\": {d},\n", .{model.linear_qkv_rows});
+    try writer.print(
+        "    \"linear_qkv_rows\": {d},\n",
+        .{model.linear_qkv_rows},
+    );
     try writer.print("    \"linear_z_rows\": {d},\n", .{model.linear_z_rows});
-    try writer.print("    \"indexer_qk_rows\": {d},\n", .{model.indexer_qk_rows});
+    try writer.print(
+        "    \"indexer_qk_rows\": {d},\n",
+        .{model.indexer_qk_rows},
+    );
     try writer.print("    \"linear_attention_layers\": {d},\n", .{
         model.linear_attention_layers,
     });
     try writer.print("    \"full_attention_layers\": {d},\n", .{
         model.full_attention_layers,
     });
-    try writer.print("    \"ple_layer_index\": {d},\n", .{model.ple_layer_index});
-    try writer.print("    \"ple_embed_dim\": {d},\n", .{config_values.ple_embed_dim});
+    try writer.print(
+        "    \"ple_layer_index\": {d},\n",
+        .{model.ple_layer_index},
+    );
+    try writer.print(
+        "    \"ple_embed_dim\": {d},\n",
+        .{config_values.ple_embed_dim},
+    );
     try writer.print("    \"ngram_heads\": {d},\n", .{model.ngram_heads});
-    try writer.print("    \"ngram_embed_dim\": {d},\n", .{model.ngram_embed_dim});
-    try writer.print("    \"ngram_table_rows\": {d},\n", .{manifest.ngram_table_rows});
-    try writer.print("    \"ngram_shard_rows\": {d},\n", .{manifest.ngram_shard_rows});
+    try writer.print(
+        "    \"ngram_embed_dim\": {d},\n",
+        .{model.ngram_embed_dim},
+    );
+    try writer.print(
+        "    \"ngram_table_rows\": {d},\n",
+        .{manifest.ngram_table_rows},
+    );
+    try writer.print(
+        "    \"ngram_shard_rows\": {d},\n",
+        .{manifest.ngram_shard_rows},
+    );
     try writer.print("    \"layer_types\": [", .{});
     for (0..config_values.num_hidden_layers) |index| {
         const kind = model.layerType(@intCast(index));
@@ -1641,10 +1862,17 @@ fn layerTypeName(kind: config.LayerType) []const u8 {
     assert(model_layer_type_names.len == 2);
     assert(kind == .linear_attention or kind == .full_attention);
 
-    return if (kind == .full_attention) "indexed_attention" else "linear_attention";
+    if (kind == .full_attention) {
+        return "indexed_attention";
+    } else {
+        return "linear_attention";
+    }
 }
 
-const model_layer_type_names = [_][]const u8{ "linear_attention", "indexed_attention" };
+const model_layer_type_names = [_][]const u8{
+    "linear_attention",
+    "indexed_attention",
+};
 
 /// Writes one `{count, bytes}` object per role, in declaration order.
 fn writeRoles(writer: anytype, manifest: *const Manifest) !void {
@@ -1670,11 +1898,15 @@ fn writeRoles(writer: anytype, manifest: *const Manifest) !void {
     try writer.print(
         "    \"kv_proj_total\": {{\"count\": {d}, \"bytes\": {d}, " ++
             "\"derived\": true}},\n",
-        .{ key_and_value.count + value.count, key_and_value.bytes + value.bytes },
+        .{
+            key_and_value.count + value.count,
+            key_and_value.bytes + value.bytes,
+        },
     );
     const attention = manifest.selfAttentionTotal();
     try writer.print(
-        "    \"self_attn\": {{\"count\": {d}, \"bytes\": {d}, \"derived\": true}}\n",
+        "    \"self_attn\": {{\"count\": {d}, \"bytes\": {d}, " ++
+            "\"derived\": true}}\n",
         .{ attention.count, attention.bytes },
     );
     try writer.print("  }},\n", .{});
@@ -1689,7 +1921,8 @@ fn writeFiles(writer: anytype, loaded: *const Loaded) !void {
     try writer.print("  \"files\": [\n", .{});
     for (loaded.manifest.files, 0..) |report, index| {
         try writer.print(
-            "    {{\"name\": \"{s}\", \"tensors\": {d}, \"tensor_bytes\": {d}, " ++
+            "    {{\"name\": \"{s}\", \"tensors\": {d}, " ++
+                "\"tensor_bytes\": {d}, " ++
                 "\"header_bytes\": {d}, \"file_bytes\": {d}, " ++
                 "\"data_present\": {s}}}",
             .{
@@ -1723,13 +1956,19 @@ fn writeSummary(writer: anytype, loaded: *const Loaded) !void {
         file_bytes += report.file_bytes;
     }
     try writer.print("  \"totals\": {{\n", .{});
-    try writer.print("    \"tensor_bytes\": {d},\n", .{loaded.tensorBytesTotal()});
+    try writer.print(
+        "    \"tensor_bytes\": {d},\n",
+        .{loaded.tensorBytesTotal()},
+    );
     try writer.print("    \"header_bytes\": {d},\n", .{header_bytes});
     try writer.print("    \"file_bytes\": {d},\n", .{file_bytes});
     try writer.print("    \"deferred_tensors\": {d},\n", .{
         loaded.manifest.deferred_tensors,
     });
-    try writer.print("    \"deferred_bytes\": {d}\n", .{loaded.manifest.deferred_bytes});
+    try writer.print(
+        "    \"deferred_bytes\": {d}\n",
+        .{loaded.manifest.deferred_bytes},
+    );
     try writer.print("  }},\n", .{});
     // A shard that is still arriving holds fewer bytes than its header
     // declares, so only the header side is monotone here.

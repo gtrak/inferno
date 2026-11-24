@@ -1,4 +1,4 @@
-//! `zig build manifest` entry point: types the checkpoint and writes the report.
+//! `zig build manifest` entry point: types the checkpoint, writes the report.
 //!
 //! Reads `<model-directory>/config.json` and every `*.safetensors` file next to
 //! it, then writes `manifest.json` to the path the build step asks for. The
@@ -21,7 +21,10 @@ pub fn main() !void {
     const arguments = try std.process.argsAlloc(allocator);
     assert(arguments.len >= 1);
     if (arguments.len != 3) {
-        std.debug.print("usage: {s} <model-dir> <manifest.json>\n", .{arguments[0]});
+        std.debug.print(
+            "usage: {s} <model-dir> <manifest.json>\n",
+            .{arguments[0]},
+        );
         return error.bad_arguments;
     } else {
         assert(arguments.len == 3);
@@ -36,12 +39,12 @@ pub fn main() !void {
     const document = try manifest.renderJson(allocator, &loaded);
     try std.fs.cwd().writeFile(.{ .sub_path = output_path, .data = document });
 
-    printSummary(&loaded, document.len);
+    printSummary(&loaded, @intCast(document.len));
     assert(document.len > 0);
 }
 
 /// One block per role plus the file totals, so the build log is the evidence.
-fn printSummary(loaded: *const manifest.Loaded, document_bytes: usize) void {
+fn printSummary(loaded: *const manifest.Loaded, document_bytes: u64) void {
     assert(document_bytes > 0);
     assert(loaded.files.len > 0);
 
@@ -50,11 +53,14 @@ fn printSummary(loaded: *const manifest.Loaded, document_bytes: usize) void {
     for (compiled.files) |report| {
         tensor_count += report.tensors;
     }
-    std.debug.print("manifest: {d} files, {d} tensors, {d} bytes of weights\n", .{
-        loaded.files.len,
-        tensor_count,
-        loaded.tensorBytesTotal(),
-    });
+    std.debug.print(
+        "manifest: {d} files, {d} tensors, {d} bytes of weights\n",
+        .{
+            loaded.files.len,
+            tensor_count,
+            loaded.tensorBytesTotal(),
+        },
+    );
     assert(tensor_count > 0);
     for (manifest.all_roles) |role| {
         const total = compiled.total(role);

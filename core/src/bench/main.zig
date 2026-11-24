@@ -10,6 +10,7 @@ const std = @import("std");
 const bench = @import("hw");
 const report_json = @import("report_json.zig");
 const report_markdown = @import("report_markdown.zig");
+const stability = @import("stability.zig");
 const generated_cubins = @import("generated_cubins");
 
 const assert = std.debug.assert;
@@ -20,6 +21,14 @@ const output_relative_path = "bench/hw-probe.json";
 
 /// Levels from `core/zig-out/bin` up to the repository root.
 const repository_root_levels = "../../..";
+
+/// How many times to run the measurement sequence, read from the environment.
+///
+/// One pass cannot say anything about run-to-run spread, so the default leaves
+/// the document's `stability_percent_max` null. Filling it in takes this many
+/// passes on an otherwise idle machine.
+const repeat_variable = "INFERNO_PROBE_REPEATS";
+const repeat_default: usize = 1;
 
 pub fn main() u8 {
     assert(output_relative_path.len > output_directory.len);
@@ -34,15 +43,39 @@ pub fn main() u8 {
 fn run() !u8 {
     assert(output_directory.len > 0);
     assert(output_relative_path.len > 0);
+    assert(repeat_default <= stability.repeat_max);
+
+    const repeats = repeat_count() catch |err| {
+        std.debug.print(
+            "inferno-probe: {s} must be a pass count from 1 to {d}\n",
+            .{ repeat_variable, stability.repeat_max },
+        );
+        return err;
+    };
 
     var probe: bench.Probe = undefined;
     try probe.init();
     defer probe.deinit();
 
-    try probe.measure_all();
-    // The tensor-core peaks come from the prefill GEMM kernels themselves, so
-    // the prefill ceiling in THEORY.md §3 is measured rather than assumed.
-    try probe.measure_gemm_peaks(try gemm_cubin());
+    var spread = stability.MaxSpread.init();
+    var pass: usize = 0;
+    while (pass < repeats) : (pass += 1) {
+        try probe.measure_all();
+        // The tensor-core peaks come from the prefill GEMM kernels
+        // themselves, so the prefill ceiling in THEORY.md §3 is measured
+        // rather than assumed.
+        try probe.measure_gemm_peaks(try gemm_cubin());
+        spread.observe(&probe.report);
+        if (repeats > 1) {
+            std.debug.print(
+                "inferno-probe: pass {d}/{d}\n",
+                .{ pass + 1, repeats },
+            );
+        }
+    }
+    // Null until a second pass made a spread meaningful.
+    probe.report.stability_percent_max = spread.percent_max();
+
     try probe.verify_no_leak();
     try write_json(&probe);
     try print_tables(&probe);
@@ -54,6 +87,26 @@ fn run() !u8 {
     } else {
         print_failures(&probe);
         return 1;
+    }
+}
+
+/// `INFERNO_PROBE_REPEATS`, or a single pass when it is unset.
+fn repeat_count() !usize {
+    return parse_repeats(std.posix.getenv(repeat_variable));
+}
+
+/// The repeat count behind `repeat_variable`. A value that is present but not a
+/// usable pass count fails: measuring once while believing the number said six
+/// is worse than refusing to run.
+fn parse_repeats(text: ?[]const u8) !usize {
+    const value = text orelse return repeat_default;
+    const count = std.fmt.parseInt(usize, value, 10) catch
+        return error.invalid_repeats;
+    if (count < 1 or count > stability.repeat_max) {
+        return error.invalid_repeats;
+    } else {
+        assert(count >= 1);
+        return count;
     }
 }
 
@@ -194,6 +247,28 @@ test {
     // Referenced so `zig build test` also runs the renderers' tests.
     _ = @import("report_json.zig");
     _ = @import("report_markdown.zig");
+    _ = @import("stability.zig");
+}
+
+test "the repeat count defaults to one pass" {
+    try std.testing.expectEqual(repeat_default, try parse_repeats(null));
+}
+
+test "the repeat count is taken from the environment" {
+    try std.testing.expectEqual(@as(usize, 6), try parse_repeats("6"));
+    try std.testing.expectEqual(
+        stability.repeat_max,
+        try parse_repeats("32"),
+    );
+}
+
+test "an unusable repeat count fails" {
+    for ([_][]const u8{ "0", "33", "", "six", "-1", "6.0" }) |value| {
+        try std.testing.expectError(
+            error.invalid_repeats,
+            parse_repeats(value),
+        );
+    }
 }
 
 test "the output path lives in the output directory" {

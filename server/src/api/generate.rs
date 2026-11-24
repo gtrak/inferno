@@ -112,6 +112,9 @@ pub fn generate(
     plan: GenerationPlan,
     permit: Admitted,
 ) -> impl Stream<Item = Result<GenerationEvent, ApiError>> + Send + 'static {
+    // The instant the request was accepted, before any of the body was polled:
+    // `queue_ms` is measured from here to the engine owning the request.
+    let accepted = Instant::now();
     let span = tracing::info_span!(
         "request",
         req_id = tracing::field::Empty,
@@ -122,11 +125,14 @@ pub fn generate(
         queue_ms = tracing::field::Empty,
         finish_reason = tracing::field::Empty,
     );
-    let stream = generation_stream(Arc::clone(&state), plan, permit, span);
+    let stream = generation_stream(Arc::clone(&state), plan, permit, span, accepted);
     futures::StreamExt::boxed(stream)
 }
 
 /// The generator body.
+///
+/// `accepted` is the instant the request was accepted (taken in [`generate`]);
+/// `queue_ms` is the time from it until the engine owns the request.
 ///
 /// The span is not entered across `await` points (that would leak into whatever
 /// the task polls next); it is closed with one event carrying the recorded
@@ -136,9 +142,9 @@ fn generation_stream(
     plan: GenerationPlan,
     permit: Admitted,
     span: tracing::Span,
+    accepted: Instant,
 ) -> impl Stream<Item = Result<GenerationEvent, ApiError>> + Send + 'static {
     let body = async_stream::try_stream! {
-        let started = Instant::now();
         // Held for the whole life of the stream: a client that walks away drops the
         // stream, which frees the permit and cancels the request.
         let _permit = permit;
@@ -162,12 +168,17 @@ fn generation_stream(
 
         let submitted_at = Instant::now();
         state.metrics.enter_queue();
-        if let Err(error) = state.engine.submit(req_id, request) {
+        // Recorded after `submit` returns: a core blocks inside `submit` while it
+        // has no slot, and that block is the queue time the field names. Before,
+        // `queue_ms` measured only the code between two clock reads (~4 us) and
+        // stopped exactly where the wait began.
+        let submitted = state.engine.submit(req_id, request);
+        span.record("queue_ms", millis(accepted.elapsed()));
+        if let Err(error) = submitted {
             state.metrics.start_of_stream();
             state.metrics.engine_error();
             Err(ApiError::from_engine(error))?;
         }
-        span.record("queue_ms", millis(submitted_at.duration_since(started)));
 
         state.register_request(req_id);
         let mut cancellation = Cancellation::new(Arc::clone(&state), req_id);

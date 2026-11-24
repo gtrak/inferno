@@ -178,13 +178,20 @@ pub const TextModel = struct {
             .kv_proj_rows = config.num_key_value_heads * config.head_dim,
             .o_proj_cols = config.num_attention_heads * config.head_dim,
             .linear_qkv_rows = try linearAttentionRows(&config),
-            .linear_z_rows = config.linear_num_value_heads * config.linear_value_head_dim,
+            .linear_z_rows = config.linear_num_value_heads *
+                config.linear_value_head_dim,
             .indexer_qk_rows = try indexerRows(&config),
             .ngram_heads = try ngramHeadCount(&config),
             .ngram_embed_dim = try ngramEmbedDim(&config),
             .ple_layer_index = try pleLayerIndex(&config),
-            .full_attention_layers = try countLayerTypes(&config, .full_attention),
-            .linear_attention_layers = try countLayerTypes(&config, .linear_attention),
+            .full_attention_layers = try countLayerTypes(
+                &config,
+                .full_attention,
+            ),
+            .linear_attention_layers = try countLayerTypes(
+                &config,
+                .linear_attention,
+            ),
         };
         try validateMisc(&model);
         assert(model.full_attention_layers + model.linear_attention_layers ==
@@ -206,7 +213,12 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
     assert(bytes.len > 0);
     assert(bytes.len <= config_bytes_max);
 
-    const config = std.json.parseFromSliceLeaky(Config, allocator, bytes, .{}) catch |err| {
+    const config = std.json.parseFromSliceLeaky(
+        Config,
+        allocator,
+        bytes,
+        .{},
+    ) catch |err| {
         std.debug.print("config: cannot parse: {s}\n", .{@errorName(err)});
         return error.malformed_config;
     };
@@ -219,7 +231,11 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     assert(path.len > 0);
     assert(config_bytes_max > 0);
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, config_bytes_max);
+    const bytes = try std.fs.cwd().readFileAlloc(
+        allocator,
+        path,
+        config_bytes_max,
+    );
     assert(bytes.len <= config_bytes_max);
     return parse(allocator, bytes);
 }
@@ -240,7 +256,8 @@ fn hyperConnectionWidth(config: *const TextConfig) !u32 {
         config.linear_num_key_heads * config.linear_key_head_dim,
         2,
     );
-    const value_width = config.linear_num_value_heads * config.linear_value_head_dim;
+    const value_width = config.linear_num_value_heads *
+        config.linear_value_head_dim;
     // This is a real invariant of the checkpoint: the residual stream is 4 x
     // 2560 wide and the GDN input projection produces exactly that many rows,
     // so the two are the same buffer layout. If this ever fails, the layer
@@ -277,7 +294,7 @@ fn queryProjectionRows(config: *const TextConfig) !u32 {
     return rows;
 }
 
-/// Rows of `in_proj_qkv`: a query and a key per key head, values per value head.
+/// Rows of `in_proj_qkv`: a query and a key per key head, plus the values.
 fn linearAttentionRows(config: *const TextConfig) !u32 {
     assert(config.linear_num_key_heads > 0);
     assert(config.linear_num_value_heads > 0);
@@ -285,11 +302,14 @@ fn linearAttentionRows(config: *const TextConfig) !u32 {
     if (config.linear_num_value_heads % config.linear_num_key_heads != 0) {
         return error.invalid_config;
     } else {
-        assert(config.linear_num_value_heads % config.linear_num_key_heads == 0);
+        assert(
+            config.linear_num_value_heads % config.linear_num_key_heads == 0,
+        );
     }
     const per_key_head = config.linear_key_head_dim * 2;
     const key_rows = config.linear_num_key_heads * per_key_head;
-    const value_rows = config.linear_num_value_heads * config.linear_value_head_dim;
+    const value_rows = config.linear_num_value_heads *
+        config.linear_value_head_dim;
     const rows = std.math.add(u32, key_rows, value_rows) catch {
         return error.invalid_config;
     };
@@ -421,7 +441,9 @@ fn validateMisc(model: *const TextModel) !void {
     } else {
         assert(rope_halves == @as(f32, @floatFromInt(section_total)));
     }
-    if (config.partial_rotary_factor != config.rope_parameters.partial_rotary_factor) {
+    const partial = config.partial_rotary_factor;
+    const rope_partial = config.rope_parameters.partial_rotary_factor;
+    if (partial != rope_partial) {
         return error.invalid_config;
     } else {
         assert(config.partial_rotary_factor ==
@@ -601,7 +623,10 @@ test "the layer kind follows the full attention interval" {
     try std.testing.expectEqual(LayerType.linear_attention, model.layerType(1));
     try std.testing.expectEqual(LayerType.full_attention, model.layerType(3));
     try std.testing.expectEqual(LayerType.full_attention, model.layerType(47));
-    try std.testing.expectEqual(LayerType.linear_attention, model.layerType(46));
+    try std.testing.expectEqual(
+        LayerType.linear_attention,
+        model.layerType(46),
+    );
 }
 
 test "the PLE layer id is one based" {
@@ -610,7 +635,11 @@ test "the PLE layer id is one based" {
     const allocator = arena.allocator();
 
     const config = try parse(allocator, test_config_json);
-    try std.testing.expectEqualSlices(u32, &.{2}, config.text_config.ple_layer_ids);
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{2},
+        config.text_config.ple_layer_ids,
+    );
     const model = try TextModel.init(config.text_config);
     try std.testing.expectEqual(@as(u32, 1), model.ple_layer_index);
 }

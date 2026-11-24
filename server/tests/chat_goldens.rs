@@ -6,9 +6,20 @@
 //! (the reference implementation) on the model's own `chat_template.jinja`, and
 //! `ids` is what the model's real `tokenizer.json` produces from that text. The
 //! committed template copy is byte-identical to the model's, so the rendering
-//! half of this test needs no model files; the exact-id half needs the real
-//! tokenizer and fails loudly (it does not skip) when it is absent, because a
-//! skipped golden test is not a gate.
+//! half of this test needs no model files.
+//!
+//! The exact-id half needs the real tokenizer, and the *committed* fixture
+//! tokenizer (`tests/fixtures/model/tokenizer.json`) cannot replace it: it is a
+//! 256-symbol byte-level stand-in, while the golden ids reach 248069, so a
+//! fallback to it would compare nothing. The policy is therefore
+//!
+//! * `INFERNO_MODEL_DIR` set, its `tokenizer.json` present → run, after checking
+//!   the file against the hash the goldens record;
+//! * `INFERNO_MODEL_DIR` set but its `tokenizer.json` missing → **fail**, naming
+//!   the variable and the expected file: a path you configured is a promise;
+//! * nothing configured and the default location empty → **skip loudly**, printing
+//!   why and what to set, so a run that did not check the ids cannot be read as
+//!   one that did.
 
 use std::path::PathBuf;
 
@@ -19,20 +30,69 @@ use serde_json::Value;
 /// The goldens, committed.
 const GOLDENS: &str = include_str!("fixtures/chat_goldens.json");
 
+/// The environment variable a model directory is configured with.
+const MODEL_DIRECTORY_VARIABLE: &str = "INFERNO_MODEL_DIR";
+
 /// The model's chat template, byte-identical to `chat_template.jinja`.
 fn fixture_template() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model/chat_template.jinja")
+    fixture_directory().join("chat_template.jinja")
 }
 
-/// The real tokenizer, from `INFERNO_MODEL_DIR` or the default model location.
-fn real_tokenizer_path() -> PathBuf {
-    let directory = std::env::var("INFERNO_MODEL_DIR").unwrap_or_else(|_| {
-        format!(
-            "{}/models/qwen38-flash-next-nvfp4",
-            std::env::var("HOME").expect("HOME is set")
-        )
-    });
-    PathBuf::from(directory).join("tokenizer.json")
+/// The committed model-shaped fixture directory.
+fn fixture_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model")
+}
+
+/// What the exact-id goldens should do, given the environment.
+#[derive(Debug, PartialEq, Eq)]
+enum GoldenTokenizer {
+    /// This tokenizer file is the one the goldens were produced with.
+    Use(PathBuf),
+    /// `INFERNO_MODEL_DIR` is set and its `tokenizer.json` is not there.
+    ConfiguredButMissing(PathBuf),
+    /// Nothing was configured and the default location has no tokenizer.
+    NotConfigured(PathBuf),
+}
+
+/// Resolves the golden tokenizer without reading the process environment, so all
+/// three outcomes are testable. `home` is the value of `HOME`, empty when unset.
+fn golden_tokenizer(
+    model_directory: Option<&str>,
+    home: &str,
+    has_file: impl Fn(&std::path::Path) -> bool,
+) -> GoldenTokenizer {
+    let directory = match model_directory {
+        Some(configured) => PathBuf::from(configured),
+        None => PathBuf::from(home).join("models/qwen38-flash-next-nvfp4"),
+    };
+    let path = directory.join("tokenizer.json");
+    if has_file(&path) {
+        GoldenTokenizer::Use(path)
+    } else if model_directory.is_some() {
+        GoldenTokenizer::ConfiguredButMissing(path)
+    } else {
+        GoldenTokenizer::NotConfigured(path)
+    }
+}
+
+/// The refusal when a configured model directory has no tokenizer.
+fn configured_but_missing_message(path: &std::path::Path) -> String {
+    format!(
+        "{MODEL_DIRECTORY_VARIABLE} is set but its tokenizer is missing: {} \n\
+         unset {MODEL_DIRECTORY_VARIABLE} to skip the exact-id goldens, or point it at \
+         the directory holding the model's tokenizer.json",
+        path.display(),
+    )
+}
+
+/// The loud skip message when nothing is configured.
+fn not_configured_message(path: &std::path::Path) -> String {
+    format!(
+        "SKIP the exact-id goldens: no model tokenizer at {} \n\
+         set {MODEL_DIRECTORY_VARIABLE} to the model directory to run them; the committed \n\
+         fixture tokenizer is a 256-symbol byte-level stand-in and cannot produce these ids",
+        path.display(),
+    )
 }
 
 /// The golden cases.
@@ -79,13 +139,36 @@ fn every_case_renders_byte_identically_to_python_jinja2() {
 
 #[test]
 fn the_real_tokenizer_produces_the_golden_ids() {
-    let path = real_tokenizer_path();
-    assert!(
-        path.is_file(),
-        "the model tokenizer is required for the exact-id goldens: {} is missing \
-         (set INFERNO_MODEL_DIR to the model directory)",
-        path.display()
+    let source = golden_tokenizer(
+        std::env::var(MODEL_DIRECTORY_VARIABLE).ok().as_deref(),
+        std::env::var("HOME").unwrap_or_default().as_str(),
+        |path| path.is_file(),
     );
+    let path = match source {
+        GoldenTokenizer::ConfiguredButMissing(missing) => {
+            panic!("{}", configured_but_missing_message(&missing));
+        }
+        GoldenTokenizer::NotConfigured(missing) => {
+            println!("{}", not_configured_message(&missing));
+            return;
+        }
+        GoldenTokenizer::Use(found) => found,
+    };
+
+    // The goldens record the hash of the tokenizer they were produced from, so a
+    // configured directory that holds a different file is a failure, not a pass.
+    let document: Value = serde_json::from_str(GOLDENS).expect("the goldens are valid JSON");
+    let expected_hash = document["provenance"]["tokenizer_sha256"]
+        .as_str()
+        .expect("a tokenizer hash");
+    let bytes = std::fs::read(&path).expect("the model tokenizer is readable");
+    assert_eq!(
+        sha256_hex(&bytes),
+        expected_hash,
+        "{} is not the tokenizer the goldens were produced from",
+        path.display(),
+    );
+
     let tokenizer = Tokenizer::from_file(&path).expect("the model tokenizer loads");
 
     for case in cases() {
@@ -105,6 +188,77 @@ fn the_real_tokenizer_produces_the_golden_ids() {
         );
         assert_eq!(encoded, expected, "case {} has different ids", case["name"]);
     }
+}
+
+#[test]
+fn a_configured_model_directory_without_a_tokenizer_is_a_failure() {
+    let source = golden_tokenizer(Some("/no/such/model"), "/home/tester", |_| false);
+    let GoldenTokenizer::ConfiguredButMissing(path) = source else {
+        panic!("a configured directory must not skip: {source:?}");
+    };
+    let message = configured_but_missing_message(&path);
+    assert!(
+        message.contains(MODEL_DIRECTORY_VARIABLE),
+        "the refusal must name the variable: {message}"
+    );
+    assert!(
+        message.contains("tokenizer.json"),
+        "the refusal must name the missing file: {message}"
+    );
+    assert!(path.ends_with("no/such/model/tokenizer.json"));
+}
+
+#[test]
+fn an_unconfigured_machine_skips_the_id_goldens_with_a_reason() {
+    let source = golden_tokenizer(None, "/home/tester", |_| false);
+    let GoldenTokenizer::NotConfigured(path) = source else {
+        panic!("nothing was configured, so nothing may fail: {source:?}");
+    };
+    let message = not_configured_message(&path);
+    assert!(
+        message.starts_with("SKIP"),
+        "a skip must be unmistakable: {message}"
+    );
+    assert!(
+        message.contains(MODEL_DIRECTORY_VARIABLE),
+        "the skip must say how to unskip: {message}"
+    );
+}
+
+#[test]
+fn a_tokenizer_that_is_present_is_used_whatever_its_source() {
+    let directory = fixture_directory();
+    let source = golden_tokenizer(directory.to_str(), "/home/tester", |path| path.is_file());
+    assert!(
+        matches!(source, GoldenTokenizer::Use(_)),
+        "the fixture directory does hold a tokenizer.json: {source:?}"
+    );
+}
+
+#[test]
+fn the_fixture_tokenizer_cannot_be_the_golden_source() {
+    // Why the id goldens fall back to a skip instead of to the committed
+    // stand-in: the fixture vocabulary is 256 byte symbols, the golden ids are not.
+    let document: Value = serde_json::from_str(GOLDENS).expect("the goldens are valid JSON");
+    let fixture = std::fs::read(fixture_directory().join("tokenizer.json"))
+        .expect("the fixture tokenizer is readable");
+    let vocabulary: Value = serde_json::from_slice(&fixture).expect("the fixture is valid JSON");
+    let symbols = vocabulary["model"]["vocab"]
+        .as_object()
+        .expect("the fixture has a vocab")
+        .len();
+    let largest = document["cases"]
+        .as_array()
+        .expect("cases is an array")
+        .iter()
+        .flat_map(|case| case["ids"].as_array().expect("ids is an array").clone())
+        .map(|id| id.as_u64().expect("ids are numbers"))
+        .max()
+        .expect("the goldens hold ids");
+    assert!(
+        largest >= symbols as u64,
+        "golden ids {largest} fit the fixture vocab of {symbols}; a fallback would be vacuous"
+    );
 }
 
 #[test]

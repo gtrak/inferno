@@ -112,6 +112,11 @@ command line. Nested keys use `__` in the environment
 (`INFERNO_LOG__LEVEL=debug`). Unknown keys are refused at startup, so a typo can
 never silently fall back to a default.
 
+The one `INFERNO_*` name that is not a configuration key is `INFERNO_LOG`: like
+`RUST_LOG` it sets the log filter (see `telemetry::init`) and is skipped by the
+config layer, so `INFERNO_LOG=debug` turns up the verbosity without touching the
+`[log]` section.
+
 ```toml
 listen = "0.0.0.0:8080"
 model_path = "/home/gary/models/qwen38-flash-next-nvfp4"

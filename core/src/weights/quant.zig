@@ -80,7 +80,8 @@ fn withSign(magnitude: f32, negative: bool) f32 {
 
     const bits: u32 = @bitCast(magnitude);
     const signed: f32 = @bitCast(if (negative) bits | f32_sign_bit else bits);
-    assert(if (negative) @as(u32, @bitCast(signed)) & f32_sign_bit != 0 else true);
+    const signed_bits: u32 = @bitCast(signed);
+    assert(!negative or signed_bits & f32_sign_bit != 0);
     return signed;
 }
 
@@ -244,7 +245,8 @@ pub fn dequant_fp8_blockwise(
         const scale_row = row / fp8_block_size;
         for (0..extent.cols) |col| {
             const scale_col = col / fp8_block_size;
-            const scale = bf16_to_f32(scale_inv[scale_row * scale_cols + scale_col]);
+            const scale_index = scale_row * scale_cols + scale_col;
+            const scale = bf16_to_f32(scale_inv[scale_index]);
             const index = row * extent.cols + col;
             out[index] = f8_e4m3_to_f32(weight[index]) * scale;
         }
@@ -324,7 +326,10 @@ test "the E2M1 table is the sixteen value grid" {
     };
     for (expected, 0..) |value, code| {
         const decoded = fp4_e2m1_decode(@intCast(code));
-        try std.testing.expectEqual(@as(u32, @bitCast(value)), @as(u32, @bitCast(decoded)));
+        try std.testing.expectEqual(
+            @as(u32, @bitCast(value)),
+            @as(u32, @bitCast(decoded)),
+        );
     }
     // Code 8 is negative zero, which must survive the round trip.
     try std.testing.expect(std.math.signbit(fp4_e2m1_decode(8)));
@@ -351,15 +356,38 @@ test "a packed E2M1 byte splits low nibble first" {
 }
 
 test "E4M3 decodes its boundaries" {
-    try std.testing.expectEqual(@as(f32, 0.0), f8_e4m3_to_f32(@enumFromInt(0x00)));
-    try std.testing.expect(std.math.signbit(f8_e4m3_to_f32(@enumFromInt(0x80))));
-    try std.testing.expectEqual(fp8_max_magnitude, f8_e4m3_to_f32(@enumFromInt(0x7e)));
-    try std.testing.expectEqual(-fp8_max_magnitude, f8_e4m3_to_f32(@enumFromInt(0xfe)));
-    try std.testing.expectEqual(@as(f32, 1.0), f8_e4m3_to_f32(@enumFromInt(0x38)));
-    try std.testing.expectEqual(@as(f32, 1.875), f8_e4m3_to_f32(@enumFromInt(0x3f)));
+    try std.testing.expectEqual(
+        @as(f32, 0.0),
+        f8_e4m3_to_f32(@enumFromInt(0x00)),
+    );
+    try std.testing.expect(
+        std.math.signbit(f8_e4m3_to_f32(@enumFromInt(0x80))),
+    );
+    try std.testing.expectEqual(
+        fp8_max_magnitude,
+        f8_e4m3_to_f32(@enumFromInt(0x7e)),
+    );
+    try std.testing.expectEqual(
+        -fp8_max_magnitude,
+        f8_e4m3_to_f32(@enumFromInt(0xfe)),
+    );
+    try std.testing.expectEqual(
+        @as(f32, 1.0),
+        f8_e4m3_to_f32(@enumFromInt(0x38)),
+    );
+    try std.testing.expectEqual(
+        @as(f32, 1.875),
+        f8_e4m3_to_f32(@enumFromInt(0x3f)),
+    );
     // The smallest subnormal and the smallest normal.
-    try std.testing.expectEqual(@as(f32, 0.001953125), f8_e4m3_to_f32(@enumFromInt(0x01)));
-    try std.testing.expectEqual(@as(f32, 0.015625), f8_e4m3_to_f32(@enumFromInt(0x08)));
+    try std.testing.expectEqual(
+        @as(f32, 0.001953125),
+        f8_e4m3_to_f32(@enumFromInt(0x01)),
+    );
+    try std.testing.expectEqual(
+        @as(f32, 0.015625),
+        f8_e4m3_to_f32(@enumFromInt(0x08)),
+    );
     try std.testing.expect(std.math.isNan(f8_e4m3_to_f32(@enumFromInt(0x7f))));
     try std.testing.expect(std.math.isNan(f8_e4m3_to_f32(@enumFromInt(0xff))));
 }
@@ -376,11 +404,14 @@ test "BF16 conversion is exact and rounds to nearest even" {
     const above = halfway + std.math.pow(f32, 2.0, -20.0);
     try std.testing.expectEqual(@as(u16, 0x3f81), f32_to_bf16(above));
 
-    // Negative values keep their sign and NaN stays quiet instead of infiniting.
+    // Negative values keep their sign and NaN stays quiet, not infinite.
     try std.testing.expectEqual(@as(u16, 0xbf80), f32_to_bf16(-1.0));
     const quiet = f32_to_bf16(std.math.nan(f32)) & 0x7fc0;
     try std.testing.expectEqual(@as(u16, 0x7fc0), quiet);
-    try std.testing.expectEqual(@as(u16, 0x7f80), f32_to_bf16(std.math.inf(f32)));
+    try std.testing.expectEqual(
+        @as(u16, 0x7f80),
+        f32_to_bf16(std.math.inf(f32)),
+    );
 }
 
 test "the NVFP4 golden case dequantises bit exactly" {
@@ -394,20 +425,62 @@ test "the NVFP4 golden case dequantises bit exactly" {
     try std.testing.expect(header.dataComplete(&file));
 
     const packed_weights = try namedBytes(&header, &file, "packed");
-    const scales = try readF8(allocator, try namedBytes(&header, &file, "scales"));
-    const scale_2 = (try readF32(allocator, try namedBytes(&header, &file, "scale_2")))[0];
-    const expected = try readF32(allocator, try namedBytes(&header, &file, "reference"));
+    const scale_bytes = try namedBytes(&header, &file, "scales");
+    const scales = try readF8(allocator, scale_bytes);
+    const scale_2_bytes = try namedBytes(&header, &file, "scale_2");
+    const scale_2 = (try readF32(allocator, scale_2_bytes))[0];
+    const reference_bytes = try namedBytes(&header, &file, "reference");
+    const expected = try readF32(allocator, reference_bytes);
+    const codes = try namedBytes(&header, &file, "codes");
+    const pattern_bytes = try namedBytes(&header, &file, "pattern");
+    const pattern = try readF32(allocator, pattern_bytes);
     try std.testing.expectEqual(scales.len, @as(usize, 2));
 
     const out = try allocator.alloc(f32, expected.len);
     dequant_nvfp4_row(packed_weights, scales, scale_2, out);
 
     for (expected, out) |want, got| {
-        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+        try std.testing.expectEqual(
+            @as(u32, @bitCast(want)),
+            @as(u32, @bitCast(got)),
+        );
     }
     // The pattern includes a weight that quantises to negative zero, which is
     // the case a widening tolerance would silently hide.
     try std.testing.expect(std.math.signbit(out[15]));
+
+    // The oracle's own 4-bit codes, nibble by nibble: `reference` can only pin
+    // the values a code decodes to, so without this the packing convention the
+    // decoder assumes (low nibble first, along the contracted dimension) would
+    // be carried by a comment alone.
+    try std.testing.expectEqual(pattern.len, codes.len);
+    for (codes, 0..) |code, index| {
+        const packed_pair = packed_weights[index / 2];
+        const shift: u3 = @intCast((index % 2) * 4);
+        const nibble: u8 = (packed_pair >> shift) & 0x0f;
+        try std.testing.expectEqual(code, nibble);
+    }
+
+    // `pattern` is what the checkpoint quantised. A quantiser may not flip a
+    // sign, and may not land further than half of the widest E2M1 step - one
+    // code unit between 4 and 6, times the block's combined scale - from its
+    // source, so that ratio is the fixture's own non-vacuity check.
+    var widest_ratio: f32 = 0.0;
+    for (pattern, out, 0..) |source, value, index| {
+        try std.testing.expectEqual(
+            std.math.signbit(source),
+            std.math.signbit(value),
+        );
+        const block_scale = f8_e4m3_to_f32(scales[index / nvfp4_block_size]);
+        const combined = block_scale * scale_2;
+        const ratio = @abs(value - source) / combined;
+        widest_ratio = @max(widest_ratio, ratio);
+    }
+    try std.testing.expect(widest_ratio <= 1.0 + 1e-6);
+    std.debug.print(
+        "nvfp4 fixture: {d} codes match, widest error {d:.4} steps\n",
+        .{ codes.len, widest_ratio },
+    );
 }
 
 test "the FP8 blockwise golden case dequantises bit exactly" {
@@ -415,14 +488,20 @@ test "the FP8 blockwise golden case dequantises bit exactly" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var file = try safetensors.File.initFromBytes("fp8_blockwise_case", golden_fp8_blockwise);
+    var file = try safetensors.File.initFromBytes(
+        "fp8_blockwise_case",
+        golden_fp8_blockwise,
+    );
     defer file.close();
     const header = try safetensors.parseHeader(allocator, &file, 0);
     try std.testing.expect(header.dataComplete(&file));
 
-    const weight = try readF8(allocator, try namedBytes(&header, &file, "weight"));
-    const scale_inv = try readBf16(allocator, try namedBytes(&header, &file, "scale_inv"));
-    const expected = try readF32(allocator, try namedBytes(&header, &file, "reference"));
+    const weight_bytes = try namedBytes(&header, &file, "weight");
+    const weight = try readF8(allocator, weight_bytes);
+    const scale_inv_bytes = try namedBytes(&header, &file, "scale_inv");
+    const scale_inv = try readBf16(allocator, scale_inv_bytes);
+    const fp8_reference_bytes = try namedBytes(&header, &file, "reference");
+    const expected = try readF32(allocator, fp8_reference_bytes);
     try std.testing.expectEqual(scale_inv.len, @as(usize, 4));
 
     const extent = Extent{ .rows = 256, .cols = 256 };
@@ -430,6 +509,9 @@ test "the FP8 blockwise golden case dequantises bit exactly" {
     dequant_fp8_blockwise(weight, scale_inv, extent, out);
 
     for (expected, out) |want, got| {
-        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+        try std.testing.expectEqual(
+            @as(u32, @bitCast(want)),
+            @as(u32, @bitCast(got)),
+        );
     }
 }

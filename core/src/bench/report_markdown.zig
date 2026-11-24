@@ -65,7 +65,26 @@ fn render_tables(report: *const bench.Report, writer: anytype) !void {
     try render_p2p_bandwidth(report, writer);
     try render_p2p_latency(report, writer);
     try render_host(report, writer);
+    try render_stability(report, writer);
     assert(report.device_count <= bench.device_count_max);
+}
+
+/// The stability line: measured, or explicitly not measured. A prose spread
+/// that no run produced is how this document acquired the last one.
+fn render_stability(report: *const bench.Report, writer: anytype) !void {
+    if (report.stability_percent_max) |percent| {
+        assert(percent >= 0);
+        try writer.print(
+            "\nstability: worst run-to-run spread {d:.3} %% over every " ++
+                "measured number\n",
+            .{percent},
+        );
+    } else {
+        try writer.writeAll(
+            "\nstability: not measured (one pass cannot say); re-run with\n" ++
+                "INFERNO_PROBE_REPEATS=<n>, n >= 2, on an idle machine\n",
+        );
+    }
 }
 
 fn render_inventory(report: *const bench.Report, writer: anytype) !void {
@@ -450,6 +469,34 @@ test "render_summary reports the three decisive numbers" {
         text,
         "worst P2P 11.0",
     ) != null);
+}
+
+test "the tables say whether stability was measured" {
+    var report = test_report();
+    var buffer: [table_bytes_max]u8 = undefined;
+
+    report.stability_percent_max = null;
+    const unmeasured_length = try render(&report, buffer[0..]);
+    const unmeasured = buffer[0..unmeasured_length];
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        unmeasured,
+        "stability: not measured",
+    ) != null);
+
+    report.stability_percent_max = 1.25;
+    const measured_length = try render(&report, buffer[0..]);
+    const measured = buffer[0..measured_length];
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        measured,
+        "stability: worst run-to-run spread 1.250 %",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        measured,
+        "stability: not measured",
+    ) == null);
 }
 
 test "worst_peer_bandwidth ignores the device-local diagonal" {
