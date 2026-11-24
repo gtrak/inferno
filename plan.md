@@ -213,6 +213,34 @@ So the bar is reachable at 16 K but not comfortably: routed efficiency must roug
 from the measured 17 %, *and* the shared expert's 77 us/token (27 % of the token) must come
 off the FFMA path. Killing that alone is worth ~8,300 tok/s.
 
+### Metric definition — non-negotiable before quoting any number
+
+A throughput figure is meaningless without its parallel strategy, its batch model and its
+cache state. Every number in this file must carry all three, or it does not go in.
+
+| | peer engine | inferno |
+|---|---|---|
+| parallelism | pipeline (layers split across ranks) | TP dense + EP experts + replicated attention |
+| decode batch | must be > 1 to fill the pipeline | **1, by requirement** |
+| decode metric | **aggregate over concurrent sequences** | **single-sequence latency** |
+| KV format | fp16 | fp8 |
+| KV at 256K | **6.00 GiB**, unreplicated, 1.50/rank | **12.00 GiB**, replicated x4 |
+
+**The peer's 100-150 tok/s decode and our 131 tok/s are not the same measurement.** Pipeline
+parallel at batch 1 leaves 3 of 4 ranks idle on every token, so a PP engine cannot be tuned
+for single-stream: its number must be aggregate across concurrent requests (>= 4 micro-batches
+to fill 4 stages). Ours is single-stream, which is what this project requires. Do not compare
+them until the peer's batch model is known.
+
+**The KV comparison is fair, and it goes against us:** fp8 halves our footprint but replication
+multiplies it by four, so we hold **2x** their KV at full context. This is the second measured
+cost of replicating attention, after the 5.5 ms/token serial term. It is affordable only because
+QSA caps live attention at 2,048 keys: the hot window is 30 MB fp8 replicated and the tail
+lives in DRAM. Without tiering, 2x would be a blocker.
+
+Prefill *is* comparable: pipeline parallel has no bubble at chunk 16,384 (4,096 tokens per
+stage), so their 5,000 tok/s stands as a like-for-like target and M-001 must answer it.
+
 **Cache warmth is our DRAM tier, and they pay it too.** The peer engine's 5,000 is a warm
 number. Our 4.30 GB expert overflow is read once per chunk: 2.1 MB/token at chunk 2,048
 versus 262 KB/token at 16,384. Large chunks are not a tuning knob — they are what makes the
