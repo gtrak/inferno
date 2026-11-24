@@ -111,53 +111,48 @@ THEORY.md PLAN-log.md ledger.jsonl configs/ best-config.json   (inference-optimi
 | L8 | indexer top-k selection early exit at short context | short-ctx gains | none |
 | L9 | batch/pack decode across sequences (continuous batching) | 2–4× cN | scheduler |
 
-## 7. Issues (dependency order)
+## 7. Issue inventory (single source of truth — renumbering drifted from the original draft)
 
-Done: **I-001** build skeleton (gates green; probe sees 4 × 16.66 GB, driver
-610.57.04) · **I-004** oracle (240 golden tensors, transformers 5.24.0.dev0 @
-d8f10a8, tiny checkpoint in both HF and published-checkpoint layouts).
-Carried-forward reviewer suggestions: `.agents/tasks/reviewer-followups.md`.
+`[x]` merged & gated · `[~]` implemented, in review · `[s]` spec written, queued · `[ ]` not yet specified
 
-Wave 1 — foundation (parallel-safe, disjoint dirs):
-- **I-01** build skeleton: Cargo workspace + Zig static lib + nvcc pipeline + `tools/gate.sh` + hardware probe (device query, P2P, measured PCIe/GDDR bandwidth). Lane A.
-- **I-04** `tools/ref-trace`: uv venv, CPU torch + transformers(main) reference, tiny random-weight Qwen4Exp models, golden fixtures per module. Lane B.
+### Foundation — done
+- [x] **I-001** build skeleton: Cargo workspace, Zig static lib, nvcc→cubin→embed, FFI probe
+- [x] **I-004** oracle: HF reference traces, tiny random model in HF + checkpoint layouts, 240 goldens
 
-Wave 2 — data + correctness:
-- **I-02** CUDA driver layer in Zig (context/dev/stream/event/module/buffer/peer-copy, error taxonomy, `zig build test` on real GPUs). Lane A.
-- **I-03** weights: safetensors mmap reader, config/manifest, NVFP4 + FP8 blockwise layouts, placement planner input. Lane A.
-- **I-05a** CPU reference: GatedDeltaNet (chunk + recurrent) matches goldens.
-- **I-05b** CPU reference: indexed attention (partial RoPE, mRoPE, QSA indexer, gated output) matches goldens.
-- **I-05c** CPU reference: router + 512-expert MoE + shared expert matches goldens.
-- **I-05d** CPU reference: hyper-connections (10240-dim, low-rank) + PLE n-gram embedding matches goldens.
-- **I-05e** CPU reference: full layer + full model end-to-end greedy tokens match HF.
+### Wave 2 — in review
+- [~] **I-002** hardware probe (HBM/PCIe/P2P/GEMM peaks → replaces every M-todo in THEORY.md)
+- [~] **I-003** weights: safetensors, config, tensor manifest, NVFP4/FP8 decoders
+- [~] **I-005** CPU reference: full Qwen4Exp text graph in f32 = the GPU oracle
+- [~] **I-007** Rust server: axum + OpenAI API + tokenizer + metrics (MockEngine backend)
 
-Wave 3 — GPU kernels (each gated against the CPU reference, not against itself):
-- **I-06** BF16/FP8/NVFP4 GEMV+GEMM (dequant-fused; block-scaled mma for prefill).
-- **I-07** RMSNorm (grouped + gated), RoPE (partial + mRoPE), SiLU-mul, sigmoid gates, softmax/sampling.
-- **I-08** attention: prefill causal GQA with indexer mask overlay; decode with KV cache.
-- **I-09** GDN: chunked scan prefill, recurrent decode, causal conv1d (k=4) state update.
-- **I-10** MoE: router top-k, permute/group, grouped fp4 GEMM, combine, shared expert.
-- **I-11** PLE: 16-row n-gram gather (host, async), key/value proj, dilated depthwise conv, inject.
+### Wave 3 — kernels (each gated against the CPU reference, never against another GPU path)
+- [s] **I-006a** decode GEMV family (NVFP4 / FP8 blockwise / BF16) + batched decode
+- [s] **I-006b** prefill GEMM: native `OMMA.SF` NVFP4 + exact BF16-dequant reference path
+- [s] **I-008** indexed (QSA) attention: indexer selection, prefill sparse attention, decode
+- [s] **I-009** Gated DeltaNet: causal conv, chunked UT-scan prefill, recurrent decode
+- [ ] **I-010** MoE: router top-k, permute/group, grouped NVFP4 GEMM, combine, shared expert
+- [ ] **I-011** PLE: n-gram id derivation, 16-row gather, key/value proj, dilated depthwise conv
+- [ ] **I-012** elementwise/structural: RMSNorm (grouped, gated), partial+mRoPE, SiLU-mul, sigmoid gates, sampler
 
-Wave 4 — engine:
-- **I-12** single-GPU end-to-end tiny-model generation matching HF (greedy, bit-stable).
-- **I-13** multi-GPU TP=4/EP=4 with P2P allreduce/dispatch; validated vs I-12 outputs.
-- **I-14** KV + recurrent-state pool, scheduler, continuous batching, prefix cache.
-- **I-15** sampling (top-k/top-p/temp/repetition), C ABI, streaming token out.
+### Wave 4 — engine
+- [ ] **I-013** single-GPU end-to-end tiny model: greedy ids bit-identical to HF  ← integration milestone
+- [ ] **I-014** multi-GPU TP=4 dense + EP=4 experts over P2P; must match I-013 token-for-token
+- [ ] **I-015** KV + GDN-state pool, scheduler, continuous batching, prefix cache
+- [ ] **I-016** sampling, C ABI, token streaming → wires I-007 to the real engine end to end
 
-Wave 5 — server (can start after I-01):
-- **I-16** Rust server: axum, `/v1/chat/completions` (stream + non-stream), `/health`, `/metrics`.
-- **I-17** tokenizer (HF `tokenizers`), chat template rendering, stop sequences, usage accounting.
-- **I-18** config/logging/tracing/graceful shutdown/backpressure.
+### Wave 5 — real model + hill-climb
+- [ ] **I-017** load the real 132 GB checkpoint; placement report; first coherent tokens
+- [ ] **I-018** acceptance gates: needle at 50 %/100 % context, chat + tools round-trip, soak
+- [ ] **I-019** CUDA graphs + kernel tuning round 1 (L1, L6)
+- [ ] **I-020** requantiser: dense→FP8 (L2), experts→per-32 MXFP4 (L3), with quality gate
+- [ ] **I-021** expert hot/cold split + CPU-expert path (L4, L5) — the VRAM gap closer
+- [ ] **I-022** speculative decoding: prompt-lookup n-gram (L7)
+- [ ] **I-023** vision tower (deferred; text path does not need it)
 
-Wave 6 — real model + hill-climb:
-- **I-19** load the real 132 GB checkpoint, first coherent tokens, placement report.
-- **I-20** acceptance gates: needle at 50%/100% context, chat + tools round-trip, soak.
-- **I-21** CUDA graphs + kernel tuning round 1 (L1, L6).
-- **I-22** requantization tool (L2, L3) with quality gate.
-- **I-23** expert hot/cold split + CPU-expert path (L4, L5).
-- **I-24** speculative decoding (L7).
-- **I-25** vision tower (deferred, optional).
+### Critical path to "the real model answering over HTTP"
+I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-016 → I-017
+(10 issues, with I-014 effectively mandatory: 78 GB of text weights cannot fit in
+66.6 GB of VRAM on one GPU, and host streaming over 4×x4 PCIe costs ~40 ms/GB/token).
 
 ## 8. Non-negotiable
 
