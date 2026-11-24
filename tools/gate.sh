@@ -65,6 +65,29 @@ print(
 '
 printf '%s' "$probe_output" | python3 -c "$probe_check" "$expected_devices"
 
+echo "== quant fixtures are regenerable (drift guard)"
+if [ ! -f tools/ref-trace/quant_oracle.py ]; then
+    echo "SKIP quant fixture drift guard: tools/ref-trace/quant_oracle.py not present"
+elif [ ! -x tools/ref-trace/.venv/bin/python ]; then
+    echo "SKIP quant fixture drift guard: no venv (run tools/ref-trace/run.sh)"
+else
+    drift_dir="$(mktemp -d)"
+    ( cd tools/ref-trace && ./.venv/bin/python quant_oracle.py --out-dir "$drift_dir" >/dev/null ) || {
+        echo "FAIL could not regenerate quant fixtures"
+        rm -rf "$drift_dir"
+        exit 1
+    }
+    for fixture in nvfp4_case fp8_blockwise_case; do
+        if ! cmp -s "$drift_dir/$fixture.safetensors" "tests/golden/quant/$fixture.safetensors"; then
+            echo "FAIL tests/golden/quant/$fixture.safetensors is not reproducible from quant_oracle.py"
+            rm -rf "$drift_dir"
+            exit 1
+        fi
+    done
+    rm -rf "$drift_dir"
+    echo "quant fixtures reproduce byte-for-byte"
+fi
+
 echo "== structural invariants (dep-free core, contained unsafe mass)"
 python3 - <<'INVARIANTS'
 import pathlib, re, sys
