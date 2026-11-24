@@ -407,6 +407,45 @@ Any quality threshold must be derived from the **reference's own two-run noise f
 An earlier tolerance here was set at 1e-6 when the reference legitimately moved 4.5e-8 with thread
 count; a gate tighter than the reference's variance is decoration.
 
+## 7g. The quality question is answered by the vendor; and the checkpoint's dtypes, corrected
+
+**NVIDIA publishes the quantisation delta for this exact checkpoint** — the "reference trace in the
+wild" turned out to be an eval table in the model card, which is better than a logit trace for the
+question "what did 4-bit cost":
+
+| benchmark | FP8 baseline | NVFP4 | delta |
+|---|---:|---:|---:|
+| GPQA Diamond | 92.0 | 91.5 | -0.5 |
+| HLE | 34.7 | 35.4 | +0.7 |
+| tau2-Bench Telecom | 90.8 | 90.1 | -0.7 |
+| MMMU Pro | 77.1 | 78.3 | +1.2 |
+| SciCode | 16.3 | 18.8 | +2.5 |
+| AA-LCR | 71.9 | 74.1 | +2.2 |
+| IFBench | 80.5 | 81.0 | +0.5 |
+| Omniscience | 28.1 | 27.6 | -0.5 |
+| Terminal-Bench 2.1 | 83.3 | 82.9 | -0.4 |
+| **mean** | | | **+0.56** |
+
+**NVFP4 is indistinguishable from FP8 and marginally ahead on average.** The quantisation ceiling
+cost nothing measurable, on the vendor's own measurement. There is no need to generate a
+full-precision reference to establish that.
+
+**What is still missing is an implementation oracle, not a quality one** — and the baseline is a real
+checkpoint: **`Qwen/Qwen3.8-Flash-Next-FP8`**, which is what NVIDIA benchmarked against.
+
+### Dtype correction (from the card, and it contradicts our own wording)
+
+- routed MoE expert linears: **W4A4 NVFP4**, MSE-calibrated weight scales
+- **attention layers, shared experts and other main-model layers: BF16** — not FP8
+- MTP routed experts: 128x128 block-scaled FP8
+- PLE n-gram embedding: per-tensor FP8
+- checkpoint is ~2.7x smaller than the BF16 source
+- **the MTP module and PLE n-gram table match `Qwen3.8-Flash-Next-FP8` byte-for-byte** — so our
+  51.2 GB n-gram table has a byte-identical oracle available
+
+So "FP8 weights" was wrong wherever we wrote it: only the n-gram table and MTP are FP8. Everything
+else is BF16 or NVFP4 and must be loaded as declared.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
