@@ -115,6 +115,78 @@ process-global device buffer across tests.
 green runs (a test prints it while exercising an error path) and on red ones (the attention test
 genuinely failing). Any grepping of that string is meaningless; only exit codes count.
 
+## 5. The structural guarantee for read-before-write (the control-flow hazard)
+
+**Be clear about the limit first:** Zig has no linear/affine types, so a *static* "definitely
+written before read" proof across kernel launches is not expressible — a struct can be copied and
+two handles used. Anyone claiming otherwise is describing a different language. What Zig can do is
+(a) make the wrong *call* not compile, and (b) check the write-before-read dataflow at launch
+granularity, naming the offending kernel. Together that turns the hazard from possible-by-omission
+into either a compile error or a loud, located failure on the first run.
+
+### 5a. Capability handles — the read method does not exist on an unwritten buffer
+
+```zig
+pub const Buffer = struct {
+    pub fn alloc(comptime kind: Kind, bytes: u64) !Writable;
+};
+
+pub const Writable = struct {
+    // No read accessor. Not `pub fn slice()`: a Writable cannot be read, full stop.
+    pub fn upload(self: *Writable, staging: []const u8) !void;
+    pub fn fill(self: *Writable, value: u8) !void;
+    pub fn seal(self: Writable) Sealed;       // consumes the Writable
+};
+
+pub const Sealed = struct {
+    ptr: [*]u8,
+    bytes: u64,
+    kind: Kind,
+    written: Epoch,   // when the last full write landed
+};
+```
+
+A kernel can only be handed `Sealed` values. Obtaining one requires calling `seal()`, which means
+you held a `Writable` and had no read path from it. `State.reset`'s blanket zero loop then has no
+`Sealed` to write through — it can only write via `Writable`, which means re-sealing, which means
+the tracker (5b) records a fresh epoch. The "zero everything and hope" shape stops being expressible.
+
+### 5b. Declared access lists checked at launch — the dataflow check
+
+Every launch goes through one wrapper (that is invariant **G1**). The wrapper takes a comptime
+access declaration and refuses a read of a buffer whose latest epoch is `never_written`:
+
+```zig
+pub const Access = enum { read, write, read_write };
+pub fn launch(comptime spec: KernelSpec, bufs: []const []const BufDecl, args: anytype) !void;
+```
+
+Rules the wrapper enforces, in debug builds:
+- `read` on a buffer with `written == never` → **hard error naming the kernel and the buffer**.
+- `write` bumps the buffer's epoch.
+- `read_write` requires a prior write, same as `read`.
+- a buffer declared `initially_zero` at allocation is exempt from its **first** read only, and that
+  exemption is a one-time allocation property — not a per-reset blanket operation.
+
+This is the piece that would have caught tonight's bug on the first run, with the kernel's name
+attached, instead of three different `max_abs_err` values across sixteen runs.
+
+### 5c. Zeroing becomes declared, not blanket
+
+The reason blanket zeroing is wrong is that it makes *every* buffer silently initialised, so a
+missing write is invisible. Under 5b the only zeroed buffers are the ones whose **kernel contract
+depends on zero padding** (MoE 16-row padding, KV tile tails), declared once at allocation. Real
+data paths must write. That is exactly the by-case table in the I-013 follow-up, now enforced
+rather than documented.
+
+### 5d. NaN poisoning makes masked reads harmless and unmasked reads loud
+
+Debug builds fill allocations with NaN rather than zero. A kernel that masks correctly multiplies
+NaN by a mask of 0 and is unaffected (mask the *selection*, not the product, or use `select`).
+A kernel that reads past `length` without masking propagates NaN into the output and fails the
+oracle immediately. This is the detector that distinguishes "padding, harmless" from "real data,
+bug" — the distinction blanket zeroing destroys.
+
 ## Non-goals
 
 - Do not attempt to prevent device-side OOB by type checks. Guard bands + a debug verify are the
