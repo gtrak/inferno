@@ -154,6 +154,18 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 (10 issues, with I-014 effectively mandatory: 78 GB of text weights cannot fit in
 66.6 GB of VRAM on one GPU, and host streaming over 4×x4 PCIe costs ~40 ms/GB/token).
 
+## 7b. Worker model routing (user directive 2026-11-24, binding)
+
+| work class | model | notes |
+|---|---|---|
+| hard: tensor-core kernels, numerics, multi-GPU placement/comms, requantiser, end-to-end integration | **`opencode-go/deepseek-v4.1-flash`** ("DeepSeek V4.1 Flash 1017", 1M ctx, $0.15/$0.60 per Mtok) — **one slot only** | reserve the single slot for the critical path |
+| straightforward: cleanup lanes, mechanical kernel ports, test harnesses, docs/specs | **`desktop`** (local, Qwen3.8-Flash-Next IQ4_XS, 262144 ctx) | verified reachable on `gary-desktop.local:1234` |
+| general reasoning when the deepseek slot is busy | `synthetic/syn:large:text` | |
+| **review gate** | `synthetic/syn:large:text`, always | the gate has caught 3+ real defects; never downgrade it to a small model, and prefer a *different* family from the implementer to avoid same-model blind spots |
+
+`local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not
+be used for dispatched work until it answers `/v1/models` again.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
