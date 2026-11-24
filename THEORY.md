@@ -87,19 +87,64 @@ and attention kernels, not the GEMM); short prompts
 **TTFT floor** = one forward pass of the last prompt token + tokenize + schedule
 ≈ 10–20 ms once the context is cached.
 
-## 4. State memory (caps concurrency)
+## 4. State memory — a first-class budget item, not a footnote
 
-| item | per sequence | note |
+Corrected 2026-11-24: an earlier version of this section said 12 KB/token for KV,
+which counted K but not V. Real numbers:
+
+| item | per token | per sequence | note |
+|---|---:|---:|---|
+| KV, 12 full-attn layers (2 kv heads × 256 × K+V × bf16) | **24 KB** | | |
+| indexer keys, 12 layers (1 head × 128 × bf16) | 3 KB | | |
+| **total full-attention state** | **27 KB/token** | | FP8 halves it to 13.5 KB |
+| GDN recurrent state (36 layers × 48 v-heads × 128 × 128 fp32) | — | **113 MB** | *independent of context* |
+| GDN conv state (36 × 3 × 10240 bf16) | — | 2.2 MB | |
+| PLE conv state + n-gram context | — | ~1 MB | |
+
+### The TP=4 multiplier is the real problem
+
+With TP=4 attention, each rank computes 6 of 24 q heads for **every** sequence, so
+every rank needs the whole KV — i.e. **KV is replicated ×4** (this is what vLLM
+does too). That multiplies the dominant long-context cost:
+
+| context | KV+idx, 1 copy | ×4 replicated bf16 | ×4 replicated **FP8** |
+|---:|---:|---:|---:|
+| 4 K | 0.11 GB | 0.45 GB | 0.23 GB |
+| 8 K | 0.23 GB | 0.91 GB | 0.45 GB |
+| 32 K | 0.91 GB | **3.62 GB** | 1.81 GB |
+| 128 K | 3.62 GB | **14.5 GB** | 7.25 GB |
+
+### Envelope implied by the weights budget
+
+Weights after the requant ladder ≈ 65.0 GB of 66.6 GB usable ⇒ **≈1.6 GB of state.**
+
+| workload | state (FP8 KV, ×4) | fits 1.6 GB? |
 |---|---:|---|
-| KV (12 full-attn layers, 2 kv heads × 256 × bf16) | 12 KB/token | 128 K ctx → 1.5 GB |
-| indexer keys (12 layers × 128 dim bf16) | 3 KB/token | 128 K ctx → 0.4 GB |
-| GDN recurrent state (36 layers × 48 heads × 128 × 128 fp32) | **113 MB** | state, not KV, caps concurrency |
-| GDN conv state (36 × 3 × 10240 bf16) | 2.2 MB | |
-| PLE conv state + n-gram context | ~0.2 MB | |
+| 1 × 16 K | 0.79 GB + 113 MB | yes |
+| 2 × 8 K | 0.45 + 0.23 | yes |
+| 8 × 2 K | 0.20 + 0.90 | yes |
+| 8 × 8 K | 0.91 × 2 + 0.90 | no (2.7 GB) |
+| 1 × 128 K | 7.25 + 0.11 | **no** |
 
-With ~1.5–2 GB VRAM left after weights: **8–16 concurrent sequences** at moderate
-context, or 1 × 128 K. GDN state in bf16 halves the state cost (lever, needs a
-quality/equivalence gate).
+So the honest statement of this machine's capability for this model is:
+**one long context (~16 K) or a handful of short chats — never both at once.**
+Three ways to widen it, in order of expected payoff:
+
+1. **KV in FP8** (halves the replicated cost) — standard, small quality cost.
+2. **Do not tensor-parallelise the attention layers** — replicate the 1.24 GB of
+   attention weights instead and pin each sequence's attention to one rank
+   (sequence-parallel attention), broadcasting the result to all ranks for the EP
+   MoE step. Costs ~+3.7 GB of weights, saves 3/4 of the KV cost — a win only for
+   long contexts, and a net loss at short ones. Decision belongs to I-014.
+3. **Free VRAM from weights via the DRAM expert tier** — but this is *not* a
+   bottomless source: each 1 GB offloaded costs ~0.15 ms/token at realistic miss
+   rates, so ~2–3 GB is the practical maximum before decode latency degrades
+   noticeably.
+
+**Therefore the expert-frequency histogram is the highest-value unmeasured
+number in the project**: routing skew decides whether VRAM can hold a much smaller
+hot expert set (freeing tens of GB for state) or whether we are stuck near 65 GB.
+Measure it as soon as one layer runs (after I-013).
 
 ## 5. Quality gates that must hold at every measured point
 
