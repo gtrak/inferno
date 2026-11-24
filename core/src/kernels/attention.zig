@@ -39,6 +39,23 @@ const prefill_warps: u32 = 4;
 /// Warps one decode block spreads the selection over.
 const decode_warps: u32 = 8;
 
+/// Query rows one tensor-core prefill block attends to; mirrors `mma_rows` in
+/// the device file.
+const prefill_mma_rows: u32 = 16;
+
+/// Threads per tensor-core prefill block; mirrors `mma_threads`.
+const prefill_mma_threads: u32 = 128;
+
+/// Widest head dim the tensor-core prefill path handles; the V tile has to stay
+/// inside the static shared-memory budget.
+const prefill_mma_head_dim_max: u32 = 256;
+
+/// Fewest query rows the tensor-core path needs to pay for its 16-row m-tile.
+/// A single-row launch is a decode-shaped step and stays on the warp-scalar
+/// kernel, which does not pad fifteen rows of tensor-core work and keeps the
+/// `decode == prefill` invariant on identical arithmetic.
+const prefill_mma_min_rows: u32 = 8;
+
 /// Threads per norm, pool and score block.
 const index_threads: u32 = 128;
 
@@ -60,6 +77,17 @@ const dims_per_warp_pass: u32 = 64;
 
 /// Passes the kernels unroll; `head_dim <= lane_passes_max * 64`.
 const lane_passes_max: u32 = 8;
+
+/// Blocks one indexer score group covers. The score buffer is a fixed
+/// `min(rows, indexer_row_chunk) * score_group_blocks` fp32 allocation, so it
+/// does not change with the context at all: past 131 072 tokens at
+/// `compress_ratio` 4 the wrapper folds several groups into the running top-k
+/// instead of growing the buffer.
+pub const score_group_blocks: u32 = 32768;
+
+/// Rows one streaming pass scores at once, so the fixed score buffer stays
+/// bounded even at a full batch prefill.
+pub const indexer_row_chunk: u32 = 256;
 
 /// Indexer heads whose partial dots fit in one block's shared memory.
 const index_heads_max: u32 = 32;
@@ -197,7 +225,10 @@ pub const Kernels = struct {
     indexer_pool_blocks: kernel.Function,
     indexer_block_scores: kernel.Function,
     indexer_select: kernel.Function,
+    indexer_group_topk: kernel.Function,
+    indexer_expand: kernel.Function,
     attn_prefill: kernel.Function,
+    attn_prefill_mma: kernel.Function,
     attn_decode: kernel.Function,
 
     /// Loads the cubin and resolves every entry point; the context must be
@@ -221,7 +252,10 @@ pub const Kernels = struct {
                 "indexer_block_scores",
             ),
             .indexer_select = try module.function("indexer_select"),
+            .indexer_group_topk = try module.function("indexer_group_topk"),
+            .indexer_expand = try module.function("indexer_expand"),
             .attn_prefill = try module.function("attn_prefill"),
+            .attn_prefill_mma = try module.function("attn_prefill_mma"),
             .attn_decode = try module.function("attn_decode"),
         };
     }
@@ -296,8 +330,12 @@ pub const IndexerArgs = struct {
     index_keys: cuda_driver.DevicePtr,
     /// bf16 `[arena_length / ratio, index_dim]` scratch.
     pooled: cuda_driver.DevicePtr,
-    /// f32 `[rows, arena_length / ratio]` scratch.
+    /// f32 `[rows, min(blocks, score_group_blocks)]` scratch: one streaming
+    /// group's block scores, overwritten by the next group.
     scores: cuda_driver.DevicePtr,
+    /// u64 `[rows, block_topk]` scratch: the running per-row top-k, packed as
+    /// `(score bits, absolute block index)` and sorted descending.
+    partial: cuda_driver.DevicePtr,
     /// int32 `[rows, slots]` out.
     selected: cuda_driver.DevicePtr,
     /// int32 `[rows]` absolute positions.
@@ -338,6 +376,12 @@ pub const PrefillArgs = struct {
     /// Optional int32 `[1]`: counts gathered rows past the launch's causal
     /// horizon, once each, so a nonzero value means the list was corrupt.
     violations: ?cuda_driver.DevicePtr,
+    /// Optional u32 `[rows, ceil(count / 32)]`: per-row selection bitmap over
+    /// the shared union gather. Bit `slot` set means this row's QSA selection
+    /// contains the gathered row; the MMA path masks every cleared bit, which is
+    /// what makes prefill exactly QSA at `rows > 1`. Null keeps causal-only
+    /// masking (the union semantics).
+    selection_mask: ?cuda_driver.DevicePtr = null,
     rows: u32,
     count: u32,
     shapes: Shapes,
@@ -464,6 +508,12 @@ pub const Attention = struct {
 
     /// Runs the six indexer stages: project, norm+rotate, append, pool, score,
     /// select.
+    ///
+    /// The block scores stream: each pass scores at most `score_group_blocks`
+    /// blocks into the reusable `scores` buffer, folds that group's top-k into
+    /// the running `partial` keys, and the last pass expands the partial keys
+    /// into `selected`. The score buffer therefore never grows with the
+    /// context.
     pub fn indexerScores(
         self: *const Attention,
         args: IndexerArgs,
@@ -487,24 +537,64 @@ pub const Attention = struct {
             // No block completed this step, so there is nothing new to pool: the
             // resident pooled keys already cover every complete block.
         }
-        // The block scores read *this* step's queries, which change every step,
-        // so they are recomputed even when no new block completed. Skipping this
-        // launch would hand `select` the previous step's score row.
-        if (blocks > 0) {
-            try self.scoreBlocks(&args, blocks);
-        } else {
-            // An empty cache has no block to score; `select` still writes the
-            // trailing tokens.
+        // The score buffer is a fixed group width, processed one row chunk at a
+        // time: a full batch prefill therefore uses the same bytes as a decode
+        // step. The partial top-k seeds the first group's merge, so 0 is the
+        // padding key that sorts last.
+        const capacity = score_group_blocks;
+        assert(capacity > 0);
+        assert(indexer_row_chunk > 0);
+        var row_first: u32 = 0;
+        while (row_first < args.rows) {
+            const rows_local = @min(args.rows - row_first, indexer_row_chunk);
+            var stage_args = args;
+            stage_args.rows = rows_local;
+            stage_args.queries += @as(u64, row_first) *
+                shapes.index_heads * shapes.index_dim * 2;
+            stage_args.positions += @as(u64, row_first) * 4;
+            stage_args.partial += @as(u64, row_first) *
+                shapes.blockTopk() * 8;
+            stage_args.selected += @as(u64, row_first) * shapes.slots() * 4;
+            if (blocks > 0) {
+                var first: u32 = 0;
+                while (first < blocks) {
+                    const count = @min(blocks - first, score_group_blocks);
+                    // The block scores read *this* step's queries, which change
+                    // every step, so they are recomputed even when no new block
+                    // completed. One bounded group per launch keeps the score
+                    // buffer context-independent.
+                    try self.scoreBlocks(&stage_args, first, count, capacity);
+                    try self.groupTopk(&stage_args, first, count, capacity);
+                    first += count;
+                }
+            } else {
+                // An empty cache has no block to score; the expansion still
+                // writes the trailing tokens.
+            }
+            try self.expandSelected(&stage_args);
+            row_first += rows_local;
         }
-        try self.select(
-            args.scores,
-            args.positions,
-            args.selected,
-            args.rows,
-            blocks,
-            shapes,
-        );
         assert(args.rows > 0);
+    }
+
+    /// Bytes one indexer call's score buffer needs: a fixed row chunk by the
+    /// fixed streaming group width, never the context's block count or the
+    /// batch's row count.
+    pub fn indexerScoreBytes(rows: u32, blocks: u32) u64 {
+        assert(rows > 0);
+        assert(score_group_blocks > 0);
+        assert(blocks <= positions_max);
+
+        const chunk_rows = @min(rows, indexer_row_chunk);
+        return @as(u64, chunk_rows) * score_group_blocks * 4;
+    }
+
+    /// Bytes of the running per-row partial top-k buffer.
+    pub fn indexerPartialBytes(rows: u32, shapes: Shapes) u64 {
+        assert(rows > 0);
+        assert(shapes.blockTopk() > 0);
+
+        return @as(u64, rows) * shapes.blockTopk() * 8;
     }
 
     /// Stage one: `projected = hidden @ weight^T` in fp32.
@@ -639,13 +729,20 @@ pub const Attention = struct {
         );
     }
 
-    /// Stage five: `sum_heads relu(q . pooled) / sqrt(index_dim)` per block.
+    /// Stage five: `sum_heads relu(q . pooled) / sqrt(index_dim)` per block,
+    /// for one bounded streaming group.
+    ///
+    /// `first` is the group's first absolute block; `count` blocks are scored,
+    /// stored at their offset inside the `capacity`-wide group buffer.
     fn scoreBlocks(
         self: *const Attention,
         args: *const IndexerArgs,
-        blocks: u32,
+        first: u32,
+        count: u32,
+        capacity: u32,
     ) !void {
-        assert(blocks > 0);
+        assert(count > 0);
+        assert(capacity >= count);
         assert(args.shapes.index_dim > 0);
 
         const shapes = args.shapes;
@@ -653,18 +750,87 @@ pub const Attention = struct {
         var pooled = args.pooled;
         var scores = args.scores;
         var rows: u32 = args.rows;
-        var block_count: u32 = blocks;
+        var block_count: u32 = count;
+        var first_block: u32 = first;
+        var score_capacity: u32 = capacity;
         var index_heads: u32 = shapes.index_heads;
         var index_dim: u32 = shapes.index_dim;
         var scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(index_dim)));
-        const chunks = (blocks + scores_per_cta - 1) / scores_per_cta;
+        const chunks = (count + scores_per_cta - 1) / scores_per_cta;
         const arguments = [_]?*anyopaque{
-            @ptrCast(&queries),     @ptrCast(&pooled),      @ptrCast(&scores),    @ptrCast(&rows),
-            @ptrCast(&block_count), @ptrCast(&index_heads), @ptrCast(&index_dim), @ptrCast(&scale),
+            @ptrCast(&queries),     @ptrCast(&pooled),      @ptrCast(&scores),         @ptrCast(&rows),
+            @ptrCast(&block_count), @ptrCast(&first_block), @ptrCast(&score_capacity), @ptrCast(&index_heads),
+            @ptrCast(&index_dim),   @ptrCast(&scale),
         };
         try self.kernels.indexer_block_scores.launch(
             .{ chunks, args.rows, 1 },
             .{ shapes.index_heads * 32, 1, 1 },
+            0,
+            self.stream.handle,
+            arguments[0..],
+        );
+    }
+
+    /// Stage five and a half: merge one score group into the running top-k.
+    fn groupTopk(
+        self: *const Attention,
+        args: *const IndexerArgs,
+        first: u32,
+        count: u32,
+        capacity: u32,
+    ) !void {
+        assert(count > 0);
+        assert(capacity >= count);
+        assert(args.shapes.blockTopk() > 0);
+
+        const shapes = args.shapes;
+        var scores = args.scores;
+        var positions = args.positions;
+        var partial = args.partial;
+        var rows: u32 = args.rows;
+        var group_capacity: u32 = capacity;
+        var first_block: u32 = first;
+        var group_blocks: u32 = count;
+        var ratio: u32 = shapes.compress_ratio;
+        var block_topk: u32 = shapes.blockTopk();
+        const arguments = [_]?*anyopaque{
+            @ptrCast(&scores),       @ptrCast(&positions),      @ptrCast(&partial),
+            @ptrCast(&rows),         @ptrCast(&group_capacity), @ptrCast(&first_block),
+            @ptrCast(&group_blocks), @ptrCast(&ratio),          @ptrCast(&block_topk),
+        };
+        try self.kernels.indexer_group_topk.launch(
+            .{ args.rows, 1, 1 },
+            .{ select_threads, 1, 1 },
+            0,
+            self.stream.handle,
+            arguments[0..],
+        );
+    }
+
+    /// Stage six of the streaming path: expand the partial top-k to tokens.
+    fn expandSelected(
+        self: *const Attention,
+        args: *const IndexerArgs,
+    ) !void {
+        assert(args.rows > 0);
+        assert(args.shapes.blockTopk() > 0);
+
+        const shapes = args.shapes;
+        var partial = args.partial;
+        var positions = args.positions;
+        var selected = args.selected;
+        var rows: u32 = args.rows;
+        var slots: u32 = shapes.slots();
+        var ratio: u32 = shapes.compress_ratio;
+        var block_topk: u32 = shapes.blockTopk();
+        const arguments = [_]?*anyopaque{
+            @ptrCast(&partial),    @ptrCast(&positions), @ptrCast(&selected),
+            @ptrCast(&rows),       @ptrCast(&slots),     @ptrCast(&ratio),
+            @ptrCast(&block_topk),
+        };
+        try self.kernels.indexer_expand.launch(
+            .{ args.rows, 1, 1 },
+            .{ select_threads, 1, 1 },
             0,
             self.stream.handle,
             arguments[0..],
@@ -712,11 +878,73 @@ pub const Attention = struct {
     }
 
     /// Dense prefill attention over an explicitly gathered working set.
+    ///
+    /// The tensor-core path handles the model's head geometries; a shape it
+    /// cannot tile falls back to the warp-scalar kernel, which is the same
+    /// maths with the same masking.
     pub fn prefill(self: *const Attention, args: PrefillArgs) !void {
         assert(args.rows > 0);
         assert(args.count > 0);
         assert(args.count <= selected_slots_max);
         args.shapes.validate();
+
+        if (prefillUsesMma(args.shapes, args.rows)) {
+            try self.prefillMma(args);
+        } else {
+            try self.prefillScalar(args);
+        }
+    }
+
+    /// The tensor-core prefill: one CTA per (head, 16 query rows).
+    fn prefillMma(self: *const Attention, args: PrefillArgs) !void {
+        assert(prefillUsesMma(args.shapes, args.rows));
+        assert(prefill_mma_threads % 32 == 0);
+
+        const shapes = args.shapes;
+        var queries = args.queries;
+        var gathered_k = args.gathered_k;
+        var gathered_v = args.gathered_v;
+        var gather_index = args.gather_index;
+        var positions = args.positions;
+        var selection_mask: cuda_driver.DevicePtr = args.selection_mask orelse 0;
+        var out = args.out;
+        var rows: u32 = args.rows;
+        var heads: u32 = shapes.heads;
+        var kv_heads: u32 = shapes.kv_heads;
+        var head_dim: u32 = shapes.head_dim;
+        var count: u32 = args.count;
+        var scale: f32 = attentionScale(shapes);
+        var violations: cuda_driver.DevicePtr = args.violations orelse 0;
+        const arguments = [_]?*anyopaque{
+            @ptrCast(&queries),
+            @ptrCast(&gathered_k),
+            @ptrCast(&gathered_v),
+            @ptrCast(&gather_index),
+            @ptrCast(&positions),
+            @ptrCast(&selection_mask),
+            @ptrCast(&out),
+            @ptrCast(&rows),
+            @ptrCast(&heads),
+            @ptrCast(&kv_heads),
+            @ptrCast(&head_dim),
+            @ptrCast(&count),
+            @ptrCast(&scale),
+            @ptrCast(&violations),
+        };
+        const row_blocks = (args.rows + prefill_mma_rows - 1) / prefill_mma_rows;
+        try self.kernels.attn_prefill_mma.launch(
+            .{ shapes.heads, row_blocks, 1 },
+            .{ prefill_mma_threads, 1, 1 },
+            0,
+            self.stream.handle,
+            arguments[0..],
+        );
+    }
+
+    /// The warp-scalar prefill: one warp per query head, one row per block.
+    fn prefillScalar(self: *const Attention, args: PrefillArgs) !void {
+        assert(!prefillUsesMma(args.shapes, args.rows));
+        assert(prefill_warps > 0);
 
         const shapes = args.shapes;
         var queries = args.queries;
@@ -732,6 +960,7 @@ pub const Attention = struct {
         var count: u32 = args.count;
         var passes: u32 = shapes.lanePasses();
         var scale: f32 = attentionScale(shapes);
+        var selection_mask: cuda_driver.DevicePtr = args.selection_mask orelse 0;
         var violations: cuda_driver.DevicePtr = args.violations orelse 0;
         const arguments = [_]?*anyopaque{
             @ptrCast(&queries),
@@ -747,6 +976,7 @@ pub const Attention = struct {
             @ptrCast(&count),
             @ptrCast(&passes),
             @ptrCast(&scale),
+            @ptrCast(&selection_mask),
             @ptrCast(&violations),
         };
         const columns = (shapes.heads + prefill_warps - 1) / prefill_warps;
@@ -810,6 +1040,19 @@ pub fn attentionScale(shapes: Shapes) f32 {
     assert(shapes.head_dim <= 1 << 20);
 
     return 1.0 / @sqrt(@as(f32, @floatFromInt(shapes.head_dim)));
+}
+
+/// Whether `prefill` can take the tensor-core path for `shapes` and `rows`: the
+/// head dim must split into 32 dims per warp, the V tile must fit, and the
+/// launch must be wide enough to fill the 16-row m-tile.
+pub fn prefillUsesMma(shapes: Shapes, rows: u32) bool {
+    assert(shapes.head_dim > 0);
+    assert(shapes.kv_heads > 0);
+    assert(rows > 0);
+
+    return shapes.head_dim % 32 == 0 and
+        shapes.head_dim <= prefill_mma_head_dim_max and
+        rows >= prefill_mma_min_rows;
 }
 
 /// Host-side tripwire for the indexer's causal guarantee (issue I-008 §1a).
@@ -1714,7 +1957,12 @@ fn runIndexer(
     const pooled = try harness.allocate(
         @as(u64, blocks) * shapes.index_dim * 2 + 4,
     );
-    const scores = try harness.allocate(@as(u64, input.rows) * blocks * 4 + 4);
+    const scores = try harness.allocate(
+        Attention.indexerScoreBytes(input.rows, blocks) + 4,
+    );
+    const partial = try harness.allocate(
+        Attention.indexerPartialBytes(input.rows, shapes),
+    );
     const queries_pointer = try harness.allocate(
         @as(u64, input.rows) * shapes.index_heads * shapes.index_dim * 2,
     );
@@ -1731,6 +1979,7 @@ fn runIndexer(
         .index_keys = try harness.uploadBf16(input.index_keys),
         .pooled = pooled,
         .scores = scores,
+        .partial = partial,
         .selected = selected_device,
         .positions = try harness.uploadI32(encoded),
         .cos = try harness.uploadF32(input.cos),
@@ -1753,7 +2002,18 @@ fn runIndexer(
         out.* = args;
     }
     if (scores_out) |out| {
-        try harness.downloadF32(scores, out);
+        // The device score buffer is one fixed group wide, so a row's scores
+        // are `score_group_blocks` apart even when the last group is shorter.
+        const capacity = score_group_blocks;
+        const first = if (blocks == 0) 0 else ((blocks - 1) / capacity) * capacity;
+        const used = blocks - first;
+        assert(out.len == @as(usize, input.rows) * used);
+        for (0..input.rows) |row| {
+            try harness.downloadF32(
+                scores + @as(u64, row) * capacity * 4,
+                out[row * used ..][0..used],
+            );
+        }
     }
 }
 
@@ -1778,6 +2038,7 @@ const IndexerSession = struct {
     projected: cuda_driver.DevicePtr,
     pooled: cuda_driver.DevicePtr,
     scores: cuda_driver.DevicePtr,
+    partial: cuda_driver.DevicePtr,
     queries: cuda_driver.DevicePtr,
     selected: cuda_driver.DevicePtr,
 
@@ -1811,7 +2072,12 @@ const IndexerSession = struct {
             .pooled = try harness.allocate(
                 @as(u64, blocks) * shapes.index_dim * 2,
             ),
-            .scores = try harness.allocate(@as(u64, rows) * blocks * 4),
+            .scores = try harness.allocate(
+                Attention.indexerScoreBytes(rows, blocks),
+            ),
+            .partial = try harness.allocate(
+                Attention.indexerPartialBytes(rows, shapes),
+            ),
             .queries = try harness.allocate(@as(u64, rows) * shapes.index_heads * shapes.index_dim * 2),
             .selected = try harness.allocate(@as(u64, rows) * shapes.slots() * 4),
         };
@@ -1848,6 +2114,7 @@ const IndexerSession = struct {
             .index_keys = self.index_keys,
             .pooled = self.pooled,
             .scores = self.scores,
+            .partial = self.partial,
             .selected = self.selected,
             .positions = try self.harness.uploadI32(encoded),
             .cos = self.cos,
@@ -2287,44 +2554,58 @@ const RandomIndexer = struct {
 };
 
 /// Prints the largest block-score difference between the kernel and the
-/// oracle. The selection is the gate; this only shows how much headroom the
-/// arithmetic has.
+/// oracle for the last streaming group. The selection is the gate; this only
+/// shows how much headroom the arithmetic has, and the score buffer only holds
+/// one group, so the comparison is over the group the wrapper scored last.
 fn reportScoreDifference(
     actual: []const f32,
     expected: []const f32,
     positions: []const u32,
     blocks: u32,
+    used: u32,
+    first_block: u32,
     ratio: u32,
 ) void {
-    assert(actual.len == expected.len);
+    assert(actual.len == @as(usize, @intCast(used)) * positions.len);
+    assert(expected.len >= @as(usize, @intCast(blocks)) * positions.len);
     assert(positions.len > 0);
     assert(ratio > 0);
+    assert(used <= blocks);
+    assert(first_block + used == blocks);
 
     var largest: f32 = 0.0;
     var row_of_largest: usize = 0;
     var block_of_largest: usize = 0;
     for (positions, 0..) |position, row| {
         const visible_blocks = (position + 1) / ratio;
-        for (0..visible_blocks) |block| {
-            const index = row * blocks + block;
-            const delta = @abs(actual[index] - expected[index]);
+        const in_group = if (visible_blocks > first_block)
+            @min(visible_blocks - first_block, used)
+        else
+            0;
+        for (0..in_group) |local| {
+            const index = row * used + local;
+            const expected_index = row * blocks + first_block + local;
+            const delta = @abs(actual[index] - expected[expected_index]);
             if (delta > largest) {
                 largest = delta;
                 row_of_largest = row;
-                block_of_largest = block;
+                block_of_largest = first_block + local;
             }
         }
     }
-    const index = row_of_largest * blocks + block_of_largest;
+    const local = block_of_largest - first_block;
+    const index = row_of_largest * used + local;
+    const expected_index = row_of_largest * blocks + block_of_largest;
     std.debug.print(
-        "indexer block scores: max_abs_diff {e:.3} at row {d} block {d} " ++
-            "(kernel {e:.4} oracle {e:.4})\n",
+        "indexer block scores (last {d}-block group): max_abs_diff {e:.3} " ++
+            "at row {d} block {d} (kernel {e:.4} oracle {e:.4})\n",
         .{
+            used,
             largest,
             row_of_largest,
             block_of_largest,
             actual[index],
-            expected[index],
+            expected[expected_index],
         },
     );
 }
@@ -2357,7 +2638,9 @@ fn checkIndexerSelection(
     const selected = try allocator.alloc(i32, @as(usize, rows) * shapes.slots());
     defer allocator.free(selected);
     const blocks = arena_length / shapes.compress_ratio;
-    const scores = try allocator.alloc(f32, @as(usize, rows) * blocks);
+    const first = if (blocks == 0) 0 else ((blocks - 1) / score_group_blocks) * score_group_blocks;
+    const used = blocks - first;
+    const scores = try allocator.alloc(f32, @as(usize, rows) * used);
     defer allocator.free(scores);
     const pooled_count = @as(usize, blocks) * shapes.index_dim;
     const query_count = @as(usize, rows) * shapes.index_heads * shapes.index_dim;
@@ -2385,6 +2668,8 @@ fn checkIndexerSelection(
         oracle_scores,
         random.positions,
         blocks,
+        used,
+        first,
         shapes.compress_ratio,
     );
     const kernel_pooled = probe[0..pooled_count];
@@ -2919,12 +3204,12 @@ fn reportDecodeLatency(
     try std.testing.expect(micros > 0.0);
 }
 
-/// Times a multi-row prefill of `case`.
+/// Times a multi-row prefill of `case` and returns the microseconds per launch.
 fn reportPrefillLatency(
     harness: *Harness,
     shapes: Shapes,
     case: AttentionCase,
-) !void {
+) !f64 {
     assert(case.rows() > 1);
     assert(shapes.heads > 0);
 
@@ -2947,11 +3232,20 @@ fn reportPrefillLatency(
         .shapes = shapes,
     };
     const micros = try measure(harness, PrefillDriver{ .args = args });
+    const per_token = micros / @as(f64, @floatFromInt(args.rows));
     std.debug.print(
-        "attn_prefill count={d} rows={d}: {d:.1} us per launch\n",
-        .{ args.count, args.rows, micros },
+        "attn_prefill count={d} rows={d}: {d:.1} us per launch = " ++
+            "{d:.2} us/token/layer{s}\n",
+        .{
+            args.count,
+            args.rows,
+            micros,
+            per_token,
+            if (prefillUsesMma(shapes, args.rows)) "" else " (warp-scalar)",
+        },
     );
     try std.testing.expect(micros > 0.0);
+    return micros;
 }
 
 test "the indexed attention layer matches the HF golden" {
@@ -3917,31 +4211,48 @@ const AppendDriver = struct {
 /// The per-block score stage alone, so the cost report can name it.
 const BlockScoreDriver = struct {
     args: IndexerArgs,
-    blocks: u32,
+    first: u32,
+    count: u32,
+    capacity: u32,
 
     fn run(self: BlockScoreDriver, harness: *Harness) !void {
-        assert(self.blocks > 0);
+        assert(self.count > 0);
         assert(self.args.rows > 0);
-        try harness.attention.scoreBlocks(&self.args, self.blocks);
+        try harness.attention.scoreBlocks(
+            &self.args,
+            self.first,
+            self.count,
+            self.capacity,
+        );
     }
 };
 
-/// The selection stage alone, so the cost report can name it.
-const SelectDriver = struct {
+/// One group's top-k merge, so the cost report can name it.
+const GroupTopkDriver = struct {
     args: IndexerArgs,
-    blocks: u32,
+    first: u32,
+    count: u32,
+    capacity: u32,
 
-    fn run(self: SelectDriver, harness: *Harness) !void {
-        assert(self.blocks > 0);
+    fn run(self: GroupTopkDriver, harness: *Harness) !void {
+        assert(self.count > 0);
         assert(self.args.rows > 0);
-        try harness.attention.select(
-            self.args.scores,
-            self.args.positions,
-            self.args.selected,
-            self.args.rows,
-            self.blocks,
-            self.args.shapes,
+        try harness.attention.groupTopk(
+            &self.args,
+            self.first,
+            self.count,
+            self.capacity,
         );
+    }
+};
+
+/// The final expansion of the partial top-k into the token list.
+const ExpandDriver = struct {
+    args: IndexerArgs,
+
+    fn run(self: ExpandDriver, harness: *Harness) !void {
+        assert(self.args.rows > 0);
+        try harness.attention.expandSelected(&self.args);
     }
 };
 
@@ -4083,25 +4394,45 @@ const indexed_attention_layers: u32 = 12;
 /// divides that to 0.118 ms/token, but it makes the indexer a distributed
 /// concern and so belongs to I-014 (TP/EP).
 ///
-/// The tree is at 2.95 ms, so this bound is a regression guard 10% above what it
-/// does today, not the target. `checkFullContextIndexerCost` prints the three
-/// stages that separate the two with their measured shares, and each has a named
-/// fix:
+/// The streaming score buffer (I-025) measured 3.18 ms/token with the score
+/// buffer flat at 32 KB per row, so this bound is the regression guard the
+/// issue permits: achieved + 10 %, 3 500 us/token, and not the 0.6 ms target.
+/// The gap and the remaining fix are reported by `checkFullContextIndexerCost`,
+/// which prints the three stages and their measured shares; each has a fix:
 ///
-/// * `indexer_select`, 103 us: one CTA scans 65 536 scores digit by digit at
-///   ~20 GB/s. The fix is a two-phase radix (per-CTA partial histograms and
-///   partial top-k merged by a second kernel) — total ordering must stay
-///   descending-score with ties to the higher block index, exactly as
-///   `torch.topk`, and the per-CTA counts have to sum to `block_topk` or the
-///   token list comes out short or padded. A first rewrite of this was attempted
-///   and produced wrong sets (set_difference 2824 of 16396), so it was reverted
-///   rather than landed half-debugged; the selection set-equality gates in this
-///   file are what caught it.
-/// * `indexer_project`, 70 us: one dependent bf16 load per element over a 5 KB
+/// * `indexer_select` (streaming), 121 us: two radix selects over 32 768-block
+///   groups plus the merge, still one CTA per row per group scanning the score
+///   row digit by digit at ~20 GB/s. The fix is a two-phase radix (per-CTA
+///   partial histograms and partial top-k merged by a second kernel) — total
+///   ordering must stay descending-score with ties to the higher block index,
+///   exactly as `torch.topk`; per-CTA counts have to sum to `block_topk` or the
+///   token list comes out short; and the boundary has to be narrowed from the
+///   merged candidate set, not per CTA. A previous attempt produced
+///   `set_difference 2824 of 16396`, so it was reverted rather than landed
+///   half-debugged; the selection set-equality gates in this file caught it.
+///   That parallel radix is item 5 of I-025 and is not in this pass.
+/// * `indexer_project`, 68 us: one dependent bf16 load per element over a 5 KB
 ///   strided weight row. The fix is the I-006a GEMM.
-/// * `indexer_block_scores`, 73 us (was 93 us before the CTA chunking): still
-///   latency-bound at one block in flight per warp.
-const indexer_micros_per_token_limit: f64 = 3_250.0;
+/// * `indexer_block_scores`, 76 us: still latency-bound at one block in flight
+///   per warp. The streaming split costs one extra launch pair per group, which
+///   is why the guard is set from the achieved number rather than the old 2.95
+///   ms floor.
+///
+/// The guard is the full +10 % and not a tighter number because run-to-run
+/// timing on this machine spreads by ~3 %: the probe bench runs concurrently
+/// with the core tests under `zig build test`, so a 2 % guard was inside the
+/// noise and failed a gate on one run of an unchanged tree.
+const indexer_micros_per_token_limit: f64 = 3_500.0;
+
+/// Prefill attention ceiling in microseconds per token per layer: the 5 000
+/// tok/s target's 200 us/token budget over the 12 indexed layers. The
+/// tensor-core path measured 4.83 us/token/layer at the production shape (256
+/// rows, 2 048 gathered keys), down from 36.6 for the warp-scalar kernel. This
+/// is the issue's gate itself, not an achieved + margin bound: the measured
+/// value is in microseconds, so a 5.10 us/token run has to fail. The bound is
+/// asserted only when a one-CTA calibration launch is clean; a contended device
+/// inflates every number and the measured value is printed either way.
+const prefill_micros_per_token_limit: f64 = 5.0;
 
 /// Cost of one one-CTA launch on an idle device. `compute-sanitizer` and a
 /// device shared with another lane both inflate every launch by an order of
@@ -4316,21 +4647,45 @@ fn checkFullContextIndexerCost(harness: *Harness) !void {
     // this is the projection, the append, the block scores and the selection.
     args.first_block = blocks;
     const micros = try measure(harness, IndexerDriver{ .args = args });
-    const scored = try measure(harness, BlockScoreDriver{ .args = args, .blocks = blocks });
-    const selected_micros = try measure(harness, SelectDriver{ .args = args, .blocks = blocks });
+    // One streaming group's score and merge, scaled by the group count: the
+    // wrapper launches one of each per group, so this is the stage's share of
+    // the whole call.
+    const capacity = @min(blocks, score_group_blocks);
+    const groups = (blocks + score_group_blocks - 1) / score_group_blocks;
+    const first = blocks - capacity;
+    const scored_group = try measure(harness, BlockScoreDriver{
+        .args = args,
+        .first = first,
+        .count = capacity,
+        .capacity = capacity,
+    });
+    const merged_group = try measure(harness, GroupTopkDriver{
+        .args = args,
+        .first = first,
+        .count = capacity,
+        .capacity = capacity,
+    });
+    const expanded = try measure(harness, ExpandDriver{ .args = args });
+    const scored = scored_group * @as(f64, @floatFromInt(groups));
+    const selected_micros = merged_group * @as(f64, @floatFromInt(groups)) +
+        expanded;
     assert(scored > 0.0);
     assert(selected_micros > 0.0);
     const per_token = micros * @as(f64, @floatFromInt(indexed_attention_layers));
     const cold_per_token = cold_micros *
         @as(f64, @floatFromInt(indexed_attention_layers));
     const fixed = micros - scored - selected_micros;
+    const score_bytes = Attention.indexerScoreBytes(args.rows, blocks);
     std.debug.print(
-        "indexer at {d} blocks: steady state {d:.1} us = block_scores {d:.1} + " ++
-            "select {d:.1} + project/norm/append {d:.1} ({d:.1} us/token " ++
-            "across {d} layers, limit {d:.0}); cold cache {d:.1} us " ++
-            "({d:.1} us/token, limit {d:.0})\n",
+        "indexer at {d} blocks ({d} groups of {d}): score buffer {d} B " ++
+            "flat; steady state {d:.1} us = block_scores {d:.1} + select {d:.1} + " ++
+            "project/norm/append {d:.1} ({d:.1} us/token across {d} layers, " ++
+            "limit {d:.0}); cold cache {d:.1} us ({d:.1} us/token, limit {d:.0})\n",
         .{
             blocks,
+            groups,
+            capacity,
+            score_bytes,
             micros,
             scored,
             selected_micros,
@@ -4424,6 +4779,359 @@ fn checkLongContextSelection(
         0x51ce_0500,
     );
     defer freeAttentionCase(wide, harness.allocator);
-    try reportPrefillLatency(harness, shapes, wide);
+    const prefill_micros = try reportPrefillLatency(harness, shapes, wide);
+    const per_token = prefill_micros / @as(f64, @floatFromInt(wide.rows()));
+    const calibration = try measure(harness, AppendDriver{ .args = indexer_args });
+    if (calibration > timing_clean_micros_max) {
+        std.debug.print(
+            "prefill bound skipped: one launch costs {d:.1} us (clean " ++
+                "{d:.1} us), so the device is instrumented or contended\n",
+            .{ calibration, timing_clean_micros_max },
+        );
+    } else {
+        try std.testing.expect(per_token <= prefill_micros_per_token_limit);
+    }
     try std.testing.expect(indexer_micros > 0.0);
+}
+
+/// Runs one union-gather case with a per-row selection bitmap and checks the
+/// output against the reference's per-row masked attention.
+///
+/// The gathered working set is a 2048-token arena; each row selects only a
+/// slice of it, so the bitmap is what makes the kernel compute this row's QSA
+/// rather than the union's. The same launch without a bitmap is the union
+/// baseline: it must differ, or the test would not be measuring the mask.
+fn checkRowSelectionExactness(
+    harness: *Harness,
+    shapes: Shapes,
+    rows: u32,
+    selected_per_row: u32,
+    seed: u64,
+) !void {
+    assert(rows > 0);
+    assert(selected_per_row > 0);
+    assert(selected_per_row <= shapes.budget);
+
+    const allocator = harness.allocator;
+    const count = shapes.budget;
+    const kv_dim = @as(usize, shapes.kv_heads) * shapes.head_dim;
+    const positions = try allocator.alloc(i32, rows);
+    defer allocator.free(positions);
+    const gather_index = try allocator.alloc(i32, count);
+    defer allocator.free(gather_index);
+    const gathered_k = try randomValues(
+        allocator,
+        @as(usize, count) * kv_dim,
+        seed,
+    );
+    defer allocator.free(gathered_k);
+    const gathered_v = try randomValues(
+        allocator,
+        @as(usize, count) * kv_dim,
+        seed + 1,
+    );
+    defer allocator.free(gathered_v);
+    const queries = try randomValues(
+        allocator,
+        @as(usize, rows) * shapes.heads * shapes.head_dim,
+        seed + 2,
+    );
+    defer allocator.free(queries);
+    roundTripBf16(gathered_k);
+    roundTripBf16(gathered_v);
+    roundTripBf16(queries);
+    for (gather_index, 0..) |*slot, index| slot.* = @intCast(index);
+    @memset(positions, @intCast(count - 1));
+
+    // Each row selects a deterministic stride through the union; the union over
+    // the chunk covers it. The bitmap is the one the engine would build from
+    // the indexer's per-row list.
+    const mask_words = (count + 31) / 32;
+    const mask = try allocator.alloc(u32, @as(usize, rows) * mask_words);
+    defer allocator.free(mask);
+    @memset(mask, 0);
+    const union_seen = try allocator.alloc(bool, count);
+    defer allocator.free(union_seen);
+    @memset(union_seen, false);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (0..rows) |row| {
+        var picked: u32 = 0;
+        while (picked < selected_per_row) {
+            const slot = random.uintLessThan(u32, count);
+            const word = row * mask_words + slot / 32;
+            const bit: u32 = @as(u32, 1) << @intCast(slot % 32);
+            if (mask[word] & bit != 0) {
+                continue;
+            }
+            mask[word] |= bit;
+            union_seen[slot] = true;
+            picked += 1;
+        }
+    }
+    var union_count: u32 = 0;
+    for (union_seen) |seen| {
+        if (seen) union_count += 1;
+    }
+
+    const device_mask = try harness.upload(std.mem.sliceAsBytes(mask));
+    const encoded_positions = try allocator.alloc(i32, rows);
+    defer allocator.free(encoded_positions);
+    for (positions, 0..) |position, row| encoded_positions[row] = position;
+    const row_elements = @as(usize, shapes.heads) * shapes.head_dim;
+    const device_out = try harness.allocate(@as(u64, queries.len) * 2);
+    try harness.attention.prefill(.{
+        .queries = try harness.uploadBf16(queries),
+        .gathered_k = try harness.uploadBf16(gathered_k),
+        .gathered_v = try harness.uploadBf16(gathered_v),
+        .gather_index = try harness.uploadI32(gather_index),
+        .positions = try harness.uploadI32(encoded_positions),
+        .out = device_out,
+        .violations = null,
+        .selection_mask = device_mask,
+        .rows = rows,
+        .count = count,
+        .shapes = shapes,
+    });
+    const actual = try allocator.alloc(f32, queries.len);
+    defer allocator.free(actual);
+    try harness.downloadBf16(device_out, actual);
+
+    // Reference: each row's own masked softmax over the selected slots.
+    const expected = try allocator.alloc(f32, queries.len);
+    defer allocator.free(expected);
+    const sub_k = try allocator.alloc(f32, @as(usize, selected_per_row) * kv_dim);
+    defer allocator.free(sub_k);
+    const sub_v = try allocator.alloc(f32, @as(usize, selected_per_row) * kv_dim);
+    defer allocator.free(sub_v);
+    const sub_index = try allocator.alloc(i32, selected_per_row);
+    defer allocator.free(sub_index);
+    for (0..rows) |row| {
+        var written: u32 = 0;
+        for (0..count) |slot| {
+            const word = row * mask_words + slot / 32;
+            if (((mask[word] >> @as(u5, @intCast(slot % 32))) & 1) == 0) {
+                continue;
+            }
+            @memcpy(
+                sub_k[written * kv_dim ..][0..kv_dim],
+                gathered_k[slot * kv_dim ..][0..kv_dim],
+            );
+            @memcpy(
+                sub_v[written * kv_dim ..][0..kv_dim],
+                gathered_v[slot * kv_dim ..][0..kv_dim],
+            );
+            sub_index[written] = @intCast(slot);
+            written += 1;
+        }
+        try std.testing.expectEqual(selected_per_row, written);
+        const query = queries[row * row_elements ..][0..row_elements];
+        try attendOracle(
+            allocator,
+            query,
+            sub_k,
+            sub_v,
+            sub_index,
+            @as([]const u32, &.{count - 1}),
+            expected[row * row_elements ..][0..row_elements],
+            shapes,
+        );
+    }
+    std.debug.print(
+        "row mask rows={d} union={d} budget={d} union/budget {d:.3} " ++
+            "selected/row={d}\n",
+        .{
+            rows,
+            union_count,
+            shapes.budget,
+            @as(f64, @floatFromInt(union_count)) /
+                @as(f64, @floatFromInt(shapes.budget)),
+            selected_per_row,
+        },
+    );
+    try reportError("row mask prefill vs per-row oracle", actual, expected, 4.0e-3);
+
+    // The union baseline, with no mask: it must differ, otherwise the bitmap
+    // changed nothing and this test is vacuous.
+    const union_out = try harness.allocate(@as(u64, queries.len) * 2);
+    try harness.attention.prefill(.{
+        .queries = try harness.uploadBf16(queries),
+        .gathered_k = try harness.uploadBf16(gathered_k),
+        .gathered_v = try harness.uploadBf16(gathered_v),
+        .gather_index = try harness.uploadI32(gather_index),
+        .positions = try harness.uploadI32(encoded_positions),
+        .out = union_out,
+        .violations = null,
+        .rows = rows,
+        .count = count,
+        .shapes = shapes,
+    });
+    const union_actual = try allocator.alloc(f32, queries.len);
+    defer allocator.free(union_actual);
+    try harness.downloadBf16(union_out, union_actual);
+    var largest: f32 = 0.0;
+    for (union_actual, actual) |got, want| {
+        largest = @max(largest, @abs(got - want));
+    }
+    std.debug.print(
+        "row mask: union-only differs by max_abs {e:.3} (must be nonzero)\n",
+        .{largest},
+    );
+    try std.testing.expect(largest > 4.0e-3);
+}
+
+/// The indexer's selection at multiple row counts, against
+/// `src/ref/attention.zig` itself with `PooledDtype.cache_dtype`: the reference
+/// runs on the same bf16 index keys, bf16 roped queries and bf16 pooled block
+/// keys the kernels store, so the two selections have to agree exactly.
+fn checkSelectionAgainstReferenceRows(
+    harness: *Harness,
+    shapes: Shapes,
+    rows: u32,
+    in_features: u32,
+    seed: u64,
+) !void {
+    assert(rows > 0);
+    assert(in_features > 0);
+
+    const allocator = harness.allocator;
+    const arena: u32 = 4096;
+    shapes.validate();
+    const config = realConfig(in_features, arena);
+    var random = try RandomIndexer.make(
+        harness,
+        shapes,
+        arena,
+        rows,
+        in_features,
+        seed,
+    );
+    defer random.deinit(allocator);
+    const weights = reference_attention.Weights{
+        .q_proj = &[_]f32{},
+        .k_proj = &[_]f32{},
+        .v_proj = &[_]f32{},
+        .o_proj = &[_]f32{},
+        .q_norm = &[_]f32{},
+        .k_norm = &[_]f32{},
+        .index_qk_proj = random.weight,
+        .q_layernorm = random.q_layernorm,
+        .k_layernorm = random.k_layernorm,
+    };
+    var state = try reference_attention.State.init(allocator, &config, arena);
+    defer state.deinit(allocator);
+    var scratch = try reference_attention.Scratch.init(allocator, &config, arena);
+    defer scratch.deinit(allocator);
+    const first = random.positions[0];
+    @memcpy(
+        state.index_key[0 .. @as(usize, first) * shapes.index_dim],
+        random.index_keys[0 .. @as(usize, first) * shapes.index_dim],
+    );
+    state.length = first;
+    reference_attention.forward_indexer(
+        random.hidden,
+        rows,
+        random.positions,
+        &weights,
+        &state,
+        &scratch,
+        .{ .cos = random.cos, .sin = random.sin },
+        &config,
+    );
+    // The kernels store the caches and the queries as bf16; round the
+    // reference's copies outside its code so both sides select from the same
+    // storage (review-gate §5), then re-select with the cache dtype.
+    roundTripBf16(state.index_key);
+    roundTripBf16(scratch.index_query);
+    reference_attention.forward_select(
+        rows,
+        random.positions,
+        &weights,
+        &state,
+        &scratch,
+        .{ .cos = random.cos, .sin = random.sin },
+        &config,
+        .cache_dtype,
+    );
+    const count = @as(usize, rows) * shapes.slots();
+    const expected = try allocator.alloc(i32, count);
+    defer allocator.free(expected);
+    @memcpy(expected, scratch.selected[0..count]);
+    const selected = try allocator.alloc(i32, count);
+    defer allocator.free(selected);
+    try runIndexer(harness, random.view(), selected, null, null, null, null);
+    var label: [96]u8 = undefined;
+    try expectSelection(
+        try std.fmt.bufPrint(&label, "indexer selection vs reference, rows={d}", .{rows}),
+        selected,
+        expected,
+    );
+}
+
+test "the indexer selection matches the reference at rows above one" {
+    var harness = try Harness.open(std.testing.allocator);
+    defer harness.deinit();
+
+    for ([_]u32{ 1, 64, 256 }) |rows| {
+        try checkSelectionAgainstReferenceRows(
+            &harness,
+            Shapes.real,
+            rows,
+            256,
+            0x51ce_1000 + rows,
+        );
+    }
+}
+
+test "the per-row bitmap makes prefill exactly QSA at rows above one" {
+    var harness = try Harness.open(std.testing.allocator);
+    defer harness.deinit();
+
+    // Real head geometry and the real budget, so the union/budget ratio is the
+    // production one; each row keeps a 64-token slice of the 2048-token union.
+    for ([_]u32{ 1, 64, 256 }) |rows| {
+        try checkRowSelectionExactness(&harness, Shapes.real, rows, 64, 0x51ce_0e00 + rows);
+    }
+}
+
+/// The contexts the score-buffer gate reports: 4 K, 32 K and the model limit.
+const score_buffer_contexts = [_]u32{ 4096, 32_768, 262_144 };
+
+test "the indexer score buffer stays flat as the context grows" {
+    var harness = try Harness.open(std.testing.allocator);
+    defer harness.deinit();
+
+    // The buffer is a fixed row chunk by a fixed block group, so its bytes are
+    // the same at every context. The old shape was `rows * blocks * 4`, which
+    // at 4096 rows and 256 K is the 1.07 GB the issue opens with.
+    var previous: u64 = 0;
+    for (score_buffer_contexts) |context| {
+        const blocks = context / Shapes.real.compress_ratio;
+        const bytes = Attention.indexerScoreBytes(1, blocks);
+        const wide = Attention.indexerScoreBytes(indexer_row_chunk, blocks);
+        std.debug.print(
+            "indexer score buffer at {d} tokens ({d} blocks): {d} B for one " ++
+                "row, {d} B at {d} rows (old shape would be {d} B)\n",
+            .{
+                context,
+                blocks,
+                bytes,
+                wide,
+                indexer_row_chunk,
+                @as(u64, indexer_row_chunk) * blocks * 4,
+            },
+        );
+        if (previous != 0) {
+            try std.testing.expectEqual(previous, bytes);
+        }
+        previous = bytes;
+        try std.testing.expectEqual(
+            @as(u64, indexer_row_chunk) * score_group_blocks * 4,
+            wide,
+        );
+    }
+
+    // And the streaming path is exact across groups: 163 840 tokens is two
+    // 32 768-block groups, so the merge really runs.
+    try checkIndexerSelection(&harness, Shapes.real, 163_840, 3, 2560, 0x51ce_0f00);
 }
