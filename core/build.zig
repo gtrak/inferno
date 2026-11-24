@@ -241,6 +241,10 @@ pub fn build(b: *std.Build) !void {
     const run_probe_tests = b.addRunArtifact(probe_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    // Both binaries bring up a CUDA context on device 0. With no edge between them Zig
+    // runs them concurrently, and a reviewer measured 2 of 5 `zig build test` runs failing
+    // at different GPU tests as a result. Serialise: probe waits for core.
+    run_probe_tests.step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_probe_tests.step);
 
