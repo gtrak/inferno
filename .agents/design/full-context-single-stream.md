@@ -110,7 +110,8 @@ But QSA changes the working set, and this is the key insight:
 | per-(layer, token) K+V, fp8 | 1,024 B |
 | **worst-case KV actually read per decode step** | 12 layers × 2048 × 1 KB = **25.2 MB** |
 | that at 28.9 GB/s of measured host bandwidth | **0.87 ms/token** |
-| pooled indexer keys at 256 K (one per 4-token block) | **8.4 MB — stays resident in VRAM** |
+| pooled indexer keys at 256 K, **bf16**, per layer | **16.8 MB** (f32: 33.6 MB) |
+| all 12 layers' pooled keys read per token | **201 MB bf16 / 403 MB f32** = 0.112 / 0.225 ms |
 | hot window of 32 K context in VRAM (fp8) | 0.40 GB |
 | **VRAM freed vs fully-resident 256 K** | **2.82 GB** |
 
@@ -151,3 +152,29 @@ because the indexer caps attention at 2,048 selected keys and selection is
   per token ≈ 2.2 ms at 28.9 GB/s, against a ~2.8 ms HBM floor — i.e. decode remains
   HBM-bound at max context, which is exactly where we want it.
 - Consequence for I-008 (in flight): attention takes a gather list, not an arena.
+
+## 8. Correction: the pooled-key re-read dominates long-context state traffic
+
+An earlier note in this file said fp32 pooled keys would cost ~7 ms/token. That was
+wrong — it applied DRAM bandwidth to a buffer that is VRAM-resident. Measured
+arithmetic at 256 K:
+
+| item | per token |
+|---|---:|
+| pooled indexer keys, 12 layers, **bf16** | 201 MB → 0.112 ms |
+| pooled indexer keys, 12 layers, f32 | 403 MB → 0.225 ms |
+| **selected KV working set (the §7 gather)** | **25 MB → 0.87 ms of *host* bandwidth** |
+
+So at long context the **indexer's pooled-key re-read (201 MB) is 8× larger than the
+KV working set (25 MB)** — the indexer, not the KV gather, is the dominant per-token
+*state* cost. It is cheap (0.112 ms) only because it is VRAM-resident and therefore
+runs at HBM speed rather than host speed; that is precisely why pooled keys must stay
+in VRAM and why they must stay **bf16**.
+
+bf16 is also the *faithful* choice: the reference pools in f32 and casts to
+`raw_keys.dtype`, which in the real bf16 model is bf16. Our f32 CPU oracle is the less
+faithful of the two, so the observed 0.1 % selection drift is an oracle artifact.
+
+Indexer compute is trivial at any context (0.067 GFLOP per layer per query at 256 K ⇒
+0.36 µs at the measured fp8 rate), so a correct `indexer_scores` is memory-bound at
+~0.11 ms/token across 12 layers. Gate: ≤0.35 ms/token at the 256 K block count.
