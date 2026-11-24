@@ -156,7 +156,7 @@ pub fn forward(
 }
 
 /// Softmaxes the router logits and keeps the top-k probabilities.
-fn forward_route(
+pub fn forward_route(
     input: []const f32,
     tokens: u32,
     weights: *const Weights,
@@ -241,7 +241,7 @@ fn topk_descending(
 }
 
 /// Accumulates the routed experts in expert order, as the reference does.
-fn forward_experts(
+pub fn forward_experts(
     input: []const f32,
     tokens: u32,
     weights: *const Weights,
@@ -337,7 +337,7 @@ fn forward_expert(
 }
 
 /// The shared expert, gated by `sigmoid(shared_expert_gate(x))`.
-fn forward_shared(
+pub fn forward_shared(
     input: []const f32,
     tokens: u32,
     weights: *const Weights,
