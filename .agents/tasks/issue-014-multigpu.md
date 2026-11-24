@@ -55,3 +55,28 @@ bash tools/gate.sh ; echo EXIT=$?
 ## Report format
 Implemented / Changed files / Validation (equality with I-013, comms numbers) /
 Open risks / Recommended next step.
+
+## Status — PARTIAL, amended 2026-11-24
+
+**Delivered and accepted (plumbing pass):** `core/src/mem/placement.zig` (993 lines, 15 tests)
+and `core/src/model/multi.zig` (1,442 lines, 13 tests) — per-rank placement from measured VRAM,
+the refusal path, the host-DRAM expert tier with two-tier LRU, and prefetch double-buffering
+with two pinned staging slabs and per-slot CUDA events. The prefetch was found to race (an async
+copy could have its source slab refilled underneath it) and is fixed, pinned by a `>=2`-move GPU
+round-trip test that fails on the old code with concrete evidence. Gate: `tools/gate.sh` EXIT=0,
+`zig build test` 210/210.
+
+**Carried forward to `.agents/tasks/issue-014b-multigpu-forward.md`:**
+- item 2, the 4-rank forward pass with per-layer `cuMemcpyPeerAsync` on dedicated streams
+- gate 1, 16-token greedy equality against I-013
+- gate 2, the comms bench with its real `<= 1.5 ms` per-token assert
+
+**Why it is a dependency and not a preference:** item 2 needs `model/exec.zig`, which existed
+only in slot-1's worktree for I-013 and was not in main when this lane ran. Writing the forward
+against a file outside the graph produces code that compiles in the worktree and breaks on
+`main`. I-014b is therefore blocked on I-013 merging, and its comms assert on a quiet box.
+
+**Measured numbers this lane produced, which are load-bearing for the budget:** KV 3 GiB per rank
+at 256 K (12.00 GiB replicated x4); QSA tail 25,165,824 B of KV read per token; 4,499 expert
+slabs hot at the full-card upper bound and 4,388 on measured rank-0 free VRAM.
+**No throughput claim is made anywhere in this lane.**
