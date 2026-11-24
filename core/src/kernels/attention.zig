@@ -37,7 +37,18 @@ const cubin_name = "attention";
 const prefill_warps: u32 = 4;
 
 /// Warps one decode block spreads the selection over.
-const decode_warps: u32 = 8;
+const decode_warps: u32 = 32;
+
+/// bf16 dims one decode lane covers with one 16-byte load.
+const decode_dims_per_lane: u32 = 8;
+
+/// Dims one decode warp pass covers: the warp's lanes times eight dims.
+const decode_dims_per_pass: u32 = 32 * decode_dims_per_lane;
+
+/// Passes the decode kernel unrolls; mirrors `decode_passes_max`, which is the
+/// `lane_passes_max * dims_per_warp_pass` head-dim bound in the wider layout.
+const decode_passes_max: u32 =
+    lane_passes_max * dims_per_warp_pass / decode_dims_per_pass;
 
 /// Query rows one tensor-core prefill block attends to; mirrors `mma_rows` in
 /// the device file.
@@ -64,7 +75,7 @@ const index_threads: u32 = 128;
 const scores_per_cta: u32 = 16;
 
 /// Threads per selection block.
-const select_threads: u32 = 512;
+const select_threads: u32 = 1024;
 
 /// Selected slots the decode kernel holds in shared memory.
 const selected_slots_max: u32 = 2064;
@@ -183,6 +194,14 @@ pub const Shapes = struct {
         return (self.head_dim + dims_per_warp_pass - 1) / dims_per_warp_pass;
     }
 
+    /// Passes one decode warp takes over a head's dims: each covers 256 of them.
+    pub fn decodePasses(self: Shapes) u32 {
+        assert(self.head_dim > 0);
+        assert(self.head_dim % 2 == 0);
+
+        return (self.head_dim + decode_dims_per_pass - 1) / decode_dims_per_pass;
+    }
+
     /// Rejects shapes the kernels cannot launch.
     pub fn validate(self: Shapes) void {
         assert(self.heads > 0);
@@ -190,6 +209,7 @@ pub const Shapes = struct {
         assert(self.head_dim > 0);
         assert(self.head_dim % 2 == 0);
         assert(self.lanePasses() <= lane_passes_max);
+        assert(self.decodePasses() <= decode_passes_max);
         assert(self.index_heads > 0);
         assert(self.index_heads <= index_heads_max);
         assert(self.index_dim > 0);
@@ -1006,7 +1026,7 @@ pub const Attention = struct {
         var heads: u32 = shapes.heads;
         var kv_heads: u32 = shapes.kv_heads;
         var head_dim: u32 = shapes.head_dim;
-        var passes: u32 = shapes.lanePasses();
+        var passes: u32 = shapes.decodePasses();
         var scale: f32 = attentionScale(shapes);
         var violations: cuda_driver.DevicePtr = args.violations orelse 0;
         const arguments = [_]?*anyopaque{
@@ -3177,9 +3197,24 @@ fn decodeArgs(
     };
 }
 
-/// Times `attn_decode` for the single query of `case`. The 300 us/launch
-/// target of the issue is reported, not enforced: the number moves with
-/// whatever else is running on the GPU.
+/// Ceiling on one `attn_decode` launch over the QSA-bounded working set.
+///
+/// The measurement the issue was opened on was 195.8 us/launch. The kernel it
+/// described spent ~130 cycles of dependent warp shuffles and a shared-memory
+/// round trip per selected row with eight warps of a single CTA, so the bound
+/// below fails it by a wide margin while leaving room on a contended device:
+/// this machine measures 50 us with the working set at 2048 keys plus the
+/// incomplete block. `300 us` was the issue's aspiration; 120 us is the
+/// regression lock, because a bound nobody has seen fail proves nothing.
+const decode_micros_limit: f64 = 120.0;
+
+/// Times `attn_decode` for the single query of `case` and, when the working set
+/// is the QSA budget, holds it under `decode_micros_limit`.
+///
+/// The per-launch number moves with whatever else is on the GPU, so the bound is
+/// asserted, not the exact value; the count and the position are printed
+/// because the working set and the causal horizon are what the time should
+/// depend on.
 fn reportDecodeLatency(
     harness: *Harness,
     shapes: Shapes,
@@ -3192,16 +3227,18 @@ fn reportDecodeLatency(
     const micros = try measure(harness, DecodeDriver{ .args = args });
     std.debug.print(
         "attn_decode count={d} pos={d}: {d:.1} us per launch " ++
-            "(median of {d} samples of {d})\n",
+            "({d:.1} ns/key, median of {d} samples of {d})\n",
         .{
             args.count,
             args.position,
             micros,
+            micros * 1000.0 / @as(f64, @floatFromInt(args.count)),
             timing_samples,
             timing_launches_per_sample,
         },
     );
     try std.testing.expect(micros > 0.0);
+    try std.testing.expect(micros <= decode_micros_limit);
 }
 
 /// Times a multi-row prefill of `case` and returns the microseconds per launch.
@@ -4395,34 +4432,43 @@ const indexed_attention_layers: u32 = 12;
 /// concern and so belongs to I-014 (TP/EP).
 ///
 /// The streaming score buffer (I-025) measured 3.18 ms/token with the score
-/// buffer flat at 32 KB per row, so this bound is the regression guard the
-/// issue permits: achieved + 10 %, 3 500 us/token, and not the 0.6 ms target.
-/// The gap and the remaining fix are reported by `checkFullContextIndexerCost`,
-/// which prints the three stages and their measured shares; each has a fix:
+/// buffer flat at 32 KB per row. I-026 item 2 widened the selection CTA from 512
+/// to 1 024 threads — the radix scan of one 32 768-block group runs in a single
+/// CTA, so its thread count *is* its bandwidth — which took the selection from
+/// 121 us to 75 us and the whole indexer to 2.61 ms/token, below the 2.96 ms the
+/// pre-streaming shape cost. The guard is again achieved + 11 %.
 ///
-/// * `indexer_select` (streaming), 121 us: two radix selects over 32 768-block
-///   groups plus the merge, still one CTA per row per group scanning the score
-///   row digit by digit at ~20 GB/s. The fix is a two-phase radix (per-CTA
-///   partial histograms and partial top-k merged by a second kernel) — total
-///   ordering must stay descending-score with ties to the higher block index,
-///   exactly as `torch.topk`; per-CTA counts have to sum to `block_topk` or the
-///   token list comes out short; and the boundary has to be narrowed from the
-///   merged candidate set, not per CTA. A previous attempt produced
+/// What is left, and why it is not in this pass (`checkIndexerCost` prints the
+/// three stages and their measured shares at every context):
+///
+/// * `indexer_block_scores`, 76 us: O(blocks) by construction, not by accident.
+///   A decode step's indexer query is new, so `relu(q_h . pooled_block)` has to
+///   be recomputed for every visible block; there is no per-token incremental
+///   shortcut that keeps the selected set equal to the reference. It is split
+///   over 24 CTAs already, and it scales linearly with the block count.
+/// * `indexer_select` (streaming), 75 us: still one CTA per row per group
+///   scanning the score row digit by digit. The fix is a two-phase radix
+///   (per-CTA partial histograms and partial top-k merged by a second kernel) —
+///   total ordering must stay descending-score with ties to the higher block
+///   index, exactly as `torch.topk`; per-CTA counts have to sum to `block_topk`
+///   or the token list comes out short; and the boundary has to be narrowed from
+///   the merged candidate set, not per CTA. A previous attempt produced
 ///   `set_difference 2824 of 16396`, so it was reverted rather than landed
 ///   half-debugged; the selection set-equality gates in this file caught it.
 ///   That parallel radix is item 5 of I-025 and is not in this pass.
-/// * `indexer_project`, 68 us: one dependent bf16 load per element over a 5 KB
-///   strided weight row. The fix is the I-006a GEMM.
-/// * `indexer_block_scores`, 76 us: still latency-bound at one block in flight
-///   per warp. The streaming split costs one extra launch pair per group, which
-///   is why the guard is set from the achieved number rather than the old 2.95
-///   ms floor.
+/// * `indexer_project`, 68 us: the flat part of the cost, and at 4 096 tokens it
+///   is 77 % of the indexer step. It is memory-bound before it is anything else:
+///   the projection weight is 640 x 10 240 bf16 = 13.1 MB read per token, which
+///   at this card's bandwidth is ~29 us, and the kernel reaches 194 GB/s of it
+///   with one thread per output column over 10 240 dependent loads. The fix is
+///   the I-006a decode GEMV (split the contraction across CTAs and reduce), not
+///   a change to this launch.
 ///
-/// The guard is the full +10 % and not a tighter number because run-to-run
-/// timing on this machine spreads by ~3 %: the probe bench runs concurrently
-/// with the core tests under `zig build test`, so a 2 % guard was inside the
-/// noise and failed a gate on one run of an unchanged tree.
-const indexer_micros_per_token_limit: f64 = 3_500.0;
+/// The guard is +11 % and not tighter because run-to-run timing on this machine
+/// spreads by ~3 %: the probe bench runs concurrently with the core tests under
+/// `zig build test`, so a 2 % guard was inside the noise and failed a gate on one
+/// run of an unchanged tree.
+const indexer_micros_per_token_limit: f64 = 2_900.0;
 
 /// Prefill attention ceiling in microseconds per token per layer: the 5 000
 /// tok/s target's 200 us/token budget over the 12 indexed layers. The
@@ -4602,7 +4648,62 @@ test "the indexer holds its per-token budget at the context limit" {
     var harness = try Harness.open(std.testing.allocator);
     defer harness.deinit();
 
-    try checkFullContextIndexerCost(&harness);
+    try checkIndexerCost(&harness, full_context_tokens, 0x51ce_0a00);
+}
+
+test "attn_decode is flat across the context sweep (I-026 item 3)" {
+    var harness = try Harness.open(std.testing.allocator);
+    defer harness.deinit();
+
+    // The QSA selection caps a decode step at the budget, so the working set —
+    // and with it the cost — is fixed by construction: only the causal horizon
+    // moves. This measures that claim instead of assuming it, at the four
+    // contexts the issue asks about, and fails if the decode step ever starts
+    // reading a fraction of the context.
+    const shapes = Shapes.real;
+    const positions = [_]u32{ 4095, 32_767, 131_071, 262_143 };
+    var measured = [_]f64{0.0} ** positions.len;
+    for (positions, 0..) |position, index| {
+        const case = try makeAttentionCase(
+            std.testing.allocator,
+            shapes,
+            shapes.slots(),
+            1,
+            position,
+            0x51ce_0b00 + index,
+        );
+        defer freeAttentionCase(case, std.testing.allocator);
+        const args = try decodeArgs(&harness, shapes, case);
+        try std.testing.expectEqual(position, args.position);
+        measured[index] = try measure(&harness, DecodeDriver{ .args = args });
+        std.debug.print(
+            "attn_decode flatness pos={d} count={d}: {d:.2} us\n",
+            .{ position, args.count, measured[index] },
+        );
+    }
+    // Every context runs the same launch, so the spread is device noise; 25 %
+    // is loose enough for a contended card and tight enough to catch a working
+    // set that grew with the context (which would be a 64x move from 4K to 256K).
+    for (measured) |micros| {
+        try std.testing.expect(micros > 0.0);
+        try std.testing.expect(micros <= measured[0] * 1.25);
+        try std.testing.expect(micros >= measured[0] * 0.8);
+    }
+}
+
+test "the indexer per-token cost across the short contexts (I-026 item 3)" {
+    var harness = try Harness.open(std.testing.allocator);
+    defer harness.deinit();
+
+    // The contexts the issue asks for, minus the two already covered above
+    // (4096 tokens by the selection test, 262 144 by the context-limit test):
+    // the per-token cost has a fixed part (the projection, the norm and the
+    // append), an O(blocks) part (the block scores, which a decode step must
+    // recompute because its indexer query is new) and an O(block_topk) part
+    // (the selection and the merge), and this is where the split shows.
+    try checkIndexerCost(&harness, 4096, 0x51ce_0d00);
+    try checkIndexerCost(&harness, 32_768, 0x51ce_0d80);
+    try checkIndexerCost(&harness, 131_072, 0x51ce_0e00);
 }
 
 test "the indexer at 4096 selects about the budget and decode stays fast" {
@@ -4613,25 +4714,31 @@ test "the indexer at 4096 selects about the budget and decode stays fast" {
     try checkLongContextSelection(&harness, fixtures.allocator());
 }
 
-/// Times the six indexer stages at the context limit and checks the per-token
-/// cost of every indexed layer against `indexer_micros_per_token_limit`.
-fn checkFullContextIndexerCost(harness: *Harness) !void {
+/// Times the six indexer stages at `arena_length` tokens and checks the
+/// per-token cost of every indexed layer against the budget ceilings.
+///
+/// The score pass is O(blocks) by construction — a decode step's indexer query
+/// is new, so every visible pooled block has to be re-scored — while the
+/// selection is bounded by `block_topk` and the projection, norm and append are
+/// per token. Reporting the split at several contexts is what tells the two
+/// apart (I-026 item 3).
+fn checkIndexerCost(harness: *Harness, arena_length: u32, seed: u64) !void {
     assert(indexed_attention_layers > 0);
     assert(indexer_micros_per_token_limit > 0.0);
+    assert(arena_length > Shapes.real.budget);
 
     const shapes = Shapes.real;
-    const arena_length = full_context_tokens;
     const allocator = harness.allocator;
     shapes.validate();
     const blocks = arena_length / shapes.compress_ratio;
-    try std.testing.expectEqual(@as(u32, 65_536), blocks);
+    assert(blocks == arena_length / shapes.compress_ratio);
     var random = try RandomIndexer.make(
         harness,
         shapes,
         arena_length,
         1,
         2560,
-        0x51ce_0a00,
+        seed,
     );
     defer random.deinit(allocator);
     const selected = try allocator.alloc(i32, shapes.slots());

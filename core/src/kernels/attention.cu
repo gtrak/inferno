@@ -62,7 +62,18 @@ constexpr int dims_per_warp_pass = warp_size * pair_width;
 /// registers (the loops below are constant-bound so they never spill).
 constexpr int lane_passes_max = 8;
 
-constexpr int head_dim_max = dims_per_warp_pass * lane_passes_max;
+/// bf16 dims one lane of a decode warp holds per pass, and the dims that makes
+/// one pass: one 16-byte load per lane covers 256 dims of a key row.
+constexpr int decode_dims_per_lane = 8;
+constexpr int decode_dims_per_pass = warp_size * decode_dims_per_lane;
+
+/// Passes the decode kernel unrolls; the widest head it takes is
+/// `lane_passes_max * dims_per_warp_pass` = 512.
+constexpr int decode_passes_max =
+    lane_passes_max * dims_per_warp_pass / decode_dims_per_pass;
+
+static_assert(decode_passes_max * decode_dims_per_pass ==
+    lane_passes_max * dims_per_warp_pass, "decode passes must cover 512 dims");
 
 /// `budget + compress_ratio - 1` for the real model: 2048 + 4 - 1.
 constexpr int selected_slots_max = 2064;
@@ -71,7 +82,7 @@ constexpr int selected_slots_max = 2064;
 constexpr int prefill_warps = 4;
 
 /// Warps one decode block spreads the selection over.
-constexpr int decode_warps = 8;
+constexpr int decode_warps = 32;
 
 /// Radix-select histogram bins and passes: 8 passes of 8 bits over a u64 key,
 /// of which the first four are the score and the last four the block index.
@@ -144,6 +155,50 @@ __device__ __forceinline__ float2 load_bf16_pair(
     int dim) {
     return __bfloat1622float2(
         *reinterpret_cast<const __nv_bfloat162*>(base + dim));
+}
+
+/// Reads up to eight adjacent bf16 values as floats into `dims`, one 16-byte
+/// load when `vector_ok` and the eight dims fit, the rest zero-filled.
+///
+/// `vector_ok` is the caller's `head_dim % decode_dims_per_lane == 0`, which is
+/// what makes a 16-byte load at `base + dim` naturally aligned for every row
+/// and lane. Past the last full octet both sides of the dot are zero, so a
+/// padded lane contributes exactly nothing and never reads out of bounds.
+__device__ __forceinline__ void load_bf16_octet(
+    const __nv_bfloat16* base,
+    int dim,
+    int width,
+    bool vector_ok,
+    float* dims) {
+    if (vector_ok && dim + decode_dims_per_lane <= width) {
+        const uint4 packed = *reinterpret_cast<const uint4*>(base + dim);
+        const __nv_bfloat162 low =
+            *reinterpret_cast<const __nv_bfloat162*>(&packed.x);
+        const __nv_bfloat162 next =
+            *reinterpret_cast<const __nv_bfloat162*>(&packed.y);
+        const __nv_bfloat162 third =
+            *reinterpret_cast<const __nv_bfloat162*>(&packed.z);
+        const __nv_bfloat162 high =
+            *reinterpret_cast<const __nv_bfloat162*>(&packed.w);
+        const float2 a = __bfloat1622float2(low);
+        const float2 b = __bfloat1622float2(next);
+        const float2 c = __bfloat1622float2(third);
+        const float2 d = __bfloat1622float2(high);
+        dims[0] = a.x;
+        dims[1] = a.y;
+        dims[2] = b.x;
+        dims[3] = b.y;
+        dims[4] = c.x;
+        dims[5] = c.y;
+        dims[6] = d.x;
+        dims[7] = d.y;
+    } else {
+#pragma unroll
+        for (int index = 0; index < decode_dims_per_lane; ++index) {
+            const int at = dim + index;
+            dims[index] = at < width ? __bfloat162float(base[at]) : 0.0f;
+        }
+    }
 }
 
 /// Shared-memory address of `pointer`, the form `ldmatrix` takes.
@@ -235,6 +290,19 @@ __device__ __forceinline__ float warp_max(float value) {
     }
     largest = __shfl_sync(0xffffffffu, largest, 0);
     return largest;
+}
+
+/// Sum across the warp, authoritative on lane 0 only.
+///
+/// The decode kernel's score is consumed by lane 0 alone, so the broadcast the
+/// general `warp_sum` needs is one shuffle per key saved here.
+__device__ __forceinline__ float warp_sum_to_lane0(float value) {
+    float total = value;
+#pragma unroll
+    for (int offset = warp_size / 2; offset > 0; offset >>= 1) {
+        total += __shfl_down_sync(0xffffffffu, total, offset);
+    }
+    return total;
 }
 
 /// Largest value across the warp, then across the warps of one block.
@@ -1562,11 +1630,20 @@ extern "C" __global__ void __launch_bounds__(mma_threads) attn_prefill_mma(
 
 /// Dense single-token decode: one query head per block, `decode_warps` wide.
 ///
-/// Two passes over the dense working set: scores into shared memory (one warp
-/// per residue class of rows), a block-wide softmax, then the value
-/// accumulation split across warps and reduced per dim. At M=1 this keeps all
-/// 256 threads of the block busy instead of one warp per head, which is what
-/// the per-head latency target needs.
+/// Three phases over the dense working set: the query/key dot of every selected
+/// row into shared memory (warps split the rows), a block-wide softmax, and the
+/// value accumulation, also split by row, held in per-lane registers and reduced
+/// across the warps once. At M=1 the block has to supply the parallelism a
+/// tensor-core m-tile would have, so the launch is 32 warps wide and each lane
+/// covers eight dims of a row with a single 16-byte load (I-026 item 1: the
+/// previous 8-warp version paid 4 loads, a shared-memory round trip per value
+/// and the same serial shuffle chain per row, and measured 195 us/launch at the
+/// 2051-row working set).
+///
+/// The reduction is per pass, so the shared staging buffer covers one pass worth
+/// of dims (256) whatever the head dim is, and stays inside the 48 KB static
+/// budget. Summation order is fixed (warp ascending), so the result is
+/// reproducible run to run.
 extern "C" __global__ void attn_decode(
     const __nv_bfloat16* query,
     const __nv_bfloat16* gathered_k,
@@ -1582,68 +1659,90 @@ extern "C" __global__ void attn_decode(
     float scale,
     int* violations) {
     __shared__ float probabilities[selected_slots_max];
-    __shared__ float partials[decode_warps][head_dim_max];
+    __shared__ float staged[decode_warps * decode_dims_per_pass];
+    // `block_sum` and `block_max` publish one partial per warp, so the scratch
+    // is sized by the warp count and not by the warp width.
+    __shared__ float scratch[decode_warps];
 
     const int head = blockIdx.x;
     const int lane = threadIdx.x % warp_size;
     const int warp = threadIdx.x / warp_size;
-    if (head >= heads || count > selected_slots_max) {
+    const int warps = blockDim.x / warp_size;
+    if (head >= heads || count > selected_slots_max || warps == 0) {
         return;
     }
 
     const int group = heads / kv_heads;
     const int row_stride = kv_heads * head_dim;
     const int head_offset = (head / group) * head_dim;
+    const bool vector_ok = head_dim % decode_dims_per_lane == 0;
+    const int lane_dim_base = lane * decode_dims_per_lane;
     const __nv_bfloat16* query_row =
         query + static_cast<long long>(head) * head_dim;
-    float2 query_registers[lane_passes_max];
+
+    // The query octets live in registers for the whole launch.
+    float query_dims[decode_passes_max][decode_dims_per_lane];
 #pragma unroll
-    for (int pass = 0; pass < lane_passes_max; ++pass) {
-        query_registers[pass] = make_float2(0.0f, 0.0f);
-    }
-#pragma unroll
-    for (int pass = 0; pass < lane_passes_max; ++pass) {
+    for (int pass = 0; pass < decode_passes_max; ++pass) {
         if (pass < passes) {
-            const int dim = lane_dim(pass, lane);
-            if (dim + 1 < head_dim) {
-                query_registers[pass] = load_bf16_pair(query_row, dim);
+            load_bf16_octet(
+                query_row,
+                pass * decode_dims_per_pass + lane_dim_base,
+                head_dim,
+                vector_ok,
+                query_dims[pass]);
+        } else {
+#pragma unroll
+            for (int index = 0; index < decode_dims_per_lane; ++index) {
+                query_dims[pass][index] = 0.0f;
             }
         }
     }
 
-    // Pass one: one warp per residue class of the dense working set. A row past
+    // Phase one: one warp per residue class of the dense working set. A row past
     // the query is scored as masked instead of skipped, so the softmax below
-    // stays a single dense pass.
+    // stays a single dense pass. The row pointers advance by a constant stride,
+    // so a key costs two adds and not a 64-bit multiply of the slot index.
+    const int row_step = warps * row_stride;
     int dropped = 0;
-    for (int slot = warp; slot < count; slot += decode_warps) {
-        const int key_index = gather_index[slot];
+    int slot = warp;
+    const int* index_pointer = gather_index + warp;
+    const __nv_bfloat16* key_row =
+        gathered_k + static_cast<long long>(warp) * row_stride + head_offset;
+    for (; slot < count; slot += warps) {
+        const int key_index = *index_pointer;
+        index_pointer += warps;
         const bool masked = key_index < 0 || key_index > position;
         if (key_index > position && lane == 0) {
             dropped += 1;
         }
         float partial = 0.0f;
-        const long long row = static_cast<long long>(slot) * row_stride + head_offset;
 #pragma unroll
-        for (int pass = 0; pass < lane_passes_max; ++pass) {
+        for (int pass = 0; pass < decode_passes_max; ++pass) {
             if (pass < passes) {
-                const int dim = lane_dim(pass, lane);
-                if (dim + 1 < head_dim) {
-                    const float2 key = load_bf16_pair(gathered_k + row, dim);
-                    partial += query_registers[pass].x * key.x +
-                        query_registers[pass].y * key.y;
+                float key_dims[decode_dims_per_lane];
+                load_bf16_octet(
+                    key_row,
+                    pass * decode_dims_per_pass + lane_dim_base,
+                    head_dim,
+                    vector_ok,
+                    key_dims);
+#pragma unroll
+                for (int index = 0; index < decode_dims_per_lane; ++index) {
+                    partial += query_dims[pass][index] * key_dims[index];
                 }
             }
         }
-        const float score = warp_sum(partial) * scale;
+        const float score = warp_sum_to_lane0(partial) * scale;
         if (lane == 0) {
             probabilities[slot] = masked ? negative_infinity : score;
         }
+        key_row += row_step;
     }
     // Every warp counts its own residue class, so the block total is the number
     // of gathered rows past the query position; one block (head 0) reports it,
     // which keeps the counter independent of the head count.
-    const float dropped_total = block_sum(
-        static_cast<float>(dropped), partials[0]);
+    const float dropped_total = block_sum(static_cast<float>(dropped), scratch);
     if (blockIdx.x == 0 && threadIdx.x == 0 && violations != nullptr &&
         dropped_total > 0.0f) {
         atomicAdd(violations, static_cast<int>(dropped_total));
@@ -1655,7 +1754,7 @@ extern "C" __global__ void attn_decode(
     for (int slot = threadIdx.x; slot < count; slot += blockDim.x) {
         largest = fmaxf(largest, probabilities[slot]);
     }
-    largest = block_max(largest, partials[0]);
+    largest = block_max(largest, scratch);
     float total = 0.0f;
     if (count > 0) {
         for (int slot = threadIdx.x; slot < count; slot += blockDim.x) {
@@ -1664,42 +1763,73 @@ extern "C" __global__ void attn_decode(
             total += weight;
         }
     }
-    total = block_sum(total, partials[0]);
+    total = block_sum(total, scratch);
     __syncthreads();
 
-    // Pass two: warp `w` accumulates every `decode_warps`-th row, then the
-    // per-warp accumulators are summed per dim.
-    for (int index = threadIdx.x; index < decode_warps * head_dim;
-         index += blockDim.x) {
-        partials[index / head_dim][index % head_dim] = 0.0f;
+    // Phase two: warp `w` accumulates every `warps`-th row into its own register
+    // accumulators, so no value touches shared memory until the final reduce.
+    float value_dims[decode_passes_max][decode_dims_per_lane];
+#pragma unroll
+    for (int pass = 0; pass < decode_passes_max; ++pass) {
+#pragma unroll
+        for (int index = 0; index < decode_dims_per_lane; ++index) {
+            value_dims[pass][index] = 0.0f;
+        }
     }
-    __syncthreads();
     if (count > 0 && total > 0.0f) {
-        for (int slot = warp; slot < count; slot += decode_warps) {
-            const float weight = probabilities[slot] / total;
+        const __nv_bfloat16* value_row =
+            gathered_v + static_cast<long long>(warp) * row_stride + head_offset;
+        for (int other = warp; other < count; other += warps) {
+            const float weight = probabilities[other] / total;
             if (weight == 0.0f) {
+                value_row += row_step;
                 continue;
             }
-            const long long row =
-                static_cast<long long>(slot) * row_stride + head_offset;
-            for (int dim = lane_dim(0, lane); dim < head_dim;
-                 dim += dims_per_warp_pass) {
-                if (dim + 1 < head_dim) {
-                    const float2 value = load_bf16_pair(gathered_v + row, dim);
-                    partials[warp][dim] += weight * value.x;
-                    partials[warp][dim + 1] += weight * value.y;
+#pragma unroll
+            for (int pass = 0; pass < decode_passes_max; ++pass) {
+                if (pass < passes) {
+                    float dims[decode_dims_per_lane];
+                    load_bf16_octet(
+                        value_row,
+                        pass * decode_dims_per_pass + lane_dim_base,
+                        head_dim,
+                        vector_ok,
+                        dims);
+#pragma unroll
+                    for (int index = 0; index < decode_dims_per_lane; ++index) {
+                        value_dims[pass][index] += weight * dims[index];
+                    }
                 }
             }
+            value_row += row_step;
         }
     }
     __syncthreads();
 
+    // Phase three: sum the per-warp accumulators, one pass of dims at a time.
     __nv_bfloat16* out_row = out + static_cast<long long>(head) * head_dim;
-    for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
-        float sum = 0.0f;
-        for (int index = 0; index < decode_warps; ++index) {
-            sum += partials[index][dim];
+#pragma unroll
+    for (int pass = 0; pass < decode_passes_max; ++pass) {
+        // An unused pass stages zeros rather than skipping the barrier, which
+        // keeps `pass` a constant index into the register accumulators and the
+        // barrier unconditional (the dims past `head_dim` are never written).
+#pragma unroll
+        for (int index = 0; index < decode_dims_per_lane; ++index) {
+            staged[warp * decode_dims_per_pass + lane_dim_base + index] =
+                pass < passes ? value_dims[pass][index] : 0.0f;
         }
-        out_row[dim] = __float2bfloat16(sum);
+        __syncthreads();
+        for (int index = threadIdx.x; index < decode_dims_per_pass;
+             index += blockDim.x) {
+            const int dim = pass * decode_dims_per_pass + index;
+            if (dim < head_dim) {
+                float sum = 0.0f;
+                for (int other = 0; other < warps; ++other) {
+                    sum += staged[other * decode_dims_per_pass + index];
+                }
+                out_row[dim] = __float2bfloat16(sum);
+            }
+        }
+        __syncthreads();
     }
 }
