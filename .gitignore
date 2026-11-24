@@ -1,0 +1,9 @@
+/target
+**.zig-cache/
+/zig-out
+core/zig-out
+*.cubin
+.venv/
+bench/*.json
+**/__pycache__/
+*.pyc
