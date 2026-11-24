@@ -446,6 +446,32 @@ checkpoint: **`Qwen/Qwen3.8-Flash-Next-FP8`**, which is what NVIDIA benchmarked 
 So "FP8 weights" was wrong wherever we wrote it: only the n-gram table and MTP are FP8. Everything
 else is BF16 or NVFP4 and must be loaded as declared.
 
+## 7h. Operating rule: ask before anything expensive, and borrow before building (user directive)
+
+We are innovating on **one specific model + hardware combination** — NVFP4 Qwen3.8-Flash-Next on
+4x RTX 5060 Ti, 262,144 context, single stream. Everything outside that is **borrowed, not rebuilt**.
+The ecosystem has already dumped logits traces, quantisation deltas, routing traces, eval harnesses
+and convergence tooling for this model; reading for them costs minutes and building them costs hours.
+
+**Ask me first if any of these is true:**
+
+| trigger | threshold |
+|---|---|
+| download | **> 2 GB** (80 GiB of logits is a budget decision, not a fetch) |
+| wall clock for a single action | **> ~15 min** |
+| GPU occupancy by one action | **> ~15 min** |
+| a lane expected to run | **> 90 min** — tell me the estimate up front |
+| disk | **> 10 % of free space**; RAM **> 50 %** |
+| anything irreversible | always |
+
+**Default order of preference:** (1) an existing published artifact — logits traces, routing traces,
+quantisation deltas, eval results; (2) a mature tool — vLLM, llama.cpp, HF, modelopt, lm-eval;
+(3) our own code. Rebuilding (1) or (2) is how a night gets spent producing what already exists in a
+README.
+
+Corollary for reporting: when a lane discovers the answer is already published, **stop and say so**
+rather than finishing the expensive version out of momentum.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
