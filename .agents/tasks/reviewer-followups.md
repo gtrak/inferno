@@ -31,3 +31,20 @@ re-open the merged work.
 ## Project bookkeeping (orchestrator)
 7. `plan.md` §5 layout said `src/cuda/`; the merged tree uses `src/hw/`.
    Follow the tree, not the old plan text.
+
+## From the I-010 MoE review (non-blocking)
+
+1. **Unverifiable empirical claim in comments.** `core/src/kernels/moe.cu:345` and
+   `core/src/kernels/moe.zig:2348` assert "torch 2.12 returns arbitrary orders for
+   equal values" with specific observed permutations. `torch` is not installed
+   (`ModuleNotFoundError`) and no repro script is committed, so the reviewer marked
+   it UNVERIFIED. The *behaviour* is unaffected — the kernel's own tie rule
+   (lowest index) is deliberate and pinned by the synthetic-tie tests — but a
+   comment citing a measurement nobody can reproduce is the same defect class as an
+   untested assertion. Fix: either commit the repro script and the torch version it
+   ran under, or rewrite the comments as "torch does not document a tie order;
+   inferno deliberately uses lowest-index" with no empirical claim.
+2. **Line lengths** in `core/src/ref/tests.zig` (7 lines at 81-82 columns, added by
+   the cleanup lane while its finding 7 was about line length). Reviewer's own
+   catch; the lane measured `weights/*.zig` and `bench/*.zig` but not the file it
+   was editing. Fix with the rest of the tiger-style sweep.

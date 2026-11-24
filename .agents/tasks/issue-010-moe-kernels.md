@@ -64,8 +64,18 @@ bash tools/gate.sh ; echo EXIT=$?
 (`moe-test` = the test target you add; it must run the oracle comparisons below.)
 1. `moe_router`: `router_indices` **exactly equal** to the oracle for every
    position, including the synthetic tie cases; weights within 1e-6 relative.
-2. Full block: `max_abs_err/max|ref| <= 2e-2` for the FP4 MMA path vs the f32
-   oracle, `<= 5e-4` for the BF16-dequant path.
+2. Full block: `max_abs_err/max|ref| <= 2e-2` for the FP4 MMA path against the
+   **as-multiplied** oracle (dequantised weights, quantise-dequantised
+   activations), `<= 5e-4` for the BF16-dequant path.
+   *Amended after review:* the original wording said "vs the f32 oracle" without
+   pinning which oracle, and the two readings differ by an order of magnitude.
+   Reading it as the *unquantised* model reference gives 8.155e-2 — 4x over the
+   sentinel — but that number measures the W4A4 trade, not a kernel defect: the
+   same lane's I-006b single GEMMs already sit at 1.2e-1..1.8e-1, so **no**
+   faithful W4A4 path can pass 2e-2 that way. `review-gate.md` 5 requires
+   identical inputs on both sides, so the as-multiplied oracle is the only
+   contract-compatible reading. The 8.155e-2 must still be **printed** (it is
+   the honest quality figure) and is tracked as I-020, not gated here.
 3. **Non-vacuity**: print the expert hit histogram (must have >1 non-zero expert
    and sum to M*10), the number of padded rows, and confirm two different inputs
    give different outputs.

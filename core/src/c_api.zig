@@ -232,20 +232,21 @@ fn copy_truncated(source: []const u8, target: []u8) u32 {
     return @intCast(length);
 }
 
+// One merged import list. Each lane added its own `hw/kernel.zig` line, so the
+// merges stacked four copies of it; kept deduplicated and grouped by directory.
 test {
-    _ = @import("hw/dl.zig");
-    _ = @import("hw/cuda_driver.zig");
-    _ = @import("hw/kernel.zig");
-    _ = @import("hw/cuda_context.zig");
-    _ = @import("hw/pcie_link.zig");
     _ = @import("hw/bench.zig");
+    _ = @import("hw/cuda_context.zig");
+    _ = @import("hw/cuda_driver.zig");
+    _ = @import("hw/dl.zig");
     _ = @import("hw/kernel.zig");
-    _ = @import("kernels/gdn.zig");
-    _ = @import("weights/safetensors.zig");
+    _ = @import("hw/pcie_link.zig");
     _ = @import("weights/config.zig");
     _ = @import("weights/manifest.zig");
     _ = @import("weights/quant.zig");
-    _ = @import("hw/kernel.zig");
+    _ = @import("weights/safetensors.zig");
+    _ = @import("kernels/attention.zig");
+    _ = @import("kernels/gdn.zig");
     _ = @import("kernels/gemm.zig");
     _ = @import("kernels/gemv.zig");
     _ = @import("kernels/moe.zig");
@@ -258,8 +259,6 @@ test "inferno_version is a NUL terminated C string" {
 }
 
 test "the cubin table holds at least the probe kernel" {
-    _ = @import("hw/kernel.zig");
-    _ = @import("kernels/attention.zig");
     const table = cubin_table();
     try std.testing.expect(table.len > 0);
     const probe_cubin = table[0];
