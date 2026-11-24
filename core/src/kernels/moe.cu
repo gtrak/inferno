@@ -7,6 +7,8 @@
 // gated by `sigmoid(shared_expert_gate(x))`.
 //
 //   moe_router_logits      bf16 [M,2560] x bf16 [E,2560]^T -> f32 logits
+//   moe_shared_gemm_bf16    bf16 [M,K] x bf16 [N,K]^T -> f32, shared expert
+//   moe_shared_gemm_bf16_split  same, activation given as a high/low bf16 pair
 //   moe_router_topk        f32 softmax, top-k on the probabilities, renormalise
 //   moe_permute            stable expert-sorted assignment list + padded offsets
 //   moe_build_tiles        per-row-tile expert map for the grouped GEMM
@@ -18,6 +20,7 @@
 //   moe_gather_f32         bf16 -> f32 gathered rows, zeros for padding
 //   moe_convert_f32        bf16 -> f32, part of the exact path's setup
 //   moe_silu_mul           silu(gate)*up in f32 for the exact path
+//   moe_silu_split_bf16    the tensor-core down stage's high/low activation
 //
 // The FP4 fragment layouts are the ones `core/src/kernels/gemm.cu` verified
 // against the hardware and `core/src/weights/pack_nvfp4.zig` defines; this file
@@ -230,10 +233,35 @@ __device__ __forceinline__ float sigmoid(float value) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Router logits: bf16 [M,K] x bf16 [E,K]^T -> f32 [M,E].
+// 1. BF16 tensor-core GEMM: bf16 [M,K] x bf16 [N,K]^T -> f32 [M,N].
 //
-// `n_padded` is the expert count rounded up to a whole 64-column tile; the
-// caller zero-fills the gate rows past `n_experts` and ignores those logits.
+// One body, three entry points: the router logits over the expert gate rows and
+// the shared expert's gate_up and down projections. Both operands are bf16 and
+// the MMA accumulates in f32, so the only residual against the oracle is f32
+// accumulation order - the same term the exact FFMA path carries.
+//
+// `splits` selects how the activation operand is presented:
+//   1 - the activation is exactly bf16 (the router's `x`, and the shared
+//       gate_up's `x`, which the checkpoint ships as bf16 already), so one
+//       HMMA per k step is the whole product.
+//   2 - the activation is f32 (`silu(gate)*up`, the shared down projection's
+//       operand). A single bf16 rounding would cost 2^-9 relative on every
+//       element, which the 5e-4 block gate cannot afford to absorb, so the
+//       caller splits it into a high and a low bf16 term whose sum reproduces
+//       the f32 value to 2^-18 relative, and both products accumulate into the
+//       same f32 accumulator.
+//
+// Two terms is where the split stops, and that was measured, not assumed: a
+// three-term split (2^-27, indistinguishable from the FFMA path's f32 operand)
+// moved the block's observed error from 5.475e-6 to 5.856e-6 - no improvement,
+// because the residual is the MMA's own accumulation order, not the operand.
+// The second term is not optional: with the activation rounded to a single bf16
+// the block's observed error is 1.380e-3, and the 5e-4 gate fails.
+//
+// `n_cols` is both the output width and its stride: the router's logit row is
+// `n_padded` wide (the caller zero-fills the gate rows past `n_experts` and
+// ignores those logits), and the shared expert's outputs are exactly as wide as
+// they are long.
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ void copy_bf16_slab(__nv_bfloat16 *tile,
@@ -251,11 +279,20 @@ __device__ __forceinline__ void copy_bf16_slab(__nv_bfloat16 *tile,
     }
 }
 
-extern "C" __global__ void __launch_bounds__(router_threads)
-moe_router_logits(const __nv_bfloat16 *__restrict__ a,
-                  const __nv_bfloat16 *__restrict__ b, float *__restrict__ logits,
-                  int m_rows, int n_padded, int k_cols) {
-    __shared__ __nv_bfloat16 a_stage[stages][router_tile_m * bf16_row_elements];
+// Where one (term, stage) activation slab starts. `splits` terms are pipelined
+// together, so a k step's copies for all terms commit as one group and the MMA
+// consumes them as one.
+__device__ __forceinline__ __nv_bfloat16 *activation_slab(__nv_bfloat16 *base,
+                                                         int part, int stage) {
+    return base + (part * stages + stage) * (router_tile_m * bf16_row_elements);
+}
+
+template <int splits>
+__device__ __forceinline__ void bf16_gemm_tile(
+    const __nv_bfloat16 *a, const __nv_bfloat16 *a_low,
+    const __nv_bfloat16 *b, float *c, int m_rows, int n_cols, int k_cols) {
+    // 64 x 64 output tile, one warp per 16 rows.
+    __shared__ __nv_bfloat16 a_stage[splits][stages][router_tile_m * bf16_row_elements];
     __shared__ __nv_bfloat16 b_stage[stages][router_tile_m * bf16_row_elements];
 
     const int lane = threadIdx.x % warp_size;
@@ -269,8 +306,11 @@ moe_router_logits(const __nv_bfloat16 *__restrict__ a,
 
     for (int stage = 0; stage < stages - 1; ++stage) {
         if (stage < k_steps) {
-            copy_bf16_slab(a_stage[stage], a, m0, rows_live,
-                           stage * bf16_tile_k, k_cols);
+            for (int part = 0; part < splits; ++part) {
+                copy_bf16_slab(activation_slab(&a_stage[0][0][0], part, stage),
+                               part == 0 ? a : a_low, m0, rows_live,
+                               stage * bf16_tile_k, k_cols);
+            }
             copy_bf16_slab(b_stage[stage], b, n0, router_tile_n,
                            stage * bf16_tile_k, k_cols);
         }
@@ -291,28 +331,34 @@ moe_router_logits(const __nv_bfloat16 *__restrict__ a,
         __syncthreads();
         const int prefetch = k_step + stages - 1;
         if (prefetch < k_steps) {
-            copy_bf16_slab(a_stage[prefetch % stages], a, m0, rows_live,
-                           prefetch * bf16_tile_k, k_cols);
+            for (int part = 0; part < splits; ++part) {
+                copy_bf16_slab(activation_slab(&a_stage[0][0][0], part, prefetch % stages),
+                               part == 0 ? a : a_low, m0, rows_live,
+                               prefetch * bf16_tile_k, k_cols);
+            }
             copy_bf16_slab(b_stage[prefetch % stages], b, n0, router_tile_n,
                            prefetch * bf16_tile_k, k_cols);
         }
         cp_async_commit();
 
-        const __nv_bfloat16 *a_tile = &a_stage[k_step % stages][0];
         const __nv_bfloat16 *b_tile = &b_stage[k_step % stages][0];
-        for (int half = 0; half < bf16_tile_k / hmma_k; ++half) {
-            const int k_low = half * hmma_k + 2 * quad;
-            const uint32_t a_words[4] = {
-                bf16_pair(a_tile + row_low * bf16_row_elements, k_low),
-                bf16_pair(a_tile + row_high * bf16_row_elements, k_low),
-                bf16_pair(a_tile + row_low * bf16_row_elements, k_low + 8),
-                bf16_pair(a_tile + row_high * bf16_row_elements, k_low + 8),
-            };
-            for (int n_tile = 0; n_tile < router_n_tiles; ++n_tile) {
-                const __nv_bfloat16 *b_row =
-                    b_tile + (n_tile * hmma_n + group) * bf16_row_elements;
-                hmma_bf16(acc[n_tile], a_words, bf16_pair(b_row, k_low),
-                          bf16_pair(b_row, k_low + 8));
+        for (int part = 0; part < splits; ++part) {
+            const __nv_bfloat16 *a_tile =
+                activation_slab(&a_stage[0][0][0], part, k_step % stages);
+            for (int half = 0; half < bf16_tile_k / hmma_k; ++half) {
+                const int k_low = half * hmma_k + 2 * quad;
+                const uint32_t a_words[4] = {
+                    bf16_pair(a_tile + row_low * bf16_row_elements, k_low),
+                    bf16_pair(a_tile + row_high * bf16_row_elements, k_low),
+                    bf16_pair(a_tile + row_low * bf16_row_elements, k_low + 8),
+                    bf16_pair(a_tile + row_high * bf16_row_elements, k_low + 8),
+                };
+                for (int n_tile = 0; n_tile < router_n_tiles; ++n_tile) {
+                    const __nv_bfloat16 *b_row =
+                        b_tile + (n_tile * hmma_n + group) * bf16_row_elements;
+                    hmma_bf16(acc[n_tile], a_words, bf16_pair(b_row, k_low),
+                              bf16_pair(b_row, k_low + 8));
+                }
             }
         }
     }
@@ -323,16 +369,42 @@ moe_router_logits(const __nv_bfloat16 *__restrict__ a,
     for (int n_tile = 0; n_tile < router_n_tiles; ++n_tile) {
         const int n = column + n_tile * hmma_n;
         if (m_low < m_rows) {
-            float *destination = logits + static_cast<int64_t>(m_low) * n_padded + n;
+            float *destination = c + static_cast<int64_t>(m_low) * n_cols + n;
             destination[0] = acc[n_tile][0];
             destination[1] = acc[n_tile][1];
         }
         if (m_high < m_rows) {
-            float *destination = logits + static_cast<int64_t>(m_high) * n_padded + n;
+            float *destination = c + static_cast<int64_t>(m_high) * n_cols + n;
             destination[0] = acc[n_tile][2];
             destination[1] = acc[n_tile][3];
         }
     }
+}
+
+// Router logits: one 64-column block of the expert gate rows per block.
+extern "C" __global__ void __launch_bounds__(router_threads)
+moe_router_logits(const __nv_bfloat16 *__restrict__ a,
+                  const __nv_bfloat16 *__restrict__ b, float *__restrict__ logits,
+                  int m_rows, int n_padded, int k_cols) {
+    bf16_gemm_tile<1>(a, nullptr, b, logits, m_rows, n_padded, k_cols);
+}
+
+// Shared expert gate_up: the activation is the checkpoint's bf16 `x`.
+extern "C" __global__ void __launch_bounds__(router_threads)
+moe_shared_gemm_bf16(const __nv_bfloat16 *__restrict__ a,
+                     const __nv_bfloat16 *__restrict__ b,
+                     float *__restrict__ c, int rows, int n_cols, int k_cols) {
+    bf16_gemm_tile<1>(a, nullptr, b, c, rows, n_cols, k_cols);
+}
+
+// Shared expert down: the f32 activation arrives as a high/low bf16 pair.
+extern "C" __global__ void __launch_bounds__(router_threads)
+moe_shared_gemm_bf16_split(const __nv_bfloat16 *__restrict__ a_high,
+                           const __nv_bfloat16 *__restrict__ a_low,
+                           const __nv_bfloat16 *__restrict__ b,
+                           float *__restrict__ c, int rows, int n_cols,
+                           int k_cols) {
+    bf16_gemm_tile<2>(a_high, a_low, b, c, rows, n_cols, k_cols);
 }
 
 // ---------------------------------------------------------------------------
@@ -969,6 +1041,28 @@ moe_silu_mul(const float *__restrict__ gate_up, int rows, int intermediate,
         const int column = static_cast<int>(index % intermediate);
         const int64_t base = static_cast<int64_t>(row) * 2 * intermediate + column;
         act[index] = silu(gate_up[base]) * gate_up[base + intermediate];
+    }
+}
+
+// The tensor-core path's activation operand: silu(gate)*up split into a high
+// and a low bf16 term. `high + low` reproduces the f32 value to 2^-18 relative,
+// and `moe_shared_gemm_bf16_split` accumulates both products into one f32
+// accumulator, so the down projection's operand carries sixteen mantissa bits
+// instead of the eight a single bf16 rounding would leave.
+extern "C" __global__ void __launch_bounds__(256)
+moe_silu_split_bf16(const float *__restrict__ gate_up, int rows,
+                    int intermediate, __nv_bfloat16 *__restrict__ high,
+                    __nv_bfloat16 *__restrict__ low) {
+    const int64_t count = static_cast<int64_t>(rows) * intermediate;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(index / intermediate);
+        const int column = static_cast<int>(index % intermediate);
+        const int64_t base = static_cast<int64_t>(row) * 2 * intermediate + column;
+        const float value = silu(gate_up[base]) * gate_up[base + intermediate];
+        const __nv_bfloat16 upper = __float2bfloat16(value);
+        high[index] = upper;
+        low[index] = __float2bfloat16(value - __bfloat162float(upper));
     }
 }
 

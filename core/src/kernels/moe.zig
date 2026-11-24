@@ -59,6 +59,9 @@ pub const grouped_threads: u32 = 32;
 pub const router_threads: u32 = 128;
 pub const router_rows: u32 = 64;
 
+/// Contraction step the bf16 tensor-core GEMMs copy per pipeline stage.
+pub const bf16_k_step: u32 = 32;
+
 /// Threads per router selection block (one token per block).
 pub const router_topk_threads: u32 = 128;
 
@@ -196,10 +199,12 @@ fn download(
     try downloadAt(stream, destination, source, 0);
 }
 
-/// The twelve kernels of `moe.cu`, resolved once and launched many times.
+/// The fifteen kernels of `moe.cu`, resolved once and launched many times.
 pub const Kernels = struct {
     module: kernel.Module,
     router_logits: kernel.Function,
+    shared_gemm: kernel.Function,
+    shared_gemm_split: kernel.Function,
     router_topk: kernel.Function,
     permute: kernel.Function,
     build_tiles: kernel.Function,
@@ -211,6 +216,7 @@ pub const Kernels = struct {
     gather_f32: kernel.Function,
     convert_f32: kernel.Function,
     silu_mul: kernel.Function,
+    silu_split: kernel.Function,
 
     pub fn init(image: []const u8) KernelError!Kernels {
         assert(image.len > 0);
@@ -220,6 +226,8 @@ pub const Kernels = struct {
         return .{
             .module = module,
             .router_logits = try module.function("moe_router_logits"),
+            .shared_gemm = try module.function("moe_shared_gemm_bf16"),
+            .shared_gemm_split = try module.function("moe_shared_gemm_bf16_split"),
             .router_topk = try module.function("moe_router_topk"),
             .permute = try module.function("moe_permute"),
             .build_tiles = try module.function("moe_build_tiles"),
@@ -231,6 +239,7 @@ pub const Kernels = struct {
             .gather_f32 = try module.function("moe_gather_f32"),
             .convert_f32 = try module.function("moe_convert_f32"),
             .silu_mul = try module.function("moe_silu_mul"),
+            .silu_split = try module.function("moe_silu_split_bf16"),
         };
     }
 
@@ -310,6 +319,99 @@ pub fn launchRouterLogits(
     };
     try kernels.router_logits.launch(
         grid,
+        .{ router_threads, 1, 1 },
+        0,
+        stream.handle,
+        &arguments,
+    );
+}
+
+/// Launches a shared-expert GEMM on the bf16 tensor cores: `c = a x b^T`.
+///
+/// Both operands are bf16 as the checkpoint ships them and the MMA accumulates
+/// in f32, so this is the same arithmetic as the FFMA path with a different
+/// accumulation order. `n_cols` must be a whole 64-column tile and `k_cols` a
+/// whole 32-deep copy step, which 1280x2560 and 2560x640 both are.
+pub fn launchSharedGemm(
+    kernels: *const Kernels,
+    stream: *const cuda_context.Stream,
+    a: *const cuda_context.DeviceBuffer,
+    b: *const cuda_context.DeviceBuffer,
+    c: *const cuda_context.DeviceBuffer,
+    rows: u32,
+    n_cols: u32,
+    k_cols: u32,
+) KernelError!void {
+    assert(rows > 0);
+    assert(n_cols > 0 and n_cols % dense_columns == 0);
+    assert(k_cols % bf16_k_step == 0);
+    assert(a.bytes >= @as(u64, rows) * k_cols * 2);
+    assert(c.bytes >= @as(u64, rows) * n_cols * 4);
+
+    var a_pointer = a.pointer;
+    var b_pointer = b.pointer;
+    var c_pointer = c.pointer;
+    var row_count: i32 = @intCast(rows);
+    var columns: i32 = @intCast(n_cols);
+    var contraction: i32 = @intCast(k_cols);
+    var arguments = [_]?*anyopaque{
+        &a_pointer,
+        &b_pointer,
+        &c_pointer,
+        &row_count,
+        &columns,
+        &contraction,
+    };
+    try kernels.shared_gemm.launch(
+        .{ n_cols / dense_columns, (rows + router_rows - 1) / router_rows, 1 },
+        .{ router_threads, 1, 1 },
+        0,
+        stream.handle,
+        &arguments,
+    );
+}
+
+/// Launches the shared-expert down GEMM with the f32 activation given as a
+/// high/low bf16 pair: `c = (a_high + a_low) x b^T`, both products into one f32
+/// accumulator. Together the terms carry 2^-18 relative of the f32 value, so
+/// the operand keeps sixteen mantissa bits on a kernel whose input dtype has
+/// eight.
+pub fn launchSharedGemmSplit(
+    kernels: *const Kernels,
+    stream: *const cuda_context.Stream,
+    a_high: *const cuda_context.DeviceBuffer,
+    a_low: *const cuda_context.DeviceBuffer,
+    b: *const cuda_context.DeviceBuffer,
+    c: *const cuda_context.DeviceBuffer,
+    rows: u32,
+    n_cols: u32,
+    k_cols: u32,
+) KernelError!void {
+    assert(rows > 0);
+    assert(n_cols > 0 and n_cols % dense_columns == 0);
+    assert(k_cols % bf16_k_step == 0);
+    assert(a_high.bytes >= @as(u64, rows) * k_cols * 2);
+    assert(a_low.bytes == a_high.bytes);
+    assert(c.bytes >= @as(u64, rows) * n_cols * 4);
+
+    var high_pointer = a_high.pointer;
+    var low_pointer = a_low.pointer;
+    var b_pointer = b.pointer;
+    var c_pointer = c.pointer;
+    var row_count: i32 = @intCast(rows);
+    var columns: i32 = @intCast(n_cols);
+    var contraction: i32 = @intCast(k_cols);
+    var arguments = [_]?*anyopaque{
+        &high_pointer,
+        &low_pointer,
+        &b_pointer,
+        &c_pointer,
+        &row_count,
+        &columns,
+        &contraction,
+    };
+    try kernels.shared_gemm_split.launch(
+        .{ n_cols / dense_columns, (rows + router_rows - 1) / router_rows, 1 },
         .{ router_threads, 1, 1 },
         0,
         stream.handle,
@@ -845,6 +947,44 @@ pub fn launchSiluMul(
     );
 }
 
+/// Launches silu(gate) * up split into a high and a low bf16 term, the
+/// tensor-core down stage's activation operand.
+pub fn launchSiluSplit(
+    kernels: *const Kernels,
+    stream: *const cuda_context.Stream,
+    gate_up: *const cuda_context.DeviceBuffer,
+    rows: u32,
+    intermediate: u32,
+    high: *const cuda_context.DeviceBuffer,
+    low: *const cuda_context.DeviceBuffer,
+) KernelError!void {
+    assert(rows > 0);
+    assert(intermediate > 0);
+    assert(gate_up.bytes >= @as(u64, rows) * 2 * intermediate * 4);
+    assert(high.bytes >= @as(u64, rows) * intermediate * 2);
+    assert(low.bytes == high.bytes);
+
+    var gate_up_pointer = gate_up.pointer;
+    var high_pointer = high.pointer;
+    var low_pointer = low.pointer;
+    var row_count: i32 = @intCast(rows);
+    var width: i32 = @intCast(intermediate);
+    var arguments = [_]?*anyopaque{
+        &gate_up_pointer,
+        &row_count,
+        &width,
+        &high_pointer,
+        &low_pointer,
+    };
+    try kernels.silu_split.launch(
+        .{ elementwiseGrid(@as(u64, rows) * intermediate), 1, 1 },
+        .{ 256, 1, 1 },
+        0,
+        stream.handle,
+        &arguments,
+    );
+}
+
 /// Every device buffer one MoE block needs for a given maximum token count.
 pub const Stage = struct {
     tokens_max: u32,
@@ -880,6 +1020,8 @@ pub const Stage = struct {
     shared_gate_logit: cuda_context.DeviceBuffer,
     shared_gate_up_out: cuda_context.DeviceBuffer,
     shared_act: cuda_context.DeviceBuffer,
+    shared_act_high: cuda_context.DeviceBuffer,
+    shared_act_low: cuda_context.DeviceBuffer,
     shared_out: cuda_context.DeviceBuffer,
 
     pub fn init(tokens_max: u32, n_experts: u32, top_k: u32) KernelError!Stage {
@@ -941,6 +1083,12 @@ pub const Stage = struct {
         stage.shared_act = try allocate(
             @as(u64, tokens_max) * shared_intermediate * 4,
         );
+        stage.shared_act_high = try allocate(
+            @as(u64, tokens_max) * shared_intermediate * 2,
+        );
+        stage.shared_act_low = try allocate(
+            @as(u64, tokens_max) * shared_intermediate * 2,
+        );
         stage.shared_out = try allocate(@as(u64, tokens_max) * hidden_size * 4);
         return stage;
     }
@@ -950,6 +1098,8 @@ pub const Stage = struct {
         assert(stage.out.bytes > 0);
 
         stage.shared_out.free();
+        stage.shared_act_low.free();
+        stage.shared_act_high.free();
         stage.shared_act.free();
         stage.shared_gate_up_out.free();
         stage.shared_gate_logit.free();
@@ -988,13 +1138,19 @@ pub const Stage = struct {
         return .{ .tiles = tiles, .rows = rows };
     }
 
-    /// Authentic inputs the exact path shares: the raw conversion and the
-    /// sigmoid-gated shared expert.
+    /// Which shared-expert implementation a launch runs. The tensor-core path
+    /// is the shipped one; the FFMA path is the exact reference it is compared
+    /// against, and stays available so a numerics regression has a witness.
+    pub const SharedPath = enum { tensor_core, exact_ffma };
+
+    /// The sigmoid-gated shared expert, plus the bf16 -> f32 conversion of `x`
+    /// that `moe_combine` reads for the gate dot.
     pub fn runShared(
         stage: *Stage,
         kernels: *const Kernels,
         stream: *const cuda_context.Stream,
         tokens: u32,
+        path: SharedPath,
     ) KernelError!void {
         assert(tokens > 0 and tokens <= stage.tokens_max);
 
@@ -1005,6 +1161,63 @@ pub const Stage = struct {
             tokens * hidden_size,
             &stage.x_f32,
         );
+        switch (path) {
+            .tensor_core => try runSharedTensorCore(stage, kernels, stream, tokens),
+            .exact_ffma => try runSharedExactFfma(stage, kernels, stream, tokens),
+        }
+    }
+
+    /// gate_up on the bf16 tensor cores, silu*up split into two bf16 terms,
+    /// then the down projection as two accumulations into one f32 result.
+    fn runSharedTensorCore(
+        stage: *Stage,
+        kernels: *const Kernels,
+        stream: *const cuda_context.Stream,
+        tokens: u32,
+    ) KernelError!void {
+        assert(tokens > 0 and tokens <= stage.tokens_max);
+
+        try launchSharedGemm(
+            kernels,
+            stream,
+            &stage.x,
+            &stage.shared_gate_up,
+            &stage.shared_gate_up_out,
+            tokens,
+            2 * shared_intermediate,
+            hidden_size,
+        );
+        try launchSiluSplit(
+            kernels,
+            stream,
+            &stage.shared_gate_up_out,
+            tokens,
+            shared_intermediate,
+            &stage.shared_act_high,
+            &stage.shared_act_low,
+        );
+        try launchSharedGemmSplit(
+            kernels,
+            stream,
+            &stage.shared_act_high,
+            &stage.shared_act_low,
+            &stage.shared_down,
+            &stage.shared_out,
+            tokens,
+            hidden_size,
+            shared_intermediate,
+        );
+    }
+
+    /// The exact path: f32 FFMA over bf16-dequantised weights, unchanged.
+    fn runSharedExactFfma(
+        stage: *Stage,
+        kernels: *const Kernels,
+        stream: *const cuda_context.Stream,
+        tokens: u32,
+    ) KernelError!void {
+        assert(tokens > 0 and tokens <= stage.tokens_max);
+
         try launchDenseF32(
             kernels,
             stream,
@@ -1159,19 +1372,18 @@ pub const Stage = struct {
         );
     }
 
-    /// The whole block: dispatch, routed FP4 experts, shared expert, combine.
-    pub fn run(
+    /// The routed scatter-add and the gated shared expert: the block's epilogue.
+    /// Reads what `runShared` and `runRouted` left in the stage, so it is the
+    /// one term of the block that cannot run first.
+    pub fn runCombine(
         stage: *Stage,
         kernels: *const Kernels,
         stream: *const cuda_context.Stream,
-        weights: *const ExpertWeights,
         tokens: u32,
     ) KernelError!void {
         assert(tokens > 0 and tokens <= stage.tokens_max);
+        assert(stage.out.bytes >= @as(u64, tokens) * hidden_size * 4);
 
-        try stage.runDispatch(kernels, stream, tokens);
-        try stage.runRouted(kernels, stream, weights, tokens);
-        try stage.runShared(kernels, stream, tokens);
         try launchCombine(
             kernels,
             stream,
@@ -1188,6 +1400,22 @@ pub const Stage = struct {
             stage.top_k,
             hidden_size,
         );
+    }
+
+    /// The whole block: dispatch, routed FP4 experts, shared expert, combine.
+    pub fn run(
+        stage: *Stage,
+        kernels: *const Kernels,
+        stream: *const cuda_context.Stream,
+        weights: *const ExpertWeights,
+        tokens: u32,
+    ) KernelError!void {
+        assert(tokens > 0 and tokens <= stage.tokens_max);
+
+        try stage.runDispatch(kernels, stream, tokens);
+        try stage.runRouted(kernels, stream, weights, tokens);
+        try stage.runShared(kernels, stream, tokens, .tensor_core);
+        try stage.runCombine(kernels, stream, tokens);
     }
 };
 
@@ -2005,7 +2233,9 @@ const Exact = struct {
 
 /// Runs the exact BF16-dequantised reference: gathered f32 activations, an f32
 /// FFMA gate_up, silu*up in f32, an f32 FFMA down, then the shared expert and
-/// the same combine the FP4 path uses.
+/// the same combine the FP4 path uses. `shared` picks which shared-expert
+/// implementation runs in the same block, so the two can be compared on
+/// identical routed output.
 fn runExact(
     stage: *Stage,
     kernels: *const Kernels,
@@ -2013,6 +2243,7 @@ fn runExact(
     exact: *Exact,
     hosts: []const HostExpert,
     tokens: u32,
+    shared: Stage.SharedPath,
 ) KernelError!void {
     assert(tokens > 0);
     assert(exact.host_gate_up.len > 0);
@@ -2093,7 +2324,7 @@ fn runExact(
         );
     }
 
-    try stage.runShared(kernels, stream, tokens);
+    try stage.runShared(kernels, stream, tokens, shared);
     try launchCombine(
         kernels,
         stream,
@@ -2956,13 +3187,19 @@ const Session = struct {
         try session.fixture.uploadInput(allocator, stream, &session.stage, input_seed);
     }
 
-    /// The exact BF16-dequantised reference path against the same oracle.
+    /// The exact BF16-dequantised reference path against the same oracle, with
+    /// both shared-expert implementations on the same routed output: the FFMA
+    /// path first (the pre-tensor-core number), then the shipped tensor-core
+    /// path, which is the one gated at 5e-4.
     fn checkExact(session: *Session) !void {
         const allocator = session.allocator;
         const hosts = session.hosts orelse return error.ExpertsNotPrepared;
         const planned = session.stage.plan(session.tokens);
         var exact = try Exact.init(allocator, planned.rows);
         defer exact.deinit(allocator);
+
+        const ffma_output = try allocator.alloc(f32, @as(usize, session.tokens) * hidden_size);
+        defer allocator.free(ffma_output);
         try runExact(
             &session.stage,
             &session.harness.kernels,
@@ -2970,8 +3207,9 @@ const Session = struct {
             &exact,
             hosts,
             session.tokens,
+            .exact_ffma,
         );
-        try downloadSlice(&session.harness.stream, session.output, &session.stage.out);
+        try downloadSlice(&session.harness.stream, ffma_output, &session.stage.out);
 
         var multiplied = try OracleExperts.init(allocator, hosts, .as_multiplied);
         defer multiplied.deinit(allocator);
@@ -2998,11 +3236,39 @@ const Session = struct {
             &session.config,
         );
         fillReference(session);
+        const ffma = compareOutput(ffma_output, session.reference);
+        std.debug.print(
+            "MoE exact BF16-dequant block, shared expert on the FFMA path: max_abs={e:.3} max|ref|={e:.3} relative={e:.3} (gate 5e-4)\n",
+            .{ ffma.max_abs_err, ffma.max_reference, ffma.relative() },
+        );
+
+        try runExact(
+            &session.stage,
+            &session.harness.kernels,
+            &session.harness.stream,
+            &exact,
+            hosts,
+            session.tokens,
+            .tensor_core,
+        );
+        try downloadSlice(&session.harness.stream, session.output, &session.stage.out);
         const comparison = compareOutput(session.output, session.reference);
         std.debug.print(
-            "MoE exact BF16-dequant block: max_abs={e:.3} max|ref|={e:.3} relative={e:.3} (gate 5e-4)\n",
+            "MoE exact BF16-dequant block, shared expert on the BF16 tensor-core path: max_abs={e:.3} max|ref|={e:.3} relative={e:.3} (gate 5e-4)\n",
             .{ comparison.max_abs_err, comparison.max_reference, comparison.relative() },
         );
+        const shared_delta = compareOutput(session.output, ffma_output);
+        std.debug.print(
+            "MoE shared expert tensor-core vs FFMA on the same inputs: max_abs={e:.3} relative={e:.3} (gate 1e-4; operand split 2^-18, accumulation order)\n",
+            .{ shared_delta.max_abs_err, shared_delta.relative() },
+        );
+        // The witness gate. The tensor-core path may move the last digits of the
+        // f32 result, not approach the block gate: one part in 1e4 of the FFMA
+        // path's own output is the whole budget, and it fires if the shared
+        // expert ever stops splitting its down-projection activation.
+        if (shared_delta.relative() > 1e-4) {
+            return error.SharedPathDivergence;
+        }
         if (comparison.relative() > 5e-4) {
             return error.ExactBlockMismatch;
         }
@@ -3020,8 +3286,127 @@ fn fillReference(session: *Session) void {
     }
 }
 
-/// Which phase the throughput measurement times.
-const Phase = enum { block, routed };
+/// Which side of the DRAM tier the expert weights are on for a timed phase.
+const Cache = enum { warm, cold };
+
+/// Which part of the block a measurement times.
+const Phase = enum { block, routed, shared, dispatch, combine };
+
+/// One phase's `samples_per_measurement` launches: median and worst.
+const Timing = struct {
+    median_ns: u64,
+    max_ns: u64,
+};
+
+/// One RTX 5060 Ti's block-scaled FP4 tensor-core peak: the denominator
+/// `plan.md` §7c quotes routed efficiency against.
+const fp4_peak_tflops: f64 = 192.5;
+
+/// The shared expert's cost per token per layer before it moved onto the bf16
+/// tensor cores: M-001's measured 20,261.8 us at M=16,384 warm on one GPU,
+/// i.e. 1.237 us. This box's own pre-change run of the same sweep measured
+/// 1.292 us, so the bound holds the shipped path to the better of the two.
+const shared_micros_per_token_before: f64 = 1.237;
+
+/// Text layers that run this block (`mem/placement.zig`'s `layer_count`). The
+/// sweep measures one layer; the derived row multiplies by this and nothing
+/// else.
+const model_moe_layers: u32 = 48;
+
+/// The cold tier's source: every expert byte in pinned host memory, taken from
+/// the bytes the device holds so a cold phase differs from a warm one only in
+/// the transfer.
+///
+/// The kernels read device pointers, so an evicted slab cannot be executed at
+/// all; the cold cost is the fetch that makes it resident again. That fetch is
+/// a real PCIe transfer of the same bytes, timed inside the phase, and the warm
+/// run of the same binary in the same process is its control: if the two do not
+/// differ by the transfer, the bytes never left the device.
+const ExpertHostCopy = struct {
+    gate_up_frag: cuda_context.PinnedHostBuffer,
+    gate_up_scale: cuda_context.PinnedHostBuffer,
+    down_frag: cuda_context.PinnedHostBuffer,
+    down_scale: cuda_context.PinnedHostBuffer,
+
+    fn capture(
+        stream: *const cuda_context.Stream,
+        weights: *const ExpertWeights,
+    ) cuda_driver.DriverError!ExpertHostCopy {
+        assert(weights.gate_up_frag.bytes > 0);
+        assert(weights.down_scale.bytes > 0);
+
+        const gate_up_frag = try cuda_context.PinnedHostBuffer.allocate(weights.gate_up_frag.bytes);
+        errdefer gate_up_frag.free();
+        const gate_up_scale = try cuda_context.PinnedHostBuffer.allocate(weights.gate_up_scale.bytes);
+        errdefer gate_up_scale.free();
+        const down_frag = try cuda_context.PinnedHostBuffer.allocate(weights.down_frag.bytes);
+        errdefer down_frag.free();
+        const down_scale = try cuda_context.PinnedHostBuffer.allocate(weights.down_scale.bytes);
+        errdefer down_scale.free();
+
+        try stream.copy_d_to_h(&gate_up_frag, &weights.gate_up_frag, weights.gate_up_frag.bytes);
+        try stream.copy_d_to_h(&gate_up_scale, &weights.gate_up_scale, weights.gate_up_scale.bytes);
+        try stream.copy_d_to_h(&down_frag, &weights.down_frag, weights.down_frag.bytes);
+        try stream.copy_d_to_h(&down_scale, &weights.down_scale, weights.down_scale.bytes);
+        try stream.synchronize();
+        return .{
+            .gate_up_frag = gate_up_frag,
+            .gate_up_scale = gate_up_scale,
+            .down_frag = down_frag,
+            .down_scale = down_scale,
+        };
+    }
+
+    fn release(copy: *ExpertHostCopy) void {
+        assert(copy.gate_up_frag.bytes > 0);
+        assert(copy.down_scale.bytes > 0);
+
+        copy.down_scale.free();
+        copy.down_frag.free();
+        copy.gate_up_scale.free();
+        copy.gate_up_frag.free();
+    }
+
+    fn bytes(copy: *const ExpertHostCopy) u64 {
+        assert(copy.gate_up_frag.bytes > 0);
+        assert(copy.down_scale.bytes > 0);
+
+        return copy.gate_up_frag.bytes + copy.gate_up_scale.bytes +
+            copy.down_frag.bytes + copy.down_scale.bytes;
+    }
+
+    /// Enqueues the tier's H2D fetch on the block's stream.
+    fn fetch(
+        copy: *const ExpertHostCopy,
+        stream: *const cuda_context.Stream,
+        weights: *const ExpertWeights,
+    ) cuda_driver.DriverError!void {
+        assert(copy.bytes() > 0);
+        assert(weights.gate_up_frag.bytes == copy.gate_up_frag.bytes);
+
+        try stream.copy_h_to_d(&weights.gate_up_frag, &copy.gate_up_frag, copy.gate_up_frag.bytes);
+        try stream.copy_h_to_d(&weights.gate_up_scale, &copy.gate_up_scale, copy.gate_up_scale.bytes);
+        try stream.copy_h_to_d(&weights.down_frag, &copy.down_frag, copy.down_frag.bytes);
+        try stream.copy_h_to_d(&weights.down_scale, &copy.down_scale, copy.down_scale.bytes);
+    }
+};
+
+/// Runs what a phase reads but does not time. Only the routed phase needs it:
+/// dispatch is a measured term of its own, so it is prepared outside the region.
+fn preparePhase(
+    phase: Phase,
+    harness: *Harness,
+    stage: *Stage,
+    tokens: u32,
+) KernelError!void {
+    assert(tokens > 0);
+    assert(tokens <= stage.tokens_max);
+
+    switch (phase) {
+        .routed => try stage.runDispatch(&harness.kernels, &harness.stream, tokens),
+        else => {},
+    }
+}
 
 /// Runs one timed phase.
 fn runPhase(
@@ -3036,24 +3421,37 @@ fn runPhase(
 
     switch (phase) {
         .block => try stage.run(&harness.kernels, &harness.stream, weights, tokens),
-        .routed => {
-            try stage.runDispatch(&harness.kernels, &harness.stream, tokens);
-            try stage.runRouted(&harness.kernels, &harness.stream, weights, tokens);
-        },
+        .routed => try stage.runRouted(&harness.kernels, &harness.stream, weights, tokens),
+        .shared => try stage.runShared(&harness.kernels, &harness.stream, tokens, .tensor_core),
+        .dispatch => try stage.runDispatch(&harness.kernels, &harness.stream, tokens),
+        .combine => try stage.runCombine(&harness.kernels, &harness.stream, tokens),
     }
 }
 
-/// Median of several timed launches.
+/// Timed launches per measurement.
+const samples_per_measurement: u32 = 7;
+
+/// Runs one phase several times and returns the median and the worst sample.
+///
+/// A cold phase enqueues the tier fetch inside the timed region, after the
+/// untimed prepare, so the sample is what production pays for a miss: the
+/// transfer plus the kernels.
 fn timePhase(
     harness: *Harness,
     stage: *Stage,
     weights: *const ExpertWeights,
     tokens: u32,
     phase: Phase,
-) (KernelError || error{ImpossibleTiming})!u64 {
+    cache: Cache,
+    host_copy: ?*const ExpertHostCopy,
+) (KernelError || error{ImpossibleTiming})!Timing {
     assert(tokens > 0);
+    assert(tokens <= stage.tokens_max);
     assert(samples_per_measurement >= 3);
+    assert(cache == .warm or host_copy != null);
 
+    try preparePhase(phase, harness, stage, tokens);
+    if (cache == .cold) try host_copy.?.fetch(&harness.stream, weights);
     try runPhase(phase, harness, stage, weights, tokens);
     try harness.stream.synchronize();
 
@@ -3064,7 +3462,9 @@ fn timePhase(
 
     var measured: [samples_per_measurement]u64 = undefined;
     for (&measured) |*sample| {
+        try preparePhase(phase, harness, stage, tokens);
         try start.record(&harness.stream);
+        if (cache == .cold) try host_copy.?.fetch(&harness.stream, weights);
         try runPhase(phase, harness, stage, weights, tokens);
         try end.record(&harness.stream);
         try end.synchronize();
@@ -3074,11 +3474,102 @@ fn timePhase(
         }
     }
     std.mem.sort(u64, measured[0..], {}, std.sort.asc(u64));
-    return measured[samples_per_measurement / 2];
+    return .{
+        .median_ns = measured[samples_per_measurement / 2],
+        .max_ns = measured[samples_per_measurement - 1],
+    };
 }
 
-/// Timed launches per measurement.
-const samples_per_measurement: u32 = 7;
+/// Times the cold fetch on its own: the tier's PCIe transfer with no kernel
+/// behind it, which is the number the cold phases are checked against.
+fn timeFetch(
+    harness: *Harness,
+    host_copy: *const ExpertHostCopy,
+    weights: *const ExpertWeights,
+) (KernelError || error{ImpossibleTiming})!Timing {
+    assert(host_copy.bytes() > 0);
+    assert(samples_per_measurement >= 3);
+
+    try host_copy.fetch(&harness.stream, weights);
+    try harness.stream.synchronize();
+
+    const start = try cuda_context.Event.create();
+    defer start.destroy();
+    const end = try cuda_context.Event.create();
+    defer end.destroy();
+
+    var measured: [samples_per_measurement]u64 = undefined;
+    for (&measured) |*sample| {
+        try start.record(&harness.stream);
+        try host_copy.fetch(&harness.stream, weights);
+        try end.record(&harness.stream);
+        try end.synchronize();
+        sample.* = try cuda_context.Event.elapsed_nanoseconds(&start, &end);
+        if (sample.* == 0) {
+            return error.ImpossibleTiming;
+        }
+    }
+    std.mem.sort(u64, measured[0..], {}, std.sort.asc(u64));
+    return .{
+        .median_ns = measured[samples_per_measurement / 2],
+        .max_ns = measured[samples_per_measurement - 1],
+    };
+}
+
+/// One size's warm terms, all medians in nanoseconds.
+const WarmTerms = struct {
+    block: Timing,
+    dispatch: Timing,
+    routed: Timing,
+    shared: Timing,
+    combine: Timing,
+};
+
+/// One size's cold terms and the fetch that stands behind them.
+const ColdTerms = struct {
+    fetch: Timing,
+    routed: Timing,
+    block: Timing,
+};
+
+/// Times the warm block and each term of it. The block runs first so the
+/// buffers its epilogue reads are valid for the term measurements.
+fn measureWarm(
+    harness: *Harness,
+    stage: *Stage,
+    weights: *const ExpertWeights,
+    tokens: u32,
+) (KernelError || error{ImpossibleTiming})!WarmTerms {
+    assert(tokens > 0);
+    assert(tokens <= stage.tokens_max);
+
+    var terms: WarmTerms = undefined;
+    terms.block = try timePhase(harness, stage, weights, tokens, .block, .warm, null);
+    terms.dispatch = try timePhase(harness, stage, weights, tokens, .dispatch, .warm, null);
+    terms.routed = try timePhase(harness, stage, weights, tokens, .routed, .warm, null);
+    terms.shared = try timePhase(harness, stage, weights, tokens, .shared, .warm, null);
+    terms.combine = try timePhase(harness, stage, weights, tokens, .combine, .warm, null);
+    return terms;
+}
+
+/// Times the cold tier: the fetch alone, then routed and the whole block with
+/// that fetch inside the region.
+fn measureCold(
+    harness: *Harness,
+    stage: *Stage,
+    weights: *const ExpertWeights,
+    host_copy: *const ExpertHostCopy,
+    tokens: u32,
+) (KernelError || error{ImpossibleTiming})!ColdTerms {
+    assert(tokens > 0);
+    assert(host_copy.bytes() > 0);
+
+    var terms: ColdTerms = undefined;
+    terms.fetch = try timeFetch(harness, host_copy, weights);
+    terms.routed = try timePhase(harness, stage, weights, tokens, .routed, .cold, host_copy);
+    terms.block = try timePhase(harness, stage, weights, tokens, .block, .cold, host_copy);
+    return terms;
+}
 
 /// Routed-expert FLOPs of one block: gate_up plus down for each assignment.
 fn routedFlops(tokens: u32) f64 {
@@ -3092,29 +3583,243 @@ fn routedFlops(tokens: u32) f64 {
         @as(f64, @floatFromInt(top_k_total)) * per_row;
 }
 
-/// Reports the block at the decode and prefill shapes with the real expert count.
-fn checkThroughput(
+/// Bytes `Stage.init` allocates for `tokens_max`, page-rounded per buffer: the
+/// working set a sweep size needs, reported when it does not fit. The MoE block
+/// is KV-free, so this is activations and gathered rows only. Mirrors the
+/// terms in `Stage.init`.
+fn stageBytes(tokens_max: u32, n_experts: u32, top_k: u32) u64 {
+    assert(tokens_max > 0);
+    assert(n_experts > 0 and n_experts <= experts_total);
+
+    const n_padded = paddedExperts(n_experts);
+    const tiles = tilesUpper(tokens_max, top_k, n_experts);
+    const rows = tiles * mma_rows;
+    const gate_up_frag_words = pack_nvfp4.activationFragmentWords(rows, hidden_size);
+    const gate_up_scale_words = pack_nvfp4.activationScaleWords(rows, hidden_size);
+    const down_frag_words = pack_nvfp4.activationFragmentWords(rows, expert_intermediate);
+    const down_scale_words = pack_nvfp4.activationScaleWords(rows, expert_intermediate);
+
+    var total: u64 = 0;
+    total += pageRounded(@as(u64, n_padded) * hidden_size * 2);
+    total += pageRounded(@as(u64, tokens_max) * n_padded * 4);
+    total += pageRounded(@as(u64, tokens_max) * top_k * 4);
+    total += pageRounded(@as(u64, tokens_max) * top_k * 4);
+    total += pageRounded(@as(u64, rows) * 4);
+    total += pageRounded(@as(u64, tokens_max) * top_k * 4);
+    total += pageRounded(@as(u64, n_experts + 1) * 4);
+    total += pageRounded(@as(u64, n_experts) * 4);
+    total += pageRounded(@as(u64, tiles) * 4);
+    total += pageRounded(@as(u64, tiles) * 4);
+    total += pageRounded(@as(u64, tiles) * 4);
+    total += pageRounded(gate_up_frag_words * 4);
+    total += pageRounded(gate_up_scale_words * 4);
+    total += pageRounded(@as(u64, rows) * 2 * expert_intermediate * 4);
+    total += pageRounded(down_frag_words * 4);
+    total += pageRounded(down_scale_words * 4);
+    total += pageRounded(@as(u64, rows) * hidden_size * 4);
+    total += pageRounded(@as(u64, tokens_max) * hidden_size * 2);
+    total += pageRounded(@as(u64, tokens_max) * hidden_size * 4);
+    total += pageRounded(@as(u64, tokens_max) * hidden_size * 4);
+    total += pageRounded(@as(u64, 2 * shared_intermediate) * hidden_size * 2);
+    total += pageRounded(@as(u64, hidden_size) * shared_intermediate * 2);
+    total += pageRounded(@as(u64, hidden_size) * 4);
+    total += pageRounded(@as(u64, tokens_max) * 2 * shared_intermediate * 4);
+    total += pageRounded(@as(u64, tokens_max) * shared_intermediate * 4);
+    total += pageRounded(@as(u64, tokens_max) * shared_intermediate * 2);
+    total += pageRounded(@as(u64, tokens_max) * shared_intermediate * 2);
+    total += pageRounded(@as(u64, tokens_max) * hidden_size * 4);
+    assert(total > 0);
+    assert(total >= @as(u64, rows) * hidden_size * 4);
+    return total;
+}
+
+/// Bytes the resident expert tier occupies: the four per-expert buffers.
+fn expertBytes(weights: *const ExpertWeights) u64 {
+    assert(weights.gate_up_frag.bytes > 0);
+    assert(weights.down_scale.bytes > 0);
+
+    return weights.gate_up_frag.bytes + weights.gate_up_scale.bytes +
+        weights.down_frag.bytes + weights.down_scale.bytes;
+}
+
+/// Prints one phase row: p50, worst sample, both rates and the per-layer
+/// per-token cost. Every row names its cache state and its parallelism.
+fn reportPhase(tokens: u32, phase: Phase, cache: Cache, timing: Timing) void {
+    assert(tokens > 0);
+    assert(timing.median_ns > 0);
+    assert(timing.max_ns >= timing.median_ns);
+
+    const median_us = @as(f64, @floatFromInt(timing.median_ns)) / 1e3;
+    const max_us = @as(f64, @floatFromInt(timing.max_ns)) / 1e3;
+    const seconds = @as(f64, @floatFromInt(timing.median_ns)) / 1e9;
+    const rows_per_second = @as(f64, @floatFromInt(tokens)) / seconds;
+    const micros_per_token = median_us / @as(f64, @floatFromInt(tokens));
+    std.debug.print(
+        "MoE M={d:<5} 1gpu {s:<4} {s:<8} p50 {d:>9.1} us max {d:>9.1} us = {d:>7.0} tok/s = {d:>6.3} us/token/layer\n",
+        .{ tokens, @tagName(cache), @tagName(phase), median_us, max_us, rows_per_second, micros_per_token },
+    );
+}
+
+/// Routed-only efficiency against the card's block-scaled FP4 peak. Cold rows
+/// are not printed through here: they include a PCIe fetch, not kernel time.
+fn reportRoutedEfficiency(tokens: u32, cache: Cache, timing: Timing) void {
+    assert(tokens > 0);
+    assert(timing.median_ns > 0);
+    assert(fp4_peak_tflops > 0.0);
+
+    const seconds = @as(f64, @floatFromInt(timing.median_ns)) / 1e9;
+    const tflops = routedFlops(tokens) / seconds / 1e12;
+    const percent = tflops / fp4_peak_tflops * 100.0;
+    std.debug.print(
+        "MoE M={d:<5} 1gpu {s:<4} routed efficiency {d:>6.2} TFLOPS = {d:>5.1}% of the {d:.1} TFLOPS OMMA.SF peak\n",
+        .{ tokens, @tagName(cache), tflops, percent, fp4_peak_tflops },
+    );
+}
+
+/// Prints the cold fetch: every expert byte of one layer, host to device.
+fn reportFetch(tokens: u32, timing: Timing, bytes: u64) void {
+    assert(tokens > 0);
+    assert(bytes > 0);
+    assert(timing.median_ns > 0);
+
+    const median_us = @as(f64, @floatFromInt(timing.median_ns)) / 1e3;
+    const max_us = @as(f64, @floatFromInt(timing.max_ns)) / 1e3;
+    const seconds = @as(f64, @floatFromInt(timing.median_ns)) / 1e9;
+    const gigabytes = @as(f64, @floatFromInt(bytes)) / 1e9;
+    const rate = gigabytes / seconds;
+    const micros_per_token = median_us / @as(f64, @floatFromInt(tokens));
+    std.debug.print(
+        "MoE M={d:<5} 1gpu cold fetch p50 {d:>9.1} us max {d:>9.1} us for {d:>6.3} GB = {d:>6.1} GB/s from pinned host DRAM = {d:>6.3} us/token/layer\n",
+        .{ tokens, median_us, max_us, gigabytes, rate, micros_per_token },
+    );
+}
+
+/// The one derived row: the measured block times the model's 48 MoE layers.
+fn reportDerived(tokens: u32, block: Timing) void {
+    assert(tokens > 0);
+    assert(block.median_ns > 0);
+    assert(model_moe_layers > 0);
+
+    const seconds = @as(f64, @floatFromInt(block.median_ns)) / 1e9;
+    const model_seconds = seconds * @as(f64, @floatFromInt(model_moe_layers));
+    const model_rate = @as(f64, @floatFromInt(tokens)) / model_seconds;
+    const micros_per_token = model_seconds * 1e6 / @as(f64, @floatFromInt(tokens));
+    std.debug.print(
+        "MoE M={d:<5} 1gpu warm derived {d}-layer MoE only: {d:>7.1} us/token = {d:>7.0} tok/s " ++
+            "(measured one-layer block x {d}; excludes attention, PLE, lm_head)\n",
+        .{ tokens, model_moe_layers, micros_per_token, model_rate, model_moe_layers },
+    );
+}
+
+/// Prints every warm row for one size and checks that the term sum closes on
+/// the block, so a term measured in the wrong state cannot pass unnoticed.
+fn reportWarm(tokens: u32, terms: WarmTerms) !void {
+    assert(tokens > 0);
+    assert(terms.block.median_ns > 0);
+    assert(terms.combine.median_ns > 0);
+
+    reportPhase(tokens, .block, .warm, terms.block);
+    reportPhase(tokens, .dispatch, .warm, terms.dispatch);
+    reportPhase(tokens, .routed, .warm, terms.routed);
+    reportRoutedEfficiency(tokens, .warm, terms.routed);
+    reportPhase(tokens, .shared, .warm, terms.shared);
+    try checkSharedBound(tokens, terms.shared);
+    reportPhase(tokens, .combine, .warm, terms.combine);
+
+    const sum_ns = terms.dispatch.median_ns + terms.routed.median_ns +
+        terms.shared.median_ns + terms.combine.median_ns;
+    const sum_us = @as(f64, @floatFromInt(sum_ns)) / 1e3;
+    const block_us = @as(f64, @floatFromInt(terms.block.median_ns)) / 1e3;
+    std.debug.print(
+        "MoE M={d:<5} 1gpu warm terms sum {d:>9.1} us vs block {d:>9.1} us ({d:>5.1}%)\n",
+        .{ tokens, sum_us, block_us, sum_us / block_us * 100.0 },
+    );
+    reportDerived(tokens, terms.block);
+}
+
+/// Asserts the shared expert's per-token per-layer cost against the measurement
+/// taken before it left the scalar FFMA path. This bound is the reason the
+/// tensor-core path exists, so it has to be able to fail: a shared expert that
+/// fell back, lost its 64-column tile or picked up a per-token launch overhead
+/// lands back above it.
+fn checkSharedBound(tokens: u32, shared: Timing) !void {
+    assert(tokens > 0);
+    assert(shared.median_ns > 0);
+    assert(shared_micros_per_token_before > 0.0);
+
+    const micros_per_token =
+        @as(f64, @floatFromInt(shared.median_ns)) / 1e3 / @as(f64, @floatFromInt(tokens));
+    std.debug.print(
+        "MoE M={d:<5} 1gpu warm shared bound: {d:>6.3} us/token/layer vs {d:.3} measured before the " ++
+            "tensor-core path = {d:>5.2}x better (bound fails above {d:.3})\n",
+        .{
+            tokens,
+            micros_per_token,
+            shared_micros_per_token_before,
+            shared_micros_per_token_before / micros_per_token,
+            shared_micros_per_token_before,
+        },
+    );
+    if (micros_per_token >= shared_micros_per_token_before) {
+        return error.SharedExpertRegression;
+    }
+}
+
+/// Prints the cold rows for one size: the fetch, then routed and block with
+/// that fetch inside the measured region.
+fn reportCold(tokens: u32, cold: ColdTerms, host_copy: *const ExpertHostCopy) void {
+    assert(tokens > 0);
+    assert(cold.fetch.median_ns > 0);
+    assert(host_copy.bytes() > 0);
+
+    reportFetch(tokens, cold.fetch, host_copy.bytes());
+    reportPhase(tokens, .routed, .cold, cold.routed);
+    reportPhase(tokens, .block, .cold, cold.block);
+}
+
+/// The warm run is the cold run's control: a cold phase has to be slower than
+/// the warm one by roughly the transfer, or the "fetch" never reached the bus.
+fn checkColdControl(tokens: u32, warm: WarmTerms, cold: ColdTerms) !void {
+    assert(tokens > 0);
+    assert(warm.block.median_ns > 0);
+    assert(cold.fetch.median_ns > 0);
+
+    const block_extra_ns: i128 = @as(i128, cold.block.median_ns) - @as(i128, warm.block.median_ns);
+    const routed_extra_ns: i128 = @as(i128, cold.routed.median_ns) - @as(i128, warm.routed.median_ns);
+    const fetch_us = @as(f64, @floatFromInt(cold.fetch.median_ns)) / 1e3;
+    const block_us = @as(f64, @floatFromInt(block_extra_ns)) / 1e3;
+    const routed_us = @as(f64, @floatFromInt(routed_extra_ns)) / 1e3;
+    std.debug.print(
+        "MoE M={d:<5} 1gpu cold control: block +{d:>8.1} us ({d:>5.0}% of fetch), " ++
+            "routed +{d:>8.1} us ({d:>5.0}% of fetch), fetch {d:>8.1} us\n",
+        .{
+            tokens,
+            block_us,
+            block_us / fetch_us * 100.0,
+            routed_us,
+            routed_us / fetch_us * 100.0,
+            fetch_us,
+        },
+    );
+    try std.testing.expect(block_extra_ns > 0);
+    try std.testing.expect(routed_extra_ns > 0);
+    // Paying under half the measured transfer would mean the cold row is
+    // really warm, which is the failure this whole pairing exists to catch.
+    try std.testing.expect(block_extra_ns * 2 >= @as(i128, cold.fetch.median_ns));
+}
+
+/// Proves a size really routes across the full expert count and prints the
+/// gathered-row working set that implies.
+fn reportRouting(
     allocator: std.mem.Allocator,
     harness: *Harness,
-    weights: *const ExpertWeights,
-    fixture: *const Fixture,
-    source_expert: u32,
+    stage: *Stage,
+    tokens: u32,
 ) !void {
-    const max_tokens: u32 = 2048;
-    var stage = try Stage.init(max_tokens, experts_total, top_k_total);
-    defer stage.deinit();
-    try fixture.uploadWeights(allocator, &harness.stream, &stage);
+    assert(tokens > 0);
+    assert(stage.tokens_max >= tokens);
 
-    const x_bf16 = try allocator.alloc(u16, @as(usize, max_tokens) * hidden_size);
-    defer allocator.free(x_bf16);
-    const x_f32 = try allocator.alloc(f32, @as(usize, max_tokens) * hidden_size);
-    defer allocator.free(x_f32);
-    fillInput(x_bf16, x_f32, input_seed ^ 0x9e37_79b9);
-    try uploadAt(&harness.stream, &stage.x, 0, std.mem.sliceAsBytes(x_bf16));
-    try broadcastExperts(&harness.stream, weights, experts_total, source_expert);
-
-    // Prove the prefill timing really routes across the full expert count.
-    try stage.runDispatch(&harness.kernels, &harness.stream, max_tokens);
+    try stage.runDispatch(&harness.kernels, &harness.stream, tokens);
     const counts = try allocator.alloc(u32, experts_total);
     defer allocator.free(counts);
     try downloadSlice(&harness.stream, counts, &stage.expert_counts);
@@ -3122,30 +3827,119 @@ fn checkThroughput(
     for (counts) |count| {
         if (count > 0) hit += 1;
     }
-    try std.testing.expect(hit >= experts_total * 3 / 4);
     std.debug.print(
-        "MoE prefill routing at M={d}: {d} of {d} experts hit, top_k={d}\n",
-        .{ max_tokens, hit, experts_total, top_k_total },
+        "MoE M={d:<5} 1gpu routing {d} of {d} experts hit, {d} assignments, {d} gathered rows\n",
+        .{ tokens, hit, experts_total, tokens * top_k_total, rowsUpper(tokens, top_k_total, experts_total) },
     );
+    try std.testing.expect(hit >= experts_total * 3 / 4);
+}
 
-    const shapes = [_]u32{ 1, 32, 2048 };
-    for (shapes) |tokens| {
-        const block_ns = try timePhase(harness, &stage, weights, tokens, .block);
-        const routed_ns = try timePhase(harness, &stage, weights, tokens, .routed);
-        const block_seconds = @as(f64, @floatFromInt(block_ns)) / 1e9;
-        const routed_seconds = @as(f64, @floatFromInt(routed_ns)) / 1e9;
-        const flops = routedFlops(tokens);
-        const tokens_per_second = @as(f64, @floatFromInt(tokens)) / block_seconds;
+/// One chunk size: allocate its stage, prove routing, time the warm terms and
+/// then the cold tier. A size that does not fit is reported with its byte
+/// count and skipped, never silently dropped.
+fn sweepSize(
+    allocator: std.mem.Allocator,
+    harness: *Harness,
+    weights: *const ExpertWeights,
+    fixture: *const Fixture,
+    host_copy: ?*const ExpertHostCopy,
+    x_bf16: []const u16,
+    tokens: u32,
+) !void {
+    assert(tokens > 0);
+    assert(x_bf16.len >= @as(usize, tokens) * hidden_size);
+
+    const required = stageBytes(tokens, experts_total, top_k_total);
+    var stage = Stage.init(tokens, experts_total, top_k_total) catch |err| {
         std.debug.print(
-            "MoE M={d:<5} block {d:>8.1} us = {d:>9.0} tokens/s | dispatch+routed {d:>8.1} us = {d:>6.2} TFLOPS routed\n",
+            "MoE M={d:<5} 1gpu SKIP: stage allocation failed ({s}); {d} B = {d:.2} GB " ++
+                "of KV-free activations plus {d:.2} GB of resident experts would be needed\n",
             .{
                 tokens,
-                @as(f64, @floatFromInt(block_ns)) / 1e3,
-                tokens_per_second,
-                @as(f64, @floatFromInt(routed_ns)) / 1e3,
-                flops / routed_seconds / 1e12,
+                @errorName(err),
+                required,
+                @as(f64, @floatFromInt(required)) / 1e9,
+                @as(f64, @floatFromInt(expertBytes(weights))) / 1e9,
             },
         );
+        return;
+    };
+    defer stage.deinit();
+
+    try fixture.uploadWeights(allocator, &harness.stream, &stage);
+    try uploadAt(
+        &harness.stream,
+        &stage.x,
+        0,
+        std.mem.sliceAsBytes(x_bf16[0 .. @as(usize, tokens) * hidden_size]),
+    );
+
+    try reportRouting(allocator, harness, &stage, tokens);
+    const warm = try measureWarm(harness, &stage, weights, tokens);
+    try reportWarm(tokens, warm);
+
+    const copy = host_copy orelse {
+        std.debug.print(
+            "MoE M={d:<5} 1gpu cold SKIP: no pinned host capture of the expert tier\n",
+            .{tokens},
+        );
+        return;
+    };
+    const cold = try measureCold(harness, &stage, weights, copy, tokens);
+    reportCold(tokens, cold, copy);
+    try checkColdControl(tokens, warm, cold);
+}
+
+/// Reports the block at the chunk sizes prefill actually runs, warm and cold.
+fn checkThroughput(
+    allocator: std.mem.Allocator,
+    harness: *Harness,
+    weights: *const ExpertWeights,
+    fixture: *const Fixture,
+    source_expert: u32,
+) !void {
+    assert(experts_total > 0);
+    assert(source_expert < experts_total);
+
+    const max_tokens: u32 = 32768;
+    const x_bf16 = try allocator.alloc(u16, @as(usize, max_tokens) * hidden_size);
+    defer allocator.free(x_bf16);
+    const x_f32 = try allocator.alloc(f32, @as(usize, max_tokens) * hidden_size);
+    defer allocator.free(x_f32);
+    fillInput(x_bf16, x_f32, input_seed ^ 0x9e37_79b9);
+    try broadcastExperts(&harness.stream, weights, experts_total, source_expert);
+
+    var host_copy: ?ExpertHostCopy = ExpertHostCopy.capture(&harness.stream, weights) catch |err| blk: {
+        std.debug.print(
+            "MoE cold tier unavailable: pinned host capture failed ({s}); warm rows only\n",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    defer {
+        if (host_copy) |*copy| copy.release();
+    }
+
+    std.debug.print(
+        "MoE prefill chunk sweep on one GPU: {s} (PCI {s}, {d:.1} GB VRAM). " ++
+            "1gpu = single GPU, 1 rank, EP=1 (all {d} experts resident), no TP, no replication.\n",
+        .{
+            harness.device.name_slice(),
+            harness.device.pci_bus_id_slice(),
+            @as(f64, @floatFromInt(harness.device.vram_bytes)) / 1e9,
+            experts_total,
+        },
+    );
+    std.debug.print(
+        "One block = one MoE layer. `cold` fetches the layer's {d:.4} GB expert tier from pinned host DRAM " ++
+            "over PCIe inside the timed region, then runs the same kernels; `warm` reads the resident device copy.\n",
+        .{@as(f64, @floatFromInt(expertBytes(weights))) / 1e9},
+    );
+
+    const shapes = [_]u32{ 2048, 4096, 8192, 16384, 32768 };
+    for (shapes) |tokens| {
+        const copy = if (host_copy) |*copy| copy else null;
+        try sweepSize(allocator, harness, weights, fixture, copy, x_bf16, tokens);
     }
 }
 
