@@ -166,21 +166,21 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 `local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not
 be used for dispatched work until it answers `/v1/models` again.
 
-**`desktop` is offline from 2026-11-24, after the I-027 round completes.** It served its
-purpose (I-024 cleanup passed first time with zero blocking, all eight findings pinned by
-tests) and must not be dispatched to again.
+**`desktop` is offline from 2026-11-24 (user directive): the machine is needed for other
+work.** It served its purpose — I-024 cleanup passed first time with zero blocking, all eight
+findings pinned by tests — and must not be dispatched to again. Mechanical work routes to
+`syn:large:text` instead.
 
-This is not a quality judgement — it is a measurement-hygiene decision. `desktop` is a
-*local* model served by another inference engine on this same machine holding the same four
-GPUs. Every lane that ran on it was competing for VRAM and SM time with any benchmark
-running beside it. That retroactively explains the ~3 % run-to-run spread the I-026 lane had
-to widen a perf guard over, blaming the probe bench: a resident model is a far better
-explanation than a bench. From now on, **all benchmarking happens on a quiet box**, and the
-first M-001 prefill sweep must run with no other engine resident.
+**This is an availability decision, not a measurement-hygiene one.** An earlier version of this
+note claimed `desktop` contended for the same GPUs and thereby explained the ~3 % run-to-run
+spread that forced a perf guard widening. That was wrong: `desktop` is `gary-desktop`, a
+**separate machine** from `gary-agents`, sharing no GPU, VRAM or PCIe with it. The spread
+remains unexplained and must not be attributed to this box.
 
-The routing consequence is one row: mechanical work goes to `syn:large:text` instead. That
-costs throughput on cleanup lanes and is accepted, because a contaminated perf number is
-worth less than nothing — it is a wrong answer that looks like evidence.
+The real benchmark rule is unchanged and independent: **no kernel or benchmark lane may run
+concurrently with another on `gary-agents`.** Conflating the two cost a false causal claim in
+this file, which is the same error class as the earlier bandwidth-tier mistakes — asserting a
+mechanism without checking the topology.
 
 ## 7c. Measured baselines and the bar we are chasing
 
