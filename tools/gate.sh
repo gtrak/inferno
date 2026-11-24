@@ -83,20 +83,30 @@ if [ ! -f tools/ref-trace/quant_oracle.py ]; then
 elif [ ! -x tools/ref-trace/.venv/bin/python ]; then
     echo "SKIP quant fixture drift guard: no venv (run tools/ref-trace/run.sh)"
 else
+    # quant_oracle.py takes no arguments and writes tests/golden/quant in place,
+    # so copy the committed bytes aside, regenerate, compare, then restore. The
+    # tree is left exactly as it was, whether or not drift is detected.
     drift_dir="$(mktemp -d)"
-    ( cd tools/ref-trace && ./.venv/bin/python quant_oracle.py --out-dir "$drift_dir" >/dev/null ) || {
+    cp tests/golden/quant/*.safetensors "$drift_dir/"
+    ( cd tools/ref-trace && ./.venv/bin/python quant_oracle.py >/dev/null ) || {
         echo "FAIL could not regenerate quant fixtures"
+        cp "$drift_dir"/*.safetensors tests/golden/quant/
         rm -rf "$drift_dir"
         exit 1
     }
+    drift_status=0
     for fixture in nvfp4_case fp8_blockwise_case; do
-        if ! cmp -s "$drift_dir/$fixture.safetensors" "tests/golden/quant/$fixture.safetensors"; then
+        if ! cmp -s "$drift_dir/$fixture.safetensors" \
+            "tests/golden/quant/$fixture.safetensors"; then
             echo "FAIL tests/golden/quant/$fixture.safetensors is not reproducible from quant_oracle.py"
-            rm -rf "$drift_dir"
-            exit 1
+            drift_status=1
         fi
     done
+    cp "$drift_dir"/*.safetensors tests/golden/quant/
     rm -rf "$drift_dir"
+    if [ "$drift_status" -ne 0 ]; then
+        exit 1
+    fi
     echo "quant fixtures reproduce byte-for-byte"
 fi
 

@@ -182,7 +182,13 @@ pub fn build(b: *std.Build) !void {
     // The probe is installed by the default step as well, because the gate runs
     // `tools/gate.sh` and then executes the binary it just built.
     const hw_module = create_hw_module(b, target, optimize);
-    const probe_module = create_probe_module(b, target, optimize, hw_module);
+    const probe_module = create_probe_module(
+        b,
+        target,
+        optimize,
+        hw_module,
+        cubin_directory,
+    );
     const probe = b.addExecutable(.{
         .name = probe_binary_name,
         .root_module = probe_module,
@@ -249,9 +255,11 @@ fn create_probe_module(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     hw_module: *std.Build.Module,
+    cubin_directory: std.Build.LazyPath,
 ) *std.Build.Module {
     assert(probe_root_source_file.len > 0);
     assert(hw_module_name.len > 0);
+    assert(cubin_table_file_name.len > 0);
 
     const module = b.createModule(.{
         .root_source_file = b.path(probe_root_source_file),
@@ -260,6 +268,11 @@ fn create_probe_module(
         .link_libc = true,
     });
     module.addImport(hw_module_name, hw_module);
+    // The probe measures achieved GEMM throughput, which means it has to load and
+    // launch the embedded kernels; without this it cannot see any cubin.
+    module.addAnonymousImport("generated_cubins", .{
+        .root_source_file = cubin_directory.path(b, cubin_table_file_name),
+    });
     return module;
 }
 

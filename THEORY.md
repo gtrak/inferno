@@ -67,10 +67,11 @@ Active parameters per token: experts 10/512 × 40.3 B = 0.79 B, dense 3.63 B,
 shared expert 0.24 B → **≈4.4 B active** → 8.8 GFLOP/token, plus attention
 ≈4·L·h·s = 4 × 12 × 2560 × s.
 
-| BF16 tensor peak (M-todo) | ≈95 TFLOPS/GPU (4× FP32 vector) → ~380 TFLOPS aggregate |
-| FP8 tensor peak (M-todo) | ≈190 TFLOPS/GPU → ~760 TFLOPS aggregate |
-| NVFP4 tensor peak (M-todo) | ≈380 TFLOPS/GPU → **~1500 TFLOPS aggregate** — native `OMMA.SF` block-scaled FP4 *is* available on `sm_120a` |
-| practical (30–50 %) | prefill: 450–750 TFLOPS FP4-equivalent aggregate |
+| BF16 tensor peak (**measured** I-006b, M=N=K=4096) | **32.9 TFLOPS/GPU** → ~132 TFLOPS aggregate |
+| FP8 tensor peak (**measured**) | **46.3 TFLOPS/GPU** → ~185 TFLOPS aggregate |
+| NVFP4 tensor peak (**measured**) | **192.5 TFLOPS/GPU** → ~770 TFLOPS aggregate — native `OMMA.SF` block-scaled FP4, **11.4× the dequant→BF16 path** (29.1 TFLOPS) |
+| practical (30–50 %) | prefill: 230–385 TFLOPS FP4-equivalent aggregate. Earlier estimates in this
+file (95/380 TFLOPS) were ~3x optimistic; these are measured. |
 
 **Design consequence (corrected 2026-11-24):** the ModelOpt checkpoint's E4M3
 per-16 block scales are *exactly* the operand format of `OMMA.SF` m16n8k64, so
@@ -79,9 +80,10 @@ A dequantise-to-BF16 + `HMMA` kernel is kept as the exact numerical reference an
 fallback. Decode stays a bandwidth-bound dequant-GEMV (FFMA), because M=1 wastes
 the tensor core.
 
-At 32 K prompt: ≈13 GFLOP/token ⇒ **20–35 K tok/s** prefill ceiling at 30–50 % of
-1500 TFLOPS FP4, realistically **4–10 K tok/s** (bounded by the router/permute
-and attention kernels, not the GEMM); short prompts
+At 32 K prompt: ≈13 GFLOP/token ⇒ **18–30 K tok/s** prefill ceiling at 30–50 % of
+770 TFLOPS FP4, realistically **4–10 K tok/s** (bounded by the router/permute
+and attention kernels, not the GEMM); the 5,000 tok/s target needs ~65 TFLOPS =
+8 % of measured peak, so it is comfortable. Short prompts
 (≤2 K) are dominated by expert GEMV inefficiency, not FLOPs.
 
 **TTFT floor** = one forward pass of the last prompt token + tokenize + schedule
