@@ -17,7 +17,8 @@ const ART = '/home/gary/.pi/agent/sessions/--home-gary-dev-inferno--/subagent-ar
 
 // Every model the routing table may use. Define all of them, always.
 const DEEPSEEK = 'opencode-go/deepseek-v4.1-flash'; // hard work, ONE slot only
-const DESKTOP = 'desktop';                          // straightforward + mechanical
+const DESKTOP = 'desktop';                          // OFFLINE 2026-11-24: local engine on
+// the same GPUs; do NOT dispatch. Kept defined so old scripts do not break.
 const STRONG = 'synthetic/syn:large:text';          // general; ALWAYS the reviewer
 
 const COMMON = 'You are the ONLY writer in your cwd. Never touch /home/gary/dev/inferno (main) '

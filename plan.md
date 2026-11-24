@@ -159,12 +159,28 @@ I-006a → I-006b → I-008/I-009/I-010/I-011/I-012 → I-013 → I-014 → I-01
 | work class | model | notes |
 |---|---|---|
 | hard: tensor-core kernels, numerics, multi-GPU placement/comms, requantiser, end-to-end integration | **`opencode-go/deepseek-v4.1-flash`** ("DeepSeek V4.1 Flash 1017", 1M ctx, $0.15/$0.60 per Mtok) — **one slot only** | reserve the single slot for the critical path |
-| straightforward: cleanup lanes, mechanical kernel ports, test harnesses, docs/specs | **`desktop`** (local, Qwen3.8-Flash-Next IQ4_XS, 262144 ctx) | verified reachable on `gary-desktop.local:1234` |
+| straightforward: cleanup lanes, mechanical kernel ports, test harnesses, docs/specs | **`synthetic/syn:large:text`** | `desktop` is **OFFLINE as of 2026-11-24 (user directive)** — see the note below |
 | general reasoning when the deepseek slot is busy | `synthetic/syn:large:text` | |
 | **review gate** | `synthetic/syn:large:text`, always | the gate has caught 3+ real defects; never downgrade it to a small model, and prefer a *different* family from the implementer to avoid same-model blind spots |
 
 `local/local` (gary-agents) was returning `Bad Gateway` on 2026-11-24 and must not
 be used for dispatched work until it answers `/v1/models` again.
+
+**`desktop` is offline from 2026-11-24, after the I-027 round completes.** It served its
+purpose (I-024 cleanup passed first time with zero blocking, all eight findings pinned by
+tests) and must not be dispatched to again.
+
+This is not a quality judgement — it is a measurement-hygiene decision. `desktop` is a
+*local* model served by another inference engine on this same machine holding the same four
+GPUs. Every lane that ran on it was competing for VRAM and SM time with any benchmark
+running beside it. That retroactively explains the ~3 % run-to-run spread the I-026 lane had
+to widen a perf guard over, blaming the probe bench: a resident model is a far better
+explanation than a bench. From now on, **all benchmarking happens on a quiet box**, and the
+first M-001 prefill sweep must run with no other engine resident.
+
+The routing consequence is one row: mechanical work goes to `syn:large:text` instead. That
+costs throughput on cleanup lanes and is accepted, because a contaminated perf number is
+worth less than nothing — it is a wrong answer that looks like evidence.
 
 ## 7c. Measured baselines and the bar we are chasing
 
