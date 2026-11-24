@@ -11,7 +11,8 @@ lands in `bench/hw-probe.json` (issue I-02) and `ledger.jsonl`.
 |---|---|
 | GPU | 4 × NVIDIA GeForce RTX 5060 Ti, 16311 MiB each = 65244 MiB ≈ 68.4 GB total |
 | compute capability | sm_120 (GB206) → `-arch=sm_120a` |
-| tensor-core ISA (Q, probed with ptxas 13.2) | `mma.sync.m16n8k16.f32.bf16.bf16.f32` **OK**; `mma.sync.m16n8k32.f32.e4m3.e4m3.f32` **OK**; `mma.sync...kind::mxf4nvf4` / `kind::mxf4` block-scaled FP4 **REJECTED** ("Unexpected instruction types"); `kind::f8f6f4` k64 **REJECTED** |
+| tensor-core ISA (Q, verified: `ptxas` 13.2 + `cuobjdump -sass`, see `.agents/design/mma-sm120-nvfp4.md`) | `mma.sync.m16n8k16.f32.bf16.bf16.f32` → HMMA **OK**; `mma.sync.m16n8k32.f32.e4m3.e4m3.f32` → FP8 **OK**; `mma.sync.kind::f8f6f4.m16n8k32.f32.e2m1.e2m1.f32` → `QMMA.16832` **OK**; `mma.sync.m16n8k64.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3` → `OMMA.SF.16864.UE4M3.4X` **OK (native NVFP4)**; `tcgen05.mma` **not available on SM120** |
+| build flag | **`-arch=sm_120a` is mandatory** — plain `sm_120` rejects `.kind::mxf4nvf4` ("Feature not supported on .target 'sm_120'") |
 | max memory clock (Q) | 15501 MHz |
 | memory bandwidth per GPU (M-todo) | spec 448 GB/s (128-bit GDDR7) → aggregate 1792 GB/s |
 | PCIe | **one bifurcated Gen4 x16 = 4 × x4**, all four GPUs on the same root complex; P2P enabled by modified driver |
@@ -53,16 +54,19 @@ shared expert 0.24 B → **≈4.4 B active** → 8.8 GFLOP/token, plus attention
 
 | BF16 tensor peak (M-todo) | ≈95 TFLOPS/GPU (4× FP32 vector) → ~380 TFLOPS aggregate |
 | FP8 tensor peak (M-todo) | ≈190 TFLOPS/GPU → ~760 TFLOPS aggregate |
-| FP4 tensor peak | **n/a — no block-scaled FP4 MMA on sm_120a** (probed); FP4 must be dequantised to BF16 in-kernel, so FP4 GEMM runs at BF16 tensor-core rates plus a dequant cost |
-| practical (30–50 %) | 110–190 TFLOPS BF16-equivalent aggregate |
+| NVFP4 tensor peak (M-todo) | ≈380 TFLOPS/GPU → **~1500 TFLOPS aggregate** — native `OMMA.SF` block-scaled FP4 *is* available on `sm_120a` |
+| practical (30–50 %) | prefill: 450–750 TFLOPS FP4-equivalent aggregate |
 
-**Design consequence:** NVFP4 prefill GEMM = dequantise fp4×scale into **BF16** in
-shared memory (exact: an e2m1 value times an e4m3 scale needs ≤6 mantissa bits,
-so BF16 represents the product exactly), then `m16n8k16` HMMA with fp32
-accumulate. Decode GEMV = dequantise in registers and FFMA (bandwidth bound).
+**Design consequence (corrected 2026-11-24):** the ModelOpt checkpoint's E4M3
+per-16 block scales are *exactly* the operand format of `OMMA.SF` m16n8k64, so
+expert prefill GEMM runs as native W4A4 NVFP4 (a labelled quality trade, gated).
+A dequantise-to-BF16 + `HMMA` kernel is kept as the exact numerical reference and
+fallback. Decode stays a bandwidth-bound dequant-GEMV (FFMA), because M=1 wastes
+the tensor core.
 
-At 32 K prompt: ≈13 GFLOP/token ⇒ **8–15 K tok/s** prefill ceiling at 60 % of
-380 TFLOPS, realistically **2–6 K tok/s**; short prompts
+At 32 K prompt: ≈13 GFLOP/token ⇒ **20–35 K tok/s** prefill ceiling at 30–50 % of
+1500 TFLOPS FP4, realistically **4–10 K tok/s** (bounded by the router/permute
+and attention kernels, not the GEMM); short prompts
 (≤2 K) are dominated by expert GEMV inefficiency, not FLOPs.
 
 **TTFT floor** = one forward pass of the last prompt token + tokenize + schedule

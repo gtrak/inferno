@@ -19,6 +19,8 @@ GPU kernels are CUDA C++ compiled by `nvcc -arch=sm_120a` at build time into
 cubins, embedded into the Zig binary and loaded via the CUDA **Driver** API.
 Rationale: Zig cannot emit PTX/NVPTX; CUDA C++ is the only practical way to
 target Blackwell tensor cores. Everything that *decides or schedules* work is Zig.
+`-arch=sm_120a` is **mandatory** — plain `sm_120` rejects the block-scaled FP4 MMA
+we depend on (`.agents/design/mma-sm120-nvfp4.md`).
 
 ## 2. Hardware (measured / queried, see THEORY.md)
 
@@ -101,7 +103,7 @@ THEORY.md PLAN-log.md ledger.jsonl configs/ best-config.json   (inference-optimi
 | L3 | experts → per-32 block scales (4.25 b/p, 64.2 GB) | frees 3.7 GB VRAM | needs eval gate |
 | L4 | hot/cold expert split, statistics-driven | fits in VRAM | ~2-5% tok on PCIe |
 | L5 | **cold experts computed on the idle CPU** (12 cores, ~40 GB/s DDR4 otherwise unused) instead of PCIe | avoids 1–4 ms/token | implementation |
-| L6 | fused QKV/gate-up GEMMs, fp4 dequant-in-MMA (`sm_120a` block-scaled mma) | 1.3–1.8× prefill | kernel work |
+| L6 | fused QKV/gate-up GEMMs + native `OMMA.SF` NVFP4 block-scaled prefill MMA (verified available on `sm_120a`, see `.agents/design/mma-sm120-nvfp4.md`) | ~4× bf16 tensor throughput for prefill | kernel work |
 | L7 | speculative decoding (prompt-lookup n-gram; MTP later, no HF reference for MTP) | 1.5–2.5× c1 | quality-neutral |
 | L8 | indexer top-k selection early exit at short context | short-ctx gains | none |
 | L9 | batch/pack decode across sequences (continuous batching) | 2–4× cN | scheduler |

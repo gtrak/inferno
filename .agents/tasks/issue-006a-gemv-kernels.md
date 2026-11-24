@@ -14,23 +14,26 @@
 
 ## What to build
 
-### 1. `core/src/kernels/fp4_mma_probe.cu` — capability probe (3 lines, then move on)
+### 1. `core/src/kernels/fp4_mma_probe.cu` — capability probe (10 minutes, then move on)
 
-**Already answered by the orchestrator with `ptxas` 13.2 / `-arch=sm_120a`; do not
-re-litigate, just re-verify and record:**
+**Verified by the orchestrator on this machine** (`ptxas` V13.2.86, `cuobjdump -sass`).
+Full details, exact PTX strings, operand constraints and SASS: read
+`.agents/design/mma-sm120-nvfp4.md`. Summary:
 
-| instruction | verdict |
-|---|---|
-| `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` | **ACCEPTED** |
-| `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` | **ACCEPTED** |
-| `mma.sync...kind::mxf4nvf4.block_scale.scale_vec::4X...` | **REJECTED** |
-| `mma.sync...kind::mxf4.block_scale.scale_vec::2X...` | **REJECTED** |
-| `mma.sync...kind::f8f6f4...` (k64) | **REJECTED** |
+| instruction | SASS | verdict |
+|---|---|---|
+| `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` | HMMA | ACCEPTED |
+| `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` | FP8 | ACCEPTED |
+| `mma.sync.aligned.kind::f8f6f4.m16n8k32.f32.e2m1.e2m1.f32` | `QMMA.16832` | ACCEPTED |
+| `...m16n8k64.kind::mxf4nvf4.block_scale.scale_vec::4X....ue4m3` | `OMMA.SF.16864.UE4M3.4X` | **ACCEPTED — native NVFP4** |
+| `...scale_vec::2X....ue8m0` (MXFP4, per-32) | `OMMA.SF.16864.E8` | ACCEPTED |
+| same instructions with `-arch=sm_120` (no `a`) | — | REJECTED |
 
-So: **no block-scaled FP4 MMA on consumer Blackwell.** Emit the three accepted
-lines (plus one rejected line, kept as a comment) in
-`fp4_mma_probe.cu`, compile it in `zig build`, and write the verdict into
-`bench/fp4-mma-probe.txt`. This is a 10-minute sub-task, not the issue.
+Your job on this sub-task: put these lines in `fp4_mma_probe.cu`, add
+`-arch=sm_120a` as an assertion in the build, write the verdict table into
+`bench/fp4-mma-probe.txt`, and **move on**. Do not re-derive it. If a line stops
+compiling, the cause is almost certainly operand kinds (`byte_id`/`thread_id`
+are `u16` **immediates**), not a missing architectural feature.
 
 ### 2. `core/src/kernels/gemv.cu` — the decode hot path
 
