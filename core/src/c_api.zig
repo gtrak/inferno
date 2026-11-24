@@ -235,6 +235,7 @@ fn copy_truncated(source: []const u8, target: []u8) u32 {
 test {
     _ = @import("hw/dl.zig");
     _ = @import("hw/cuda_driver.zig");
+    _ = @import("hw/kernel.zig");
     _ = @import("hw/cuda_context.zig");
     _ = @import("hw/pcie_link.zig");
     _ = @import("hw/bench.zig");
@@ -245,6 +246,7 @@ test {
     _ = @import("weights/quant.zig");
     _ = @import("hw/kernel.zig");
     _ = @import("kernels/gemm.zig");
+    _ = @import("kernels/gemv.zig");
 }
 
 test "inferno_version is a NUL terminated C string" {
