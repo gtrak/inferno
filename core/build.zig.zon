@@ -1,0 +1,12 @@
+.{
+    .name = .inferno_core,
+    .version = "0.1.0",
+    .fingerprint = 0x3a5583872a81cd6e,
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

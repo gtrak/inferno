@@ -7,3 +7,4 @@ core/zig-out
 bench/*.json
 **/__pycache__/
 *.pyc
+core/src/kernels/generated_cubins.zig
