@@ -108,27 +108,73 @@ produce the reference by dequantizing with an independent implementation
 
 ## Gates
 
+**Rule: no gate expectation may be a hand-written numeric window.** Every expected
+byte count is *derived from config* and asserted exactly, and the whole manifest
+must reconcile against the checkpoint's own index metadata. (Two earlier specs in
+this project asserted impossible windows — an H2D floor above the PCIe ceiling in
+I-002, and a `kv_proj` range that described `k_proj` alone here. Magic ranges are
+the bug; derived equalities are the fix.)
+
 ```
 bash tools/gate.sh ; echo EXIT=$?
 (cd core && zig build manifest && python3 - <<'EOF'
 import json
 m = json.load(open("zig-out/manifest.json"))
-assert m["dims"]["num_hidden_layers"] == 48
-assert m["roles"]["expert"]["count"] == 48*512*3*4      # weight+3 scalars per proj
-gb = m["roles"]["expert"]["bytes"]/1e9
-assert 67.0 < gb < 68.9, gb                            # THEORY.md says 67.95
-ng = m["roles"]["ngram_table"]["bytes"]/1e9
-assert 50.5 < ng < 51.9, ng                            # THEORY.md says 51.20
-kb = m["roles"]["kv_proj"]["bytes"]/1e9
-assert 0.02 < kb < 0.04, kb
-print("manifest OK", m["roles"]["expert"]["bytes"], m["roles"]["ngram_table"]["bytes"])
+r, d = m["roles"], m["dims"]
+
+# --- headline invariant: the manifest accounts for every byte the index claims ---
+assert m["total_bytes"] == m["index_total_size"], (m["total_bytes"], m["index_total_size"])
+
+# --- per-role counts are structural, not empirical ---
+H, L = d["hidden_size"], d["num_hidden_layers"]
+E, I = d["num_experts"], d["moe_intermediate_size"]
+n_full = d["layer_types"].count("indexed_attention")
+n_lin = L - n_full
+assert n_full == 12 and n_lin == 36, (n_full, n_lin)
+assert r["expert"]["count"] == L * E * 3 * 4           # weight + 3 scalars per proj
+assert r["k_proj"]["count"] == n_full
+assert r["v_proj"]["count"] == n_full
+assert r["ngram_table"]["count"] == 128
+
+# --- exact byte counts, derived from shapes and dtypes ---
+BF16 = 2
+assert r["k_proj"]["bytes"] == n_full * 2 * 256 * H * BF16       # 2 kv heads, head_dim 256
+assert r["v_proj"]["bytes"] == r["k_proj"]["bytes"]
+assert r["q_proj"]["bytes"] == n_full * 2 * 24 * 256 * H * BF16  # query AND gate fused
+assert r["o_proj"]["bytes"] == n_full * H * 24 * 256 * BF16
+expert_proj = I * H // 2 + I * H // 16 + 8                       # fp4 pairs + e4m3/block + 2 f32
+assert r["expert"]["bytes"] == L * E * 3 * expert_proj
+assert r["kv_proj_total"]["bytes"] == r["k_proj"]["bytes"] + r["v_proj"]["bytes"]
+
+# --- cross-check against THEORY.md (report deltas, never widen a tolerance) ---
+for role, theory_gb in (("expert", 67.95), ("ngram_table", 51.20),
+                        ("linear_attn", 4.16), ("self_attn", 1.23)):
+    got = r[role]["bytes"] / 1e9
+    assert abs(got - theory_gb) / theory_gb < 0.01, (role, got, theory_gb)
+print("manifest OK", m["total_bytes"], "bytes reconciled")
 EOF
 ) ; echo MANIFEST_EXIT=$?
 (cd core && zig build test) ; echo TEST_EXIT=$?
 ```
 
-All three exits must be 0. The byte totals are the real gate: they prove we
-understand the checkpoint layout, and they must match `THEORY.md` §3.
+All exits must be 0. If the whole-checkpoint reconciliation passes but a role
+derivation fails, the *role taxonomy* is wrong (split or merge the role); never
+relax the derivation.
+
+### Role taxonomy decision (settled)
+
+`k_proj` and `v_proj` are **separate roles**, each 12 tensors of
+`2 kv_heads x 256 x hidden_size` BF16 (31,457,280 B each), because placement and
+the per-tensor requantiser treat them independently. A derived aggregate role
+`kv_proj_total` exists only for reporting. `q_proj` is its own role (query+gate
+fused, `2*24*256` out-features). Do not fold k/v into one role: an aggregate that
+hides two differently-sized tensors is what produced the bad window.
+
+### Partially-downloaded files
+
+Handle an in-flight shard by parsing the header (complete as soon as the file is
+opened for append), reporting `"data_present": false` for that file, and still
+counting its bytes. Only the mmap-touch check may be skipped for such a file.
 
 ## Report format
 
