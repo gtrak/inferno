@@ -83,7 +83,8 @@ Requirements:
 
 ### 2. `core/src/kernels/gemm.zig`
 
-Typed launch wrappers with assertions + a `zig build gemmtest` harness that, for
+Typed launch wrappers with assertions + a test suite (reached through the
+`c_api.zig` import; there is no per-kernel build step) that, for
 every kernel, compares against the f32 oracle at these shapes:
 `M ∈ {1, 16, 128, 512, 2048}` × `(N,K) ∈ {(10240,2560), (6144,2560), (2560,6144), (12288,2560), (640,2560)}`.
 
@@ -109,17 +110,31 @@ print(d['gemm_peak_tflops'])") ; echo PEAK=$?
 ```
 
 Acceptance:
-1. Numerical: the **exact** path `gemm_nvfp4_bf16` must match the oracle on the
-   dequantised weights to `max_abs_err/max|ref| <= 5e-4`; the **fast** path
-   `gemm_nvfp4_mma` must match the oracle on the *original* fp32 weights to
-   `<= 2e-2` (W4A4 error budget) and must be internally repeatable (same input ⇒
-   bit-identical output).
-2. Performance floors for a first correct implementation (tuning is a later
-   issue): `gemm_nvfp4_mma` at `(M=2048,N=10240,K=2560)` **≥ 20 %** of measured
-   NVFP4 peak; `gemm_nvfp4_bf16` **≥ 40 %** of measured bf16 peak;
-   `gemm_fp8_e4m3` **≥ 30 %** of measured fp8 peak. Report real numbers even if a
-   floor is missed, with a profiler-free explanation (occupancy, smem, dequant or
-   repack overhead).
+1. Numerical — a **three-tier ladder**, because kernel correctness and the engine's
+   dtype policy are different questions (`.agents/tasks/review-gate.md` §5):
+   - **tier 1, operand-exact** (both sides get the kernel's own quantised
+     operands): the kernel machinery — repack, fragment layouts, SFA/SFB, epilogue —
+     must match to **≤ 1e-6**. This is the real correctness gate.
+   - **tier 2, W4A16** (`gemm_nvfp4_bf16` vs the oracle on dequantised weights,
+     activations bf16): `max_abs_err/max|ref| <= 5e-4`.
+   - **tier 3, W4A4 vs the original fp32 weights**: **reported, NOT asserted.**
+     E2M1 is a 3-bit grid, so both-operand quantisation gives ~10 % per-element RMS
+     and, for iid data, dot-product error scales with sqrt(K) exactly like the
+     signal — it does not shrink with K. 1.1e-1..1.4e-1 is the *correct* value for
+     any correct W4A4 kernel, confirmed independently by the gate reviewer's
+     from-scratch numpy oracle (1.374e-1). The earlier `<= 2e-2` wording here was an
+     error in this spec: it describes the exact path, not W4A4.
+     W4A4 quality is gated at **I-020** (ΔNLL, router top-k agreement). If it fails
+     there the fallback is `kind::f8f6f4` e2m1×e4m3 (W4A8), available on this GPU.
+   Also required: internal repeatability (same input ⇒ bit-identical output).
+2. Performance floors **must be asserted, not merely printed** — an unasserted
+   floor is decoration (gate finding). Assert at **half** the intended floor so a
+   catastrophic regression fails while run-to-run noise on a shared GPU does not:
+   `gemm_nvfp4_mma` at `(M=2048,N=10240,K=2560)` ≥ 10 % of measured NVFP4 peak;
+   `gemm_nvfp4_bf16` ≥ 20 % of measured bf16 peak; `gemm_fp8_e4m3` ≥ 15 % of
+   measured fp8 peak. Print the achieved percentage and the intended (20/40/30 %)
+   figure alongside. Report real numbers even when a floor is missed, with a
+   profiler-free explanation (occupancy, smem, dequant or repack overhead).
 3. Non-vacuity: print `C[0][0..3]`, verify the output is not constant, and verify
    `M=1` and `M=2048` both agree with the oracle (guards a batch-dependent bug).
 4. Report the ratio `tflops(gemm_nvfp4_mma) / tflops(gemm_nvfp4_bf16)` — this is
