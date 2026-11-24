@@ -238,6 +238,10 @@ test {
     _ = @import("hw/cuda_context.zig");
     _ = @import("hw/pcie_link.zig");
     _ = @import("hw/bench.zig");
+    _ = @import("weights/safetensors.zig");
+    _ = @import("weights/config.zig");
+    _ = @import("weights/manifest.zig");
+    _ = @import("weights/quant.zig");
 }
 
 test "inferno_version is a NUL terminated C string" {

@@ -55,6 +55,25 @@ const cubin_table_header =
     \\
 ;
 
+/// Golden fixtures embedded into the unit tests, so neither the tests nor the
+/// gate need the real checkpoint on disk.
+const golden_fixtures = [_]struct { []const u8, []const u8 }{
+    .{ "golden_quant_nvfp4", "../tests/golden/quant/nvfp4_case.safetensors" },
+    .{ "golden_quant_fp8_blockwise", "../tests/golden/quant/fp8_blockwise_case.safetensors" },
+};
+
+/// Entry point of `zig build manifest`.
+const manifest_main_path = "src/weights/manifest_main.zig";
+
+/// Name of the report the manifest step installs into `zig-out`.
+const manifest_file_name = "manifest.json";
+
+/// Checkpoint used when neither `-Dmodel-dir` nor `INFERNO_MODEL_DIR` is set.
+const model_directory_default = "/home/gary/models/qwen38-flash-next-nvfp4";
+
+/// Environment variable that overrides `model_directory_default`.
+const model_directory_variable = "INFERNO_MODEL_DIR";
+
 /// The cubin generation pass: compiles every kernel and embeds the result.
 const CubinTable = struct {
     write_files: *std.Build.Step.WriteFile,
@@ -171,6 +190,8 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_probe_tests.step);
+
+    build_manifest(b, target, optimize);
 }
 
 /// Creates the hardware layer module that `src/bench/` imports as `hw`.
@@ -210,6 +231,65 @@ fn create_probe_module(
     return module;
 }
 
+/// Adds the `manifest` step: types the checkpoint and writes `zig-out/manifest.json`.
+///
+/// The tool is not part of the library, but it shares the weight code under
+/// `src/weights`, which is why it is built from the same source tree.
+///
+/// The step is opt-in: the install step (what a bare `zig build` requests) must
+/// not depend on it, because the 132 GB checkpoint lives outside the tree and
+/// is absent on most machines. `zig build` therefore stays checkpoint free and
+/// only `zig build manifest` reads the model files.
+fn build_manifest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    assert(manifest_main_path.len > 0);
+    assert(manifest_file_name.len > 0);
+
+    const module = b.createModule(.{
+        .root_source_file = b.path(manifest_main_path),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const tool = b.addExecutable(.{ .name = "inferno-manifest", .root_module = module });
+
+    const run = b.addRunArtifact(tool);
+    // The checkpoint is not a build input (it lives outside the tree and is
+    // 132 GB), so the step must not be treated as up to date when nothing in
+    // the build graph changed: every `zig build manifest` re-reads the headers.
+    run.has_side_effects = true;
+    run.addArg(model_directory(b));
+    const report = run.addOutputFileArg(manifest_file_name);
+    const install = b.addInstallFileWithDir(report, .prefix, manifest_file_name);
+    const step = b.step("manifest", "Write zig-out/manifest.json from the checkpoint");
+    step.dependOn(&install.step);
+}
+
+/// Checkpoint directory: `-Dmodel-dir`, then `INFERNO_MODEL_DIR`, then the default.
+fn model_directory(b: *std.Build) []const u8 {
+    assert(model_directory_default.len > 0);
+    assert(model_directory_variable.len > 0);
+
+    const override = b.option([]const u8, "model-dir", "Checkpoint directory");
+    if (override) |given| {
+        return given;
+    } else {
+        // Fall through to the environment, then to the fixed path.
+    }
+    const from_environment = std.process.getEnvVarOwned(
+        b.allocator,
+        model_directory_variable,
+    );
+    if (from_environment) |value| {
+        return value;
+    } else |_| {
+        return model_directory_default;
+    }
+}
+
 /// Creates the module compiled into both the library and the unit tests.
 fn create_core_module(
     b: *std.Build,
@@ -230,6 +310,11 @@ fn create_core_module(
     module.addAnonymousImport("generated_cubins", .{
         .root_source_file = cubin_directory.path(b, cubin_table_file_name),
     });
+    for (golden_fixtures) |fixture| {
+        module.addAnonymousImport(fixture[0], .{
+            .root_source_file = b.path(fixture[1]),
+        });
+    }
     return module;
 }
 

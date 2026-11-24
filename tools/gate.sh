@@ -25,6 +25,18 @@ zig fmt --check core/src core/build.zig
 step "zig build -Doptimize=ReleaseSafe (core, compiles kernels with nvcc)"
 (cd core && zig build -Doptimize=ReleaseSafe)
 
+# The 132 GB checkpoint is not a build input. A bare `zig build` must succeed on
+# a machine that has no weights at all, so run it again with the model directory
+# pointed at a path that does not exist: a build that still read the checkpoint
+# (the manifest step used to hang off the install step) fails here.
+step "zig build -Doptimize=ReleaseSafe with no checkpoint on disk"
+absent_checkpoint="$repo_root/core/.absent-checkpoint"
+if [ -e "$absent_checkpoint" ]; then
+    echo "$absent_checkpoint exists; it must not" >&2
+    exit 1
+fi
+(cd core && INFERNO_MODEL_DIR="$absent_checkpoint" zig build -Doptimize=ReleaseSafe)
+
 step "zig build test (core)"
 (cd core && zig build test)
 
