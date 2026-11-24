@@ -248,6 +248,7 @@ test {
     _ = @import("kernels/gemm.zig");
     _ = @import("kernels/gemv.zig");
     _ = @import("kernels/moe.zig");
+    _ = @import("kernels/ple.zig");
 }
 
 test "inferno_version is a NUL terminated C string" {
