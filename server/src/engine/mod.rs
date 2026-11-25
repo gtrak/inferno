@@ -6,6 +6,7 @@
 //! graceful shutdown need; they have no effect on the C ABI.
 
 pub mod ffi;
+pub mod handles;
 mod mock;
 pub mod probe;
 mod zig;
