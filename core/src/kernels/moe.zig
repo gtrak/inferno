@@ -3977,4 +3977,3 @@ test "the MoE block matches the fp32 oracle at the real shape" {
 fn benchMode() bool {
     return std.posix.getenv("INFERNO_BENCH") != null;
 }
-

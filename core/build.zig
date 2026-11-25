@@ -247,13 +247,85 @@ pub fn build(b: *std.Build) !void {
     const probe_tests = b.addTest(.{ .root_module = probe_module });
     const run_probe_tests = b.addRunArtifact(probe_tests);
 
+    // ---- Test shards -------------------------------------------------------------------
+    // The suite is one binary whose tests are independent, and the box has four GPUs that
+    // were all pinned to device 0. Sharding gives each group its own process on its own
+    // device. Same-device concurrency stays forbidden: that is the flake actually measured
+    // (two contexts on device 0 -> 2-of-5 failures).
+    //
+    // The multi-rank group needs ALL four devices, so it runs alone, after the single-device
+    // shards have finished.
+    const Shard = struct { name: []const u8, device: ?[]const u8, filters: []const []const u8 };
+    const shards = [_]Shard{
+        // The kernels group was 50 s of a 54 s suite, so it is split rather than
+        // left whole behind the others.
+        .{ .name = "moe", .device = "0", .filters = &.{"kernels.moe."} },
+        .{ .name = "attn-ew", .device = "1", .filters = &.{ "kernels.attention.", "kernels.elementwise." } },
+        .{ .name = "gemm-gemv", .device = "2", .filters = &.{ "kernels.gemm.", "kernels.gemv." } },
+        .{ .name = "support", .device = "3", .filters = &.{ "kernels.ple.", "kernels.gdn.", "model.tiny_check.", "model.exec.", "model.state.", "model.generate.", "model.snapshot.", "model.runtime_check.", "model.load.", "model.glue.", "model.plan.", "model.mod.", "hw.", "weights.", "ref.", "mem." } },
+    };
+
+    var single_device_runs: [shards.len]*std.Build.Step.Run = undefined;
+    for (shards, 0..) |shard, index| {
+        const filtered = b.addTest(.{
+            .root_module = create_core_module(
+                b,
+                target,
+                optimize,
+                cubin_directory,
+                core_root_file,
+            ),
+            .filters = shard.filters,
+        });
+        const run = b.addRunArtifact(filtered);
+        if (shard.device) |device| {
+            run.setEnvironmentVariable("CUDA_VISIBLE_DEVICES", device);
+        } else {
+            // The quad-rank group must see every card.
+        }
+        single_device_runs[index] = run;
+    }
+
+    // The multi-rank group: needs all four devices, so it is ordered after the shards.
+    const multi_tests = b.addTest(.{
+        .root_module = create_core_module(
+            b,
+            target,
+            optimize,
+            cubin_directory,
+            core_root_file,
+        ),
+        .filters = &.{"model.multi."},
+    });
+    const run_multi_tests = b.addRunArtifact(multi_tests);
+    for (single_device_runs) |run| {
+        run_multi_tests.step.dependOn(&run.step);
+    }
+
+    // The probe binary gets its own device so it does not contend with the shards.
+    const run_probe_tests_device = run_probe_tests;
+    run_probe_tests_device.setEnvironmentVariable("CUDA_VISIBLE_DEVICES", "3");
+
     const test_step = b.step("test", "Run unit tests");
-    // Both binaries bring up a CUDA context on device 0. With no edge between them Zig
-    // runs them concurrently, and a reviewer measured 2 of 5 `zig build test` runs failing
-    // at different GPU tests as a result. Serialise: probe waits for core.
-    run_probe_tests.step.dependOn(&run_core_tests.step);
-    test_step.dependOn(&run_core_tests.step);
-    test_step.dependOn(&run_probe_tests.step);
+    for (single_device_runs) |run| {
+        test_step.dependOn(&run.step);
+    }
+    test_step.dependOn(&run_multi_tests.step);
+    test_step.dependOn(&run_probe_tests_device.step);
+
+    // The unfiltered whole-suite run stays available for anyone who wants one process.
+    const whole_step = b.step("test-whole", "Run every test in a single process");
+    whole_step.dependOn(&run_core_tests.step);
+
+    // Fast, targeted entry points so a lane can run only what it owns. These reuse the
+    // shard runs above rather than compiling a second time.
+    for (shards, 0..) |shard, index| {
+        const step = b.step(
+            b.fmt("test-{s}", .{shard.name}),
+            "Run one test shard",
+        );
+        step.dependOn(&single_device_runs[index].step);
+    }
 
     build_manifest(b, target, optimize);
 
