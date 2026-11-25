@@ -4,6 +4,29 @@ Read this first. Newest entries at the top of each stage. Numbers here are measu
 
 ---
 
+## Stage 2 — I-039 crate split — DONE, merged 812c5c1
+
+**Lane outcome:** completed inside its 90-minute ceiling and reported properly. Verified independently
+before banking.
+
+**Shipped:** `host/` (`inferno-host`: admission, engine, tokenizer, stop, template, config, telemetry,
+metrics; links the Zig archive; no axum) and `server/` (`inferno-server`: api/, server.rs, main.rs; depends
+on host; binary name unchanged). `build.rs` moved to the crate that links, and its mandatory handle-ABI
+check still fails the build when a symbol is missing (the lane proved it with a bogus name, then restored).
+
+**The catch worth keeping:** the three `compile_fail` handle doctests had to be retargeted
+`inferno_server` → `inferno_host`. Left untouched they would have passed by failing on the *unresolved
+import* instead of the ownership error — a vacuous green. Verified that the import paths resolve
+(`lib.rs: pub mod engine`, `engine/mod.rs: pub mod handles`), so the compile failure is the real E0277.
+
+**Verified by me:** gate passed 142 s (budget 160 s), including `probe ok: 4 devices, driver 610.57.04,
+cuda 13030`, `clippy -D warnings` across the workspace, zig 263/269 (6 skipped), host 34 unit + 3 doctests,
+server 8 + 14 + 8 + 3 + 1 + 2, and invariants now report `rust workspace = 2 crates`, 187 graph crates.
+
+**Lane's open item, deliberately deferred:** `server/src/lib.rs` re-exports the host modules widely so the
+untouched test suite keeps one spelling. Narrowing it would edit tests, which I-039 forbids. Follow-up
+later, not now.
+
 ## Stage 1 — I-036 handles (ABI foundation) — DONE, merged 3e3e6ae
 
 **Lane outcome:** timed out at its 30-minute first-attempt ceiling while writing its report, but had
