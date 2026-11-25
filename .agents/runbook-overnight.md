@@ -9,8 +9,22 @@ Target end state: `.agents/design/target-state.md`. Alignment instrument: the ex
 
 - Worker model `opencode-go/deepseek-v4.1-flash`; one worktree slot per lane
   (`.agents/worktrees/slot-1..4`). Workers **never commit**, never touch main or another slot.
-- **Worker hard timeout is 30 min.** Scope every dispatch to fit. A timed-out worker still leaves green
-  partial work; read its log for the last suite result, verify it myself, commit it.
+- **Worker timeout: 30 min on the first attempt, 90 min for every attempt after the first failure**
+  (user, 2026-11-25). Only raise the ceiling after a lane has actually failed once — the first pass is
+  where a badly-scoped brief shows up cheaply. 90 min is a ceiling, not a target: a lane that runs 90
+  min and produces nothing committed has failed regardless.
+- A timed-out worker still leaves green partial work; read its log for the last suite result, verify it
+  myself, commit it, and **narrow the retry's scope** rather than re-sending the same brief with more time.
+
+### Staying productive (user: "the work needs to stay productive")
+
+- Every dispatch must be capable of ending in one of: a commit, or a written finding in this log. No
+  lane may run without a defined output artifact.
+- No idle waiting: while a lane runs, do verified non-conflicting work (read-only investigation, specs,
+  review of a previous lane's diff). Never dispatch a second lane that touches the parent's files.
+- If a lane returns "could not finish X", the parent splits X and says so — it does not silently retry
+  the same larger task.
+- Partial value is banked immediately: green + measured work gets committed before the next attempt.
 - **Never trust a worker's green.** After each lane I re-run: `zig build test --summary all`,
   `cargo test`, `bash tools/gate.sh`, and record the numbers in the run log.
 - Merge discipline: commit on the lane branch, `git merge --no-ff` into main, reset all slots to main.
@@ -56,6 +70,26 @@ Tolerance in the output format's precision, never a blanket 1e-6.
 **M-E performance (8).** Numbers measured under identical conditions, with the two traps recorded:
 `-Doptimize=ReleaseSafe` does **not** build the test artifact (stale binary), and piping `zig build test`
 through awk gives a single timestamp. Targets: ≥150 tok/s decode at 262,144 ctx, ≥5000 tok/s prefill.
+
+## Measurement discipline (this was my miss — user, 2026-11-25)
+
+The timeout investigation was mine to solve and it consumed the user's attention it should not have.
+What went wrong: I reported a 13.64 s figure that was **compile time**, then a ">150 s hang" I had not
+isolated, and only found the real causes — orphaned `zig`/`test` processes spawned by my own aborted tool
+calls, and then `std.testing.allocator` in a bulk path — after the user intervened three times
+("do one at a time", "we have leftover process", "don't re-run gates").
+
+Standing checklist before any timing claim or slow-path diagnosis:
+
+1. **Prove the box is idle.** `pgrep -x zig; pgrep -x test; pgrep -x cargo` and GPU memory. My own aborted
+   calls leave processes running; a timing taken with them alive is void.
+2. **Separate compile from run.** Run twice; the second run is the measurement. `zig build` time is not
+   test time, and `-Doptimize=ReleaseSafe` does not rebuild the test artifact at all.
+3. **Instrument phases before restructuring anything.** The manifest was 0.57 s the whole time; the
+   "optimisation" I nearly started would have fixed nothing.
+4. **Bisect with one variable.** Same build, one allocator swapped — not a shard redesign.
+5. **Never route debugging to the user.** They get decisions and authorisations, not "it's slow, help".
+   If I catch myself asking for a debugging opinion, the correct move is another measurement.
 
 ## Standing constraints
 
