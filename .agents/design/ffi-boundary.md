@@ -42,6 +42,35 @@ unrepresentable - and that is Zig's strength. So the split is not "prove in Rust
 | **borrowck (Rust)** | ownership across calls: dangling interiors, use-after-move, lifecycle |
 | **runtime guards (Zig)** | arithmetic, ordering, write-before-read - bounded cost, first-run failure |
 
+## What the boundary actually is (refined 2026-11-25, user)
+
+The boundary is **by role, not by language**:
+
+- **Zig = inference.** Kernels, the forward pass, and the layout algebra those kernels agree with.
+  It executes; it does not decide when, what, or from where.
+- **Rust = integration.** Complex orchestration and ownership: which model is loaded and for how long,
+  where each expert's bytes came from, sequence lifetime, scheduling, tokenisation, stop conditions,
+  transport. The borrow checker earns its keep here because this is where the ownership lives.
+
+The three items below were always this shape, but they were hard to see because **the Rust crate root is
+called `server`** — so "move the load pipeline to Rust" read as "put loading in the HTTP layer", which
+sounds absurd and invites arguments no one should have had. `server/src/lib.rs` already holds
+`admission`, `engine`, `tokenizer`, `stop`, `template`; only `api/`, `server.rs` and `main.rs` are
+transport. The name was misdescribing the design and steering it.
+
+**Therefore (I-039):** split the crate before moving behaviour into it.
+
+| crate | role | contents |
+|---|---|---|
+| `host/` (`inferno-host`) | integration + ownership | lifecycle, load pipeline, sequence/decode control, scheduler, tokenizer, stop, template, telemetry |
+| `server/` (`inferno-server`) | transport only | `api/`, `server.rs`, `main.rs`; depends on `inferno-host` |
+| `core/` (Zig) | inference | kernels, forward, placement algebra exposed **as data**, C ABI |
+
+A consequence worth naming: **loading is Rust's**, including reading the checkpoint's headers. Zig keeps
+a minimal safetensors reader for the *tiny fixture* and the quantisation goldens — a different artifact
+from the 132 GB checkpoint, so it is a split by artifact, not a duplicated parser in the same job. The
+production parser's validation suite (its refusal tests) moves with it to Rust.
+
 ## The principle
 
 **Put the boundary where data is bulk or batched and latency-irrelevant; keep it coarse; let exactly
