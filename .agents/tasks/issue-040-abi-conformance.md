@@ -42,6 +42,26 @@ serially) exactly as the Zig shards do, so it cannot reintroduce the measured 2-
 | production-safetensors refusals | I-038 |
 | **stays Zig**: kernels vs oracle, `hw/`, forward numerics vs trace, quad-rank forward | — |
 
+## The trap already in the build (found while preparing this issue)
+
+`server/build.rs` links the Zig archive (`cargo:rustc-link-lib=static=inferno_core`) and **detects**
+whether the engine ABI symbols are present, emitting `cfg(inferno_core_abi_absent)` and swapping in
+not-implemented fallbacks when they are missing. Today the archive exports 4 symbols
+(`inferno_cubin_count`, `inferno_cubin_at`, `inferno_version`, `inferno_probe_devices`) and none of the 7
+engine ABI symbols, so the fallbacks are active.
+
+That mechanism is right for the binary and **dangerous for the tests**: a conformance test written against
+the same cfg would *silently skip* when the ABI is missing, and a suite that skips is a suite that passes
+(plan.md §7j: a guard only run on request is decoration; the review gate already had this exact bug where
+silence was treated as a pass). So this issue must:
+
+- make a **missing ABI a hard failure** in the test build, not a fallback: the symbol-detection result is
+  asserted by a test (or by build.rs when `CARGO_CFG_TEST`-style intent is detectable), so the conformance
+  suite cannot report green while the exports are absent;
+- keep the fallback for the *binary*, which may legitimately build before the ABI lands;
+- assert **each** required symbol individually, so a partially-exported ABI fails loudly instead of
+  half-linking (`5 of 7` is currently the kind of state that could pass unnoticed).
+
 ## Alignment instrument
 
 - Zig suite green, and its count may only change by tests this issue names as moved.
