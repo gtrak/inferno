@@ -472,6 +472,26 @@ README.
 Corollary for reporting: when a lane discovers the answer is already published, **stop and say so**
 rather than finishing the expensive version out of momentum.
 
+## 7i. Quality is validated at short context (user decision 2026-11-24)
+
+The published bf16 logits trace tops out at **2,048 scored positions** and no external reference exists
+at 262,144. Decision: **short context is fine.** Use it as the quality reference and stop looking for a
+long-context oracle.
+
+| property | reference used |
+|---|---|
+| implementation correctness (does our engine compute this checkpoint) | **published bf16 logits, Wikitext-2, 2,048 positions** — KL, dPPL, argmax agreement |
+| kernel numerics | fp32 CPU oracle in `core/src/ref/`, identical inputs, ulp/relative bounds |
+| **262,144-token behaviour** | **ours only**: the fp32 oracle trace + the QSA exactness gates (per-row bitmap, `set_difference == 0` at 4K/32K/128K/256K) |
+
+Consequence for claims: a quality number derived from the published trace is a **short-context**
+number and must be labelled that way. Nothing we do validates long-context quality against an
+independent implementation, and the honest statement is "long-context behaviour is validated
+internally, not externally". Do not let a 2,048-position KL figure stand in for the 262,144 case.
+
+This also means: **no more disk spent hunting long-context traces.** The 5.7 GB already fetched under
+`traces/` is sufficient for the quality gate.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by
