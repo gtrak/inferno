@@ -60,6 +60,12 @@ const bf16_bytes: u64 = 2;
 /// Timed samples per case; the median is reported.
 const timing_samples: usize = 7;
 
+/// Measurement sweeps are opt-in: `zig build test` asserts, INFERNO_BENCH=1 measures. The extra
+/// shapes only report throughput, so the default suite does not need their oracle cost.
+fn benchMode() bool {
+    return std.posix.getenv("INFERNO_BENCH") != null;
+}
+
 /// Upper bound on the copies of one weight matrix the harness cycles through
 /// while timing, so every timed read misses L2.
 const timing_copies: usize = 32;
@@ -1589,8 +1595,11 @@ test "nvfp4 decode gemv matches the fp32 oracle at the real model shapes" {
     const allocator = std.testing.allocator;
     var weights_random = std.Random.DefaultPrng.init(0x006a_0001);
     var activation_random = std.Random.DefaultPrng.init(0x006a_0002);
-    // Every production shape of the model, plus one partial trailing block.
-    const shapes = [_]Shape{
+    // Only index 0 is GRADED below; every other shape merely reports throughput. So the full
+    // list is a measurement, not an assertion: lm_head's 248320x2560 alone costs ~21 s of fp32
+    // oracle (2.5 GB of host comparison) for a line nobody gates on.
+    // Default: the acceptance shape plus the partial-block case. INFERNO_BENCH=1 sweeps all.
+    const all_shapes = [_]Shape{
         .{ .n = 10240, .k = 2560 }, // dense projection, the acceptance shape
         .{ .n = 6144, .k = 2560 }, // gate/up of an expert group
         .{ .n = 12288, .k = 2560 }, // wide gate/up
@@ -1598,6 +1607,8 @@ test "nvfp4 decode gemv matches the fp32 oracle at the real model shapes" {
         .{ .n = 248320, .k = 2560 }, // lm_head, the largest matrix
         .{ .n = 40, .k = 2560 }, // n % 8 == 0 but not % 32: partial last block
     };
+    const default_shapes = [_]Shape{ all_shapes[0], all_shapes[5] };
+    const shapes: []const Shape = if (benchMode()) &all_shapes else &default_shapes;
 
     var acceptance_fraction: f64 = 0.0;
     var acceptance_error: f64 = std.math.floatMax(f64);

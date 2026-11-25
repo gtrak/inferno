@@ -3936,7 +3936,11 @@ fn checkThroughput(
         .{@as(f64, @floatFromInt(expertBytes(weights))) / 1e9},
     );
 
-    const shapes = [_]u32{ 2048, 4096, 8192, 16384, 32768 };
+    // One size by default: the sweep is a measurement, not an assertion. 2048 keeps the
+    // chunk-size lever visible in the log; INFERNO_BENCH=1 runs the full range.
+    const all_shapes = [_]u32{ 2048, 4096, 8192, 16384, 32768 };
+    const default_shapes = [_]u32{2048};
+    const shapes: []const u32 = if (benchMode()) &all_shapes else &default_shapes;
     for (shapes) |tokens| {
         const copy = if (host_copy) |*copy| copy else null;
         try sweepSize(allocator, harness, weights, fixture, copy, x_bf16, tokens);
@@ -3965,3 +3969,12 @@ test "the MoE block matches the fp32 oracle at the real shape" {
         hosts[0].expert,
     );
 }
+
+/// Measurement sweeps are opt-in. `zig build test` asserts correctness; the throughput and
+/// cold-tier sweeps are *measurements*, which plan.md requires to run on a quiet box with their
+/// topology labelled. Running them inside every gate made the suite slow and the numbers
+/// contaminated. Set INFERNO_BENCH=1 to run the full sweeps.
+fn benchMode() bool {
+    return std.posix.getenv("INFERNO_BENCH") != null;
+}
+
