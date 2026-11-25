@@ -79,6 +79,12 @@ isolated, and only found the real causes — orphaned `zig`/`test` processes spa
 calls, and then `std.testing.allocator` in a bulk path — after the user intervened three times
 ("do one at a time", "we have leftover process", "don't re-run gates").
 
+**A checklist did not prevent this and would not have: both traps were already written in my notes when
+I walked into them.** So the control is mechanical — `tools/measure.sh` refuses to produce a number on a
+busy box, always runs twice, and rejects the pair when they disagree by more than 25 %. Any timing number
+I report must come from its `quotable` line; hand-timed figures are not reportable. It caught a live busy
+box on its first day (the running lane's `zig`/`build` processes).
+
 Standing checklist before any timing claim or slow-path diagnosis:
 
 1. **Prove the box is idle.** `pgrep -x zig; pgrep -x test; pgrep -x cargo` and GPU memory. My own aborted
