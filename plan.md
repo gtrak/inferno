@@ -496,6 +496,17 @@ internally, not externally". Do not let a 2,048-position KL figure stand in for 
 This also means: **no more disk spent hunting long-context traces.** The 5.7 GB already fetched under
 `traces/` is sufficient for the quality gate.
 
+## 7j. Guard bands are on by default — iterate with them off, gate with them on
+
+`INFERNO_GUARD_BANDS` defaults to **1**, so `zig build test` spends **195.86 s against 105.99 s**
+scanning 66 guarded allocations x 2 MiB after each of 48 layers (~6.3 GB of PCIe per forward). That
+price is deliberate: a guard exercised only when someone remembers an env var is decoration, and this
+project has shipped two gates that could never fail.
+
+**For lanes:** iterate with `INFERNO_GUARD_BANDS=0`, then run the **final** gate without the override.
+Report the banded result, not the fast one. If a lane only ever reports the bands-off number, it has
+not run the gate the project uses.
+
 ## 8. Non-negotiable
 
 0. **The core is dependency-free and its unsafe mass stays contained.** Enforced by

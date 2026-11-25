@@ -33,6 +33,8 @@ const COMMON = 'You are the ONLY writer in your cwd. Never touch /home/gary/dev/
   + 'Never change a core/src/ref/ body or semantics (adding `pub` is allowed). Never weaken a '
   + 'tolerance or a gate. Gates: bash tools/gate.sh ; echo EXIT=$? AND cd core && zig build test ; '
   + 'echo EXIT=$? -- wrap long runs in timeout, paste real output, never | tail then $?. '
+  + 'Guard bands are ON by default and roughly double core-test wall time (196 s vs 106 s): use '
+  + 'INFERNO_GUARD_BANDS=0 for iteration, then run the final gate WITHOUT the override. '
   + 'HARD TIME DISCIPLINE: if a measurement is proving hard, STOP, report the number you have as '
   + '"not measured" with the reason, and finish the deliverable. A green tree with an honest gap '
   + 'beats a perfect report that never lands.';
