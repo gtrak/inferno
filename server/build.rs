@@ -12,12 +12,27 @@
 //! day I-15 exports the ABI the fallbacks disappear without an edit here.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Optimization mode of the Zig library. The gate builds the Rust side with
 /// `--release`; the core keeps its safety checks in both profiles.
 const ZIG_OPTIMIZE: &str = "ReleaseSafe";
+
+/// Every symbol of the model/sequence handle ABI (I-036) that
+/// `src/engine/handles.rs` declares.
+///
+/// Unlike the engine ABI below, this one is not optional: the Rust handle module
+/// has no fallback, so the archive must define all of it.
+const HANDLE_ABI_SYMBOLS: [&str; 7] = [
+    "inferno_model_open",
+    "inferno_model_close",
+    "inferno_seq_open",
+    "inferno_seq_close",
+    "inferno_seq_reset",
+    "inferno_seq_step",
+    "inferno_handle_counts",
+];
 
 /// Every symbol of the engine C ABI that `src/engine/ffi.rs` declares.
 const ENGINE_ABI_SYMBOLS: [&str; 7] = [
@@ -65,14 +80,18 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=inferno_core");
 
+    let archive = std::fs::read(&library).expect("the Zig static library is readable");
+
     println!("cargo::rustc-check-cfg=cfg(inferno_core_abi_absent)");
-    if !defines_engine_abi(&library) {
+    if !defines_engine_abi(&archive) {
         println!("cargo:rustc-cfg=inferno_core_abi_absent");
         println!(
             "cargo:warning=libinferno_core.a does not export the engine C ABI yet (issue I-15); \
              building with the not-implemented fallbacks, so only `--engine mock` will serve"
         );
     }
+
+    assert_handle_abi(&archive);
 
     // The cubins are part of the archive, so kernel sources and the Zig build
     // graph are inputs of this crate as well.
@@ -96,11 +115,25 @@ fn main() {
 /// A byte scan is enough: the archive's string table holds the mangled names of
 /// the symbols it defines, and the core never *references* its own exported C
 /// ABI, so a hit means the symbol is defined rather than merely wanted.
-fn defines_engine_abi(library: &Path) -> bool {
-    let archive = std::fs::read(library).expect("the Zig static library is readable");
+fn defines_engine_abi(archive: &[u8]) -> bool {
     ENGINE_ABI_SYMBOLS
         .iter()
-        .all(|symbol| contains(&archive, symbol.as_bytes()))
+        .all(|symbol| contains(archive, symbol.as_bytes()))
+}
+
+/// Fails the build with a sentence, not a linker error, when the archive is
+/// missing part of the handle ABI that `src/engine/handles.rs` links against.
+fn assert_handle_abi(archive: &[u8]) {
+    let missing: Vec<&str> = HANDLE_ABI_SYMBOLS
+        .iter()
+        .copied()
+        .filter(|symbol| !contains(archive, symbol.as_bytes()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "libinferno_core.a does not export the handle C ABI ({missing:?}); \
+         core/src/c_api.zig must `export` those symbols"
+    );
 }
 
 /// Reports whether `haystack` contains `needle`.

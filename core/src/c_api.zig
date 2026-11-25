@@ -8,6 +8,7 @@ const std = @import("std");
 
 const cuda_driver = @import("hw/api.zig").cuda_driver;
 const generated_cubins = @import("generated_cubins");
+const handles = @import("model/handles.zig");
 
 const Cubin = generated_cubins.Cubin;
 
@@ -232,6 +233,131 @@ fn copy_truncated(source: []const u8, target: []u8) u32 {
     return @intCast(length);
 }
 
+// ---------------------------------------------------------------------------
+// Model and sequence handles (I-036).
+//
+// Rust owns the lifetime policy; these seven symbols are the mechanism it
+// drives. Every one of them answers a refusal with a code rather than an
+// assertion: a panic here would abort the Rust process across the ABI (plan.md
+// §8 rule 1b). The codes are `handles.Code`, and `handles.codeFor` is the only
+// place an error becomes one.
+// ---------------------------------------------------------------------------
+
+/// Opens the model `manifest_json` describes, or returns null.
+///
+/// The document is a JSON object with a `model` key; `{"model":"tiny"}` names
+/// the committed tiny fixtures, which is the only forward this build has until
+/// I-017c lands the real checkpoint. The ABI has no error out-parameter, so the
+/// reason for a null is logged here instead of returned.
+export fn inferno_model_open(
+    manifest_json: ?[*]const u8,
+    length: u32,
+) ?*handles.Cell {
+    assert(handles.models_max > 0);
+    assert(handles.manifest_bytes_max > 0);
+
+    return handles.openModel(manifest_json, length) catch |err| null_after(
+        "inferno_model_open",
+        err,
+    );
+}
+
+/// Closes `handle`, freeing the model and every buffer it owns. Idempotent: a
+/// stale handle frees nothing.
+export fn inferno_model_close(handle: ?*handles.Cell) void {
+    assert(handles.models_max > 0);
+    assert(handles.model_cells_max > 0);
+
+    handles.closeModel(handle);
+}
+
+/// Opens a sequence over `model` and prefills `ids`, or returns null.
+///
+/// A sequence that outlives its model is impossible in Rust (the lifetime
+/// parameter), but the C ABI cannot forbid it, so the sequence is orphaned by
+/// `inferno_model_close` and answers `model_closed` afterwards.
+export fn inferno_seq_open(
+    model: ?*const handles.Cell,
+    ids: ?[*]const u32,
+    count: u32,
+) ?*handles.Cell {
+    assert(handles.sequences_max > 0);
+    assert(handles.prompt_ids_max > 0);
+
+    return handles.openSequence(model, ids, count) catch |err| null_after(
+        "inferno_seq_open",
+        err,
+    );
+}
+
+/// Closes `handle`, returning its slot to the table. Idempotent.
+export fn inferno_seq_close(handle: ?*handles.Cell) void {
+    assert(handles.sequence_cells_max > 0);
+    assert(handles.sequences_max > 0);
+
+    handles.closeSequence(handle);
+}
+
+/// Returns the sequence to start-of-sequence and replays its prompt.
+export fn inferno_seq_reset(handle: ?*const handles.Cell) i32 {
+    assert(handles.sequences_max > 0);
+    assert(handles.prompt_ids_max > 0);
+
+    handles.resetSequence(handle) catch |err| {
+        return handles.codeFor(err);
+    };
+    return @intFromEnum(handles.Code.ok);
+}
+
+/// Produces the next id into `out_token`; see `handles.stats_len` for
+/// `out_stats`, which may be null or shorter than the vector.
+export fn inferno_seq_step(
+    handle: ?*const handles.Cell,
+    out_token: ?*u32,
+    out_stats: ?[*]f32,
+    stats_cap: u32,
+) i32 {
+    assert(handles.stats_len > 0);
+    assert(handles.sequences_max > 0);
+
+    handles.stepSequence(handle, out_token, out_stats, stats_cap) catch |err| {
+        return handles.codeFor(err);
+    };
+    return @intFromEnum(handles.Code.ok);
+}
+
+/// Fills `out` with the handle tables' counters; 0 on success, -1 on null.
+///
+/// The Rust side reads this to prove that a dropped `Sequence` and a closed
+/// `Model` left no slot occupied and no allocation behind.
+export fn inferno_handle_counts(out: ?*handles.Counts) i32 {
+    assert(handles.models_max > 0);
+    assert(handles.sequences_max > 0);
+
+    if (out) |counts| {
+        handles.readCounts(handles.instance(), counts);
+        return @intFromEnum(handles.Code.ok);
+    } else {
+        return @intFromEnum(handles.Code.invalid_argument);
+    }
+}
+
+/// Logs why a handle could not be issued and returns the ABI's null.
+fn null_after(
+    entry_point: []const u8,
+    err: anyerror,
+) ?*handles.Cell {
+    assert(entry_point.len > 0);
+    assert(err != error.NoError);
+
+    std.log.err("{s}: {s} (code {d})", .{
+        entry_point,
+        @errorName(err),
+        handles.codeFor(err),
+    });
+    return null;
+}
+
 // One merged import list. Each lane added its own `hw/kernel.zig` line, so the
 // merges stacked four copies of it; kept deduplicated and grouped by directory.
 test {
@@ -255,6 +381,7 @@ test {
     _ = @import("kernels/gemv.zig");
     _ = @import("kernels/moe.zig");
     _ = @import("kernels/ple.zig");
+    _ = @import("model/handles.zig");
     _ = @import("model/mod.zig");
     _ = @import("model/multi.zig");
 }
