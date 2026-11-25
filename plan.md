@@ -141,7 +141,11 @@ THEORY.md PLAN-log.md ledger.jsonl configs/ best-config.json   (inference-optimi
 - [ ] **I-016** sampling, C ABI, token streaming → wires I-007 to the real engine end to end
 
 ### Wave 5 — real model + hill-climb
-- [ ] **I-017** load the real 132 GB checkpoint; placement report; first coherent tokens
+- [x] **I-017a** real checkpoint loads on 4 ranks, extents read back and verified: 61.1 GiB in VRAM,
+      47.7 GiB PLE n-gram table host-resident, 4.39 GB/s, 413 KB headroom (opt-in: `INFERNO_SHARD_LOAD=1`)
+- [x] **I-017b** real config drives the reference plan: 48 layers (36 linear + 12 indexed), 512 experts
+      top-10, ctx 262144, mrope [11,11,10], one PLE layer resolved to index 1 (`model/config_bridge.zig`)
+- [ ] **I-017c** real-weight forward: first coherent tokens (see `.agents/tasks/issue-017c-real-forward.md`)
 - [ ] **I-018** acceptance gates: needle at 50 %/100 % context, chat + tools round-trip, soak
 - [ ] **I-019** CUDA graphs + kernel tuning round 1 (L1, L6)
 - [ ] **I-020** requantiser: dense→FP8 (L2), experts→per-32 MXFP4 (L3), with quality gate
