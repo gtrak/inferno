@@ -264,7 +264,7 @@ pub fn build(b: *std.Build) !void {
         .{ .name = "moe", .device = "0", .filters = &.{"kernels.moe."} },
         .{ .name = "attn-ew", .device = "1", .filters = &.{ "kernels.attention.", "kernels.elementwise." } },
         .{ .name = "gemm-gemv", .device = "2", .filters = &.{ "kernels.gemm.", "kernels.gemv." } },
-        .{ .name = "support", .device = "3", .filters = &.{ "kernels.ple.", "kernels.gdn.", "model.tiny_check.", "model.exec.", "model.state.", "model.generate.", "model.snapshot.", "model.runtime_check.", "model.load.", "model.glue.", "model.plan.", "model.mod.", "hw.", "weights.", "ref.", "mem.", "testing_alloc." } },
+        .{ .name = "support", .device = "3", .filters = &.{ "kernels.ple.", "kernels.gdn.", "model.tiny_check.", "model.exec.", "model.state.", "model.generate.", "model.snapshot.", "model.runtime_check.", "model.load.", "model.glue.", "model.plan.", "model.config_bridge.", "model.mod.", "hw.", "weights.", "ref.", "mem.", "testing_alloc." } },
     };
 
     var single_device_runs: [shards.len]*std.Build.Step.Run = undefined;
