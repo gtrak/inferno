@@ -116,6 +116,11 @@ Standing checklist before any timing claim or slow-path diagnosis:
 
 ## Time discipline: budgets, and never waiting instead of diagnosing
 
+**Generalised into a reusable skill** (user, 2026-11-25): `~/.pi/agent/skills/time-blindness/` —
+`SKILL.md`, plus a project-agnostic `scripts/measure.sh` (configurable competitors via
+`TIMING_COMPETITORS`, budget table via `TIMING_BUDGETS`) and a `time-budgets.tsv` template. Use it in any
+project; this repo keeps its own copy of the budget table because its numbers are its own.
+
 User, 2026-11-25: *"expensive polling and idle waiting masks a problem for too long. Time blindness also
 doesn't help. We should track time expectations of different things and escalate if we exceed them."*
 
