@@ -1,22 +1,31 @@
-# `inferno-server` — the Rust control plane
+# `inferno-server` — the Rust transport layer
 
 The OpenAI-compatible HTTP surface in front of the Zig inference core. The hot
-path (CUDA driver, kernels, scheduling, sampling) is `core/` in Zig; everything
-here is control plane: HTTP/SSE, the tokenizer and chat template, admission
-control, configuration, logging and Prometheus metrics. Nothing in this crate
-touches per-token compute.
+path (CUDA driver, kernels, scheduling, sampling) is `core/` in Zig; the
+integration layer is `host/` in Rust; this crate is only the transport on top:
+HTTP/SSE, and the CLI that starts it. Nothing here touches per-token compute or
+model ownership.
 
 ```
-server/src/
-  engine/          the Engine trait, the Zig C ABI (ffi.rs), ZigEngine, MockEngine
+server/src/        transport only, depends on inferno-host
   api/             axum handlers: chat, completions, models, health, metrics
+  server.rs        AppState, bind, serve, drain, engine shutdown
+  main.rs          the `inferno-server` binary, --probe / --version / --print-config
+  lib.rs           re-exports the inferno-host modules this crate integrates
+```
+
+```
+host/src/          inferno-host: integration and ownership, never axum
+  engine/          the Engine trait, the Zig C ABI (ffi.rs), handles.rs, ZigEngine, MockEngine
   tokenizer.rs     tokenizer.json (HF `tokenizers`)
   template.rs      chat_template.jinja (minijinja) + tool-call parsing
   stop.rs          stop strings, matched on decoded text
   admission.rs     the max_concurrent_requests permits (429 beyond them)
   config.rs        TOML + INFERNO_* env + CLI, deny_unknown_fields
   metrics.rs       the Prometheus registry
-  server.rs        AppState, bind, serve, drain, engine shutdown
+  telemetry.rs     tracing subscriber setup
+host/build.rs      runs `zig build` and links libinferno_core.a (this crate, not the server)
+host/tests/fixtures/  the fixture model directory + chat-template goldens
 ```
 
 ## Quick start (no GPU)
@@ -175,7 +184,9 @@ re-exported as a gauge.
 ## Tests
 
 ```bash
+cargo test -p inferno-host            # unit tests of the integration layer
 cargo test -p inferno-server          # unit + integration (mock engine, port 0)
+cargo test --workspace                # both, as the gate runs them
 bash tools/gate.sh                    # the project gate
 ```
 
@@ -189,14 +200,22 @@ bash tools/gate.sh                    # the project gate
   identical, all cases) and the prompt token ids against the real model
   tokenizer (needs `INFERNO_MODEL_DIR`, default `~/models/qwen38-flash-next-nvfp4`;
   it fails rather than skips when the tokenizer is absent).
-- `tests/fixtures/make_fixtures.py` regenerates both fixture sets and records the
-  provenance (renderer, tokenizer path, SHA-256 of tokenizer and template).
+- `host/tests/fixtures/make_fixtures.py` regenerates both fixture sets and records
+  the provenance (renderer, tokenizer path, SHA-256 of tokenizer and template).
+  The fixture model directory lives with `inferno-host` because the tokenizer and
+  the chat template are its behaviour; the integration tests above consume it
+  through `config.model_path`, the way an operator does.
 
 ## Notes on the engine boundary
 
-`server/src/engine/ffi.rs` declares the C ABI of issue I-15 verbatim, including
-the `flags` bits (`1` final, `2` error, `4` first token). `server/build.rs` looks
+`host/src/engine/ffi.rs` declares the C ABI of issue I-15 verbatim, including
+the `flags` bits (`1` final, `2` error, `4` first token). `host/build.rs` looks
 for those symbols in `libinferno_core.a`; while they are missing it compiles the
-`not implemented` fallbacks in `server/src/engine/ffi_absent.rs`, so the crate
+`not implemented` fallbacks in `host/src/engine/ffi_absent.rs`, so the crate
 links and `--engine zig` fails with a message instead of a link error. The day
 the core exports the ABI the fallbacks disappear without an edit.
+
+`inferno-host` is the only crate that links the Zig archive; `inferno-server`
+gets it through that dependency and must never name it directly. The handle ABI
+check in `host/build.rs` is mandatory: a missing symbol fails the build with a
+sentence rather than a linker error.

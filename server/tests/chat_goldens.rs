@@ -1,15 +1,15 @@
 //! Chat-template goldens: our renderer against Python `jinja2`, and our tokenizer
 //! against the real model tokenizer.
 //!
-//! `tests/fixtures/chat_goldens.json` was produced by
-//! `tests/fixtures/make_fixtures.py`: `rendered` is the output of Python `jinja2`
+//! `../host/tests/fixtures/chat_goldens.json` was produced by
+//! `../host/tests/fixtures/make_fixtures.py`: `rendered` is the output of Python `jinja2`
 //! (the reference implementation) on the model's own `chat_template.jinja`, and
 //! `ids` is what the model's real `tokenizer.json` produces from that text. The
 //! committed template copy is byte-identical to the model's, so the rendering
 //! half of this test needs no model files.
 //!
 //! The exact-id half needs the real tokenizer, and the *committed* fixture
-//! tokenizer (`tests/fixtures/model/tokenizer.json`) cannot replace it: it is a
+//! tokenizer (`../host/tests/fixtures/model/tokenizer.json`) cannot replace it: it is a
 //! 256-symbol byte-level stand-in, while the golden ids reach 248069, so a
 //! fallback to it would compare nothing. The policy is therefore
 //!
@@ -27,8 +27,9 @@ use inferno_server::template::{ChatTemplate, RenderContext};
 use inferno_server::tokenizer::Tokenizer;
 use serde_json::Value;
 
-/// The goldens, committed.
-const GOLDENS: &str = include_str!("fixtures/chat_goldens.json");
+/// The goldens, committed next to the fixture model directory the template
+/// and tokenizer modules own (`inferno-host`).
+const GOLDENS: &str = include_str!("../../host/tests/fixtures/chat_goldens.json");
 
 /// The environment variable a model directory is configured with.
 const MODEL_DIRECTORY_VARIABLE: &str = "INFERNO_MODEL_DIR";
@@ -40,7 +41,7 @@ fn fixture_template() -> PathBuf {
 
 /// The committed model-shaped fixture directory.
 fn fixture_directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../host/tests/fixtures/model")
 }
 
 /// What the exact-id goldens should do, given the environment.

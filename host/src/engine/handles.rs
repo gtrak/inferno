@@ -190,7 +190,7 @@ pub struct Step {
 /// sending one to another thread must not compile:
 ///
 /// ```compile_fail
-/// use inferno_server::engine::handles::Model;
+/// use inferno_host::engine::handles::Model;
 /// fn require_send<T: Send>(_: T) {}
 /// let model: Model = unsafe { std::mem::zeroed() };
 /// require_send(model); // error[E0277]: `*mut inferno_model` cannot be sent
@@ -279,7 +279,7 @@ impl Drop for Model {
 /// unrepresentable:
 ///
 /// ```compile_fail
-/// use inferno_server::engine::handles::Model;
+/// use inferno_host::engine::handles::Model;
 /// let mut model: Model = unsafe { std::mem::zeroed() };
 /// let mut sequence = model.sequence(&[1u32]).expect("open");
 /// model.close(); // error[E0505]: cannot move out of `model` because it is borrowed
@@ -330,7 +330,7 @@ impl Sequence<'_> {
     /// Closes the sequence. Consumes `self`, so it cannot be stepped afterwards:
     ///
     /// ```compile_fail
-    /// use inferno_server::engine::handles::{Model, Sequence};
+    /// use inferno_host::engine::handles::{Model, Sequence};
     /// let mut model: Model = unsafe { std::mem::zeroed() };
     /// let mut sequence: Sequence<'_> = model.sequence(&[1u32]).expect("open");
     /// sequence.close();

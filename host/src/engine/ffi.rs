@@ -40,7 +40,7 @@ pub const CORE_ERROR_NOT_IMPLEMENTED: i32 = -104;
 
 /// True when the linked `libinferno_core.a` exports the engine ABI.
 ///
-/// `server/build.rs` decides this from the archive's symbol table, so it flips to
+/// `host/build.rs` decides this from the archive's symbol table, so it flips to
 /// `true` by itself the day issue I-15 lands.
 pub const CORE_ABI_LINKED: bool = cfg!(not(inferno_core_abi_absent));
 

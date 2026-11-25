@@ -1,4 +1,4 @@
-//! The engine boundary: everything the HTTP layer needs from the Zig core.
+//! The engine boundary: everything the host layer needs from the Zig core.
 //!
 //! The four required methods of [`Engine`] match the contract in
 //! `.agents/tasks/issue-007-rust-server.md`. [`Engine::ready`] and

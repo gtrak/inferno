@@ -1,8 +1,10 @@
-//! Build script for `inferno-server`.
+//! Build script for `inferno-host`.
 //!
 //! The hot path is Zig. `zig build` produces the static library
 //! `libinferno_core.a` (with the CUDA cubins embedded) and this script points
 //! the Rust linker at it, so `cargo build` alone rebuilds the whole engine.
+//! This is the crate that links the archive; `inferno-server` depends on this
+//! one and never links the Zig core directly.
 //!
 //! The engine C ABI (`inferno_core_init`, `inferno_core_submit`, ...) lands in
 //! issue I-15. Until the archive defines those symbols the crate cannot link
@@ -50,7 +52,7 @@ fn main() {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     let core_directory = manifest_directory
         .parent()
-        .expect("server/ always sits inside the workspace root")
+        .expect("this crate always sits inside the workspace root")
         .join("core");
     let output_directory = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let zig_prefix = output_directory.join("zig");

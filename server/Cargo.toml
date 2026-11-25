@@ -6,6 +6,7 @@ publish = false
 
 # The HTTP layer lives in the library so integration tests can start the whole
 # server in-process; `src/main.rs` only parses the command line and runs it.
+# This crate is transport only: everything it integrates lives in `inferno-host`.
 [lib]
 name = "inferno_server"
 path = "src/lib.rs"
@@ -18,16 +19,12 @@ path = "src/main.rs"
 async-stream = "=0.3.6"
 axum = "=0.8.9"
 clap = { version = "=4.6.9", features = ["derive"] }
-figment = { version = "=0.10.19", features = ["env", "toml"] }
 futures = "=0.3.34"
-minijinja = { version = "=2.24.0", features = ["json"] }
+inferno-host = { path = "../host" }
 prometheus-client = "=0.26.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 thiserror = "=2.0.21"
-tokenizers = { version = "=0.22.1", default-features = false, features = [
-    "onig",
-] }
 tokio = { version = "=1.54.1", features = [
     "io-util",
     "macros",
@@ -38,6 +35,10 @@ tokio = { version = "=1.54.1", features = [
     "time",
 ] }
 tracing = "=0.1.44"
+
+[dev-dependencies]
+# `tests/queue_time.rs` installs its own subscriber layer to read the queue-depth
+# field back out of the traces the admission path emits.
 tracing-subscriber = { version = "=0.3.23", features = [
     "ansi",
     "env-filter",

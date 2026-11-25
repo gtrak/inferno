@@ -17,7 +17,7 @@ Two things are produced, from two different sources:
 
 Usage (needs `jinja2` and `tokenizers` in the interpreter):
 
-    python3 server/tests/fixtures/make_fixtures.py \
+    python3 host/tests/fixtures/make_fixtures.py \
         --model-dir ~/models/qwen38-flash-next-nvfp4
 """
 
