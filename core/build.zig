@@ -262,7 +262,7 @@ pub fn build(b: *std.Build) !void {
         .{ .name = "moe", .device = "0", .filters = &.{"kernels.moe."} },
         .{ .name = "attn-ew", .device = "1", .filters = &.{ "kernels.attention.", "kernels.elementwise." } },
         .{ .name = "gemm-gemv", .device = "2", .filters = &.{ "kernels.gemm.", "kernels.gemv." } },
-        .{ .name = "support", .device = "3", .filters = &.{ "kernels.ple.", "kernels.gdn.", "model.tiny_check.", "model.exec.", "model.state.", "model.generate.", "model.snapshot.", "model.runtime_check.", "model.load.", "model.glue.", "model.plan.", "model.mod.", "hw.", "weights.", "ref.", "mem." } },
+        .{ .name = "support", .device = "3", .filters = &.{ "kernels.ple.", "kernels.gdn.", "model.tiny_check.", "model.exec.", "model.state.", "model.generate.", "model.snapshot.", "model.runtime_check.", "model.load.", "model.glue.", "model.plan.", "model.mod.", "hw.", "weights.", "ref.", "mem.", "testing_alloc." } },
     };
 
     var single_device_runs: [shards.len]*std.Build.Step.Run = undefined;
@@ -302,16 +302,16 @@ pub fn build(b: *std.Build) !void {
         run_multi_tests.step.dependOn(&run.step);
     }
 
-    // The probe binary gets its own device so it does not contend with the shards.
-    const run_probe_tests_device = run_probe_tests;
-    run_probe_tests_device.setEnvironmentVariable("CUDA_VISIBLE_DEVICES", "3");
+    // The probe binary ENUMERATES all four devices, so it cannot be pinned to one: it runs
+    // after the single-device shards, alongside the multi-rank group.
+    run_probe_tests.step.dependOn(&run_multi_tests.step);
 
     const test_step = b.step("test", "Run unit tests");
     for (single_device_runs) |run| {
         test_step.dependOn(&run.step);
     }
     test_step.dependOn(&run_multi_tests.step);
-    test_step.dependOn(&run_probe_tests_device.step);
+    test_step.dependOn(&run_probe_tests.step);
 
     // The unfiltered whole-suite run stays available for anyone who wants one process.
     const whole_step = b.step("test-whole", "Run every test in a single process");

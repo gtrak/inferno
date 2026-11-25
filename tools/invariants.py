@@ -70,6 +70,34 @@ for path in core_src.rglob("*.zig"):
                     % (rel, lineno)
                 )
 
+# G3 (I-035): a bulk data path must never be handed the tracked test allocator.
+# std.testing.allocator maps every allocation for leak checking; over a 299,545-tensor
+# checkpoint that turns a 478 ms build into a run that does not finish in ten minutes
+# (measured: arena 478 ms vs tracked >600 s). Bulk entry points take an arena.
+bulk_entry_points = (
+    "manifest.build(",
+    "manifest.plan(",
+    "manifest.load(",
+    "shard.plan(",
+    "shard.load(",
+    "safetensors.open(",
+)
+tracked_allocator = re.compile(r"\bstd\.testing\.allocator\b")
+for path in core_src.rglob("*.zig"):
+    rel = str(path.relative_to(core_src))
+    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            continue
+        if not tracked_allocator.search(line):
+            continue
+        for entry in bulk_entry_points:
+            if entry in line:
+                fail.append(
+                    "G3: %s:%d passes std.testing.allocator to a bulk entry point (%s); "
+                    "use testing_alloc.arena()" % (rel, lineno, entry)
+                )
+
 # 4. The server may depend on crates; the core may not. Report the count for the log.
 lock = pathlib.Path("Cargo.lock").read_text()
 packages = lock.count("[[package]]")
@@ -79,6 +107,6 @@ if fail:
     sys.exit(1)
 print(
     "invariants ok: zig core dep-free, no rust in core/, CUDA mass confined to hw/+bench/, "
-    "G1 raw driver imports confined to hw/+bench/, server dependency graph = %d crates"
+    "G1 raw driver imports confined to hw/+bench/, G3 bulk paths off the tracked allocator, server dependency graph = %d crates"
     % packages
 )
