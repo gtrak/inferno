@@ -95,10 +95,11 @@ pub fn expertSlabBytes() u64 {
     return total;
 }
 
-/// Bytes one slab occupies in an arena: whole pages, because device and pinned
-/// allocations are page granular and the tier indexes slots by byte offset.
-pub fn expertSlabStrideBytes() u64 {
-    const slab_bytes = expertSlabBytes();
+/// Bytes a slab of `slab_bytes` occupies in an arena: whole pages, because
+/// device and pinned allocations are page granular and the tier indexes slots
+/// by byte offset. The checkpoint's own slabs are not the planned size (see
+/// `weights/shard.zig`), so the rounding is a function, not a constant.
+pub fn slabStrideBytes(slab_bytes: u64) u64 {
     assert(slab_bytes > 0);
     assert(page_bytes > 0);
 
@@ -106,6 +107,12 @@ pub fn expertSlabStrideBytes() u64 {
     assert(stride >= slab_bytes);
     assert(stride % page_bytes == 0);
     return stride;
+}
+
+/// Bytes one planned slab occupies in an arena.
+pub fn expertSlabStrideBytes() u64 {
+    assert(expertSlabBytes() > 0);
+    return slabStrideBytes(expertSlabBytes());
 }
 
 /// Bytes every layer's experts occupy across the whole checkpoint.
@@ -354,16 +361,15 @@ pub const PlacementError = error{
 };
 
 /// Expert slabs the leftover VRAM holds, never more than the rank owns.
-fn expertSlabCapacity(room_bytes: u64) u32 {
+fn expertSlabCapacity(room_bytes: u64, stride: u64, owned: u32) u32 {
     assert(room_bytes > 0);
-    assert(expert_slabs_per_rank > 0);
+    assert(stride > 0);
 
-    const stride = expertSlabStrideBytes();
     const fits = room_bytes / stride;
-    if (fits > expert_slabs_per_rank) {
-        return expert_slabs_per_rank;
+    if (fits > owned) {
+        return owned;
     } else {
-        assert(fits <= expert_slabs_per_rank);
+        assert(fits <= owned);
         return @intCast(fits);
     }
 }
@@ -391,21 +397,39 @@ fn chosenHotSlabs(requested: u32, capacity: u32) PlacementError!u32 {
     }
 }
 
+/// One rank's byte demand measured from the checkpoint itself rather than from
+/// the requantised placement table: `weights/shard.zig` reads the real dtypes
+/// (BF16 attention, NVFP4 experts) and fills this in, so the same budget rule
+/// decides both the planned and the real run.
+pub const MeasuredSet = struct {
+    /// Free device bytes the driver reports for this rank.
+    vram_bytes: u64,
+    /// Device weights that are not expert slabs: what the tier cannot move.
+    fixed_bytes: u64,
+    /// Bytes one (layer, expert) slab occupies in the checkpoint's layout.
+    slab_bytes: u64,
+    /// Slabs this rank owns before the tier moves any.
+    slab_count: u32,
+    /// Context the KV arena is sized for.
+    context_tokens: u32,
+    /// Slabs to keep on the device; 0 uses every slab the measured VRAM leaves.
+    hot_slab_count: u32 = 0,
+};
+
 /// Sizes one rank: everything that cannot move, then as many expert slabs as
 /// the measured VRAM leaves room for, and the rest in the host tier.
-pub fn place(query: RankQuery) PlacementError!RankPlacement {
+pub fn placeMeasured(query: MeasuredSet) PlacementError!RankPlacement {
     assert(query.vram_bytes > 0);
-    assert(page_bytes > 0);
+    assert(query.slab_count > 0);
 
     if (query.context_tokens == 0) {
         return PlacementError.context_tokens_zero;
     } else {
         assert(query.context_tokens > 0);
     }
-    const fixed_bytes = fixedWeightBytesPerRank();
     const kv_bytes = kvBytesPerRank(query.context_tokens);
     const state_bytes = stateBytesPerRank();
-    const resident_bytes = fixed_bytes + kv_bytes + state_bytes;
+    const resident_bytes = query.fixed_bytes + kv_bytes + state_bytes;
     if (query.vram_bytes <= resident_bytes) {
         // No expert slab fits at all, so the tier cannot close the gap.
         return PlacementError.vram_below_resident_set;
@@ -413,13 +437,17 @@ pub fn place(query: RankQuery) PlacementError!RankPlacement {
         assert(query.vram_bytes > resident_bytes);
     }
 
-    const capacity = expertSlabCapacity(query.vram_bytes - resident_bytes);
+    const stride = slabStrideBytes(query.slab_bytes);
+    const capacity = expertSlabCapacity(
+        query.vram_bytes - resident_bytes,
+        stride,
+        query.slab_count,
+    );
     const hot = try chosenHotSlabs(query.hot_slab_count, capacity);
-    const cold = expert_slabs_per_rank - hot;
-    assert(hot + cold == expert_slabs_per_rank);
+    const cold = query.slab_count - hot;
+    assert(hot + cold == query.slab_count);
 
-    const stride = expertSlabStrideBytes();
-    const weights_bytes = fixed_bytes + @as(u64, hot) * stride;
+    const weights_bytes = query.fixed_bytes + @as(u64, hot) * stride;
     const device_bytes = weights_bytes + kv_bytes + state_bytes;
     assert(device_bytes <= query.vram_bytes);
     return .{
@@ -432,6 +460,22 @@ pub fn place(query: RankQuery) PlacementError!RankPlacement {
         .cold_slab_count = cold,
         .tier_bytes = @as(u64, cold) * stride,
     };
+}
+
+/// Sizes one rank from the planned table: the same rule as `placeMeasured`
+/// with the requantised slab and the fixed set the design commits to.
+pub fn place(query: RankQuery) PlacementError!RankPlacement {
+    assert(query.vram_bytes > 0);
+    assert(expert_slabs_per_rank > 0);
+
+    return placeMeasured(.{
+        .vram_bytes = query.vram_bytes,
+        .fixed_bytes = fixedWeightBytesPerRank(),
+        .slab_bytes = expertSlabBytes(),
+        .slab_count = expert_slabs_per_rank,
+        .context_tokens = query.context_tokens,
+        .hot_slab_count = query.hot_slab_count,
+    });
 }
 
 /// The whole plan: one decision per rank plus the totals the report prints.
@@ -491,7 +535,24 @@ pub fn verify(
     assert(subject.ranks.len == rank_count);
     assert(subject.weights_bytes_per_rank > 0);
 
-    for (subject.ranks) |rank| {
+    try verifyRanks(subject.ranks[0..], dram_tier_enabled);
+    assert(subject.device_bytes_total > 0);
+}
+
+/// The refusal itself, on any set of per-rank placements: a rank that would
+/// hold more than its measured free VRAM, or a cold slab with no tier.
+///
+/// Split out of `verify` so a plan sized from the real checkpoint
+/// (`weights/shard.zig`) is held to the same rule as one sized from the
+/// requantised table, without either file restating it.
+pub fn verifyRanks(
+    ranks: []const RankPlacement,
+    dram_tier_enabled: bool,
+) PlacementError!void {
+    assert(ranks.len > 0);
+    assert(ranks.len <= rank_count);
+
+    for (ranks) |rank| {
         if (rank.device_bytes > rank.vram_bytes) {
             return PlacementError.rank_exceeds_vram;
         } else {
@@ -507,7 +568,6 @@ pub fn verify(
             }
         }
     }
-    assert(subject.device_bytes_total > 0);
 }
 
 /// Device names for the report, one per rank. Empty when the driver was not
@@ -984,6 +1044,58 @@ test "the report names every rank and states the bytes it was sized from" {
         std.mem.indexOf(u8, text, "70763146112 B") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, text, "25165824 B") != null);
+}
+
+test "a rank sized from measured bytes obeys the rule the plan is sized by" {
+    // The planned table and the checkpoint's own dtypes are two different byte
+    // sets, and both must be sized by one rule. This is the equivalence that
+    // keeps `placeMeasured` from drifting away from `place`.
+    const card_bytes: u64 = 16_660_430_848;
+    for ([_]u32{ 8_192, max_context_tokens }) |context| {
+        const planned = try place(.{
+            .vram_bytes = card_bytes,
+            .context_tokens = context,
+        });
+        const measured = try placeMeasured(.{
+            .vram_bytes = card_bytes,
+            .fixed_bytes = fixedWeightBytesPerRank(),
+            .slab_bytes = expertSlabBytes(),
+            .slab_count = expert_slabs_per_rank,
+            .context_tokens = context,
+        });
+        try std.testing.expectEqual(planned, measured);
+    }
+}
+
+test "a measured slab with a larger stride fits fewer slabs, never more" {
+    // The real checkpoint's NVFP4 slab is 2 764 824 B against the planned
+    // 2 611 212 B, so the same card holds fewer of them: 152 592 B more per
+    // slab, 5.8 %, and the tier has to absorb it.
+    const card_bytes: u64 = 16_660_430_848;
+    const real_slab_bytes: u64 = 2_764_824;
+    try std.testing.expect(real_slab_bytes > expertSlabBytes());
+    const planned = try place(.{
+        .vram_bytes = card_bytes,
+        .context_tokens = max_context_tokens,
+    });
+    const real = try placeMeasured(.{
+        .vram_bytes = card_bytes,
+        .fixed_bytes = 6_585_174_042,
+        .slab_bytes = real_slab_bytes,
+        .slab_count = expert_slabs_per_rank,
+        .context_tokens = max_context_tokens,
+    });
+    try std.testing.expectEqual(
+        @as(u64, 2_768_896),
+        slabStrideBytes(real_slab_bytes),
+    );
+    try std.testing.expect(real.hot_slab_count < planned.hot_slab_count);
+    try std.testing.expect(real.tier_bytes > planned.tier_bytes);
+    try std.testing.expect(real.device_bytes <= card_bytes);
+    // 6.59 GB of BF16 fixed weights against the FP8 plan's 4.29 GB.
+    try std.testing.expect(
+        6_585_174_042 > fixedWeightBytesPerRank() + 2_000_000_000,
+    );
 }
 
 test "the report says which rank is over its VRAM instead of hiding it" {

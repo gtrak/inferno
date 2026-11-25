@@ -236,6 +236,7 @@ fn copy_truncated(source: []const u8, target: []u8) u32 {
 // merges stacked four copies of it; kept deduplicated and grouped by directory.
 test {
     _ = @import("hw/bench.zig");
+    _ = @import("model/config_bridge.zig");
     _ = @import("testing_alloc.zig");
     _ = @import("hw/api.zig").cuda_context;
     _ = @import("hw/api.zig").cuda_driver;
@@ -246,6 +247,7 @@ test {
     _ = @import("weights/manifest.zig");
     _ = @import("weights/quant.zig");
     _ = @import("weights/safetensors.zig");
+    _ = @import("weights/shard.zig");
     _ = @import("kernels/attention.zig");
     _ = @import("kernels/elementwise.zig");
     _ = @import("kernels/gdn.zig");

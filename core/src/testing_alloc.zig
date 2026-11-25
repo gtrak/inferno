@@ -15,6 +15,18 @@
 
 const std = @import("std");
 
+/// Environment variable that turns the overrun diary back on.
+///
+/// Off by default because of how the test runner reports a failure: Zig 0.14's
+/// `std.Build.Step.Run` attaches *everything the test process wrote to stderr
+/// since the previous test result* to the next test that fails. A passing test
+/// that prints therefore renames a later failure's message. Measured: the
+/// deliberate-overrun test below printed five lines, and the shard test that
+/// genuinely failed with `expected 11, found 4` was reported as
+/// `failed: budget exceeded: 5 allocations ...`. The failing assertion and the
+/// reported reason came from different tests.
+const diary_variable = "INFERNO_ALLOC_DEBUG";
+
 /// An arena over the tracked allocator. Bulk paths allocate freely inside it; the tracker
 /// still sees the chunks, so a leaked arena still fails the test.
 pub fn arena() std.heap.ArenaAllocator {
@@ -36,15 +48,18 @@ pub const Budget = struct {
     child: std.mem.Allocator,
     limit: usize,
     count: usize = 0,
+    overruns: usize = 0,
 
     pub fn allocator(self: *Budget) std.mem.Allocator {
+        assertLimit(self.limit);
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     pub fn deinit(self: *Budget) void {
-        // No postcondition here: exceeding the budget is already reported by `alloc`, and a
-        // test that deliberately overruns must be able to pass by observing it.
-        std.debug.assert(self.count > 0 or self.limit > 0);
+        // No postcondition here: exceeding the budget is already reported through
+        // `exceeded`, and a test that deliberately overruns must be able to pass by
+        // observing it.
+        std.debug.assert(self.limit > 0);
     }
 
     pub fn exceeded(self: *const Budget) bool {
@@ -62,11 +77,10 @@ pub const Budget = struct {
         const self: *Budget = @ptrCast(@alignCast(context));
         self.count += 1;
         if (self.count > self.limit) {
-            std.debug.print(
-                "budget exceeded: {d} allocations (limit {d}); this path allocates per " ++
-                    "element - pass an arena or a caller-owned scratch buffer\n",
-                .{ self.count, self.limit },
-            );
+            self.overruns += 1;
+            reportOverrun(self.count, self.limit);
+            // Null here is `error.OutOfMemory` at the caller, so the test that ran
+            // out of budget still fails on its own name with its own stack trace.
             return null;
         }
         return self.child.vtable.alloc(self.child.ptr, len, alignment, ra);
@@ -100,6 +114,24 @@ pub const Budget = struct {
     }
 };
 
+/// Silent unless `INFERNO_ALLOC_DEBUG` is set in the environment. The message is
+/// the diagnosis a lane hunting a per-element allocation wants; the default stream
+/// is kept clean so a failure is reported against the test that failed.
+fn reportOverrun(count: usize, limit: usize) void {
+    assertLimit(limit);
+    std.debug.assert(count > limit);
+
+    if (std.posix.getenv(diary_variable) == null) {
+        return;
+    } else {
+        std.debug.print(
+            "budget overrun: {d} allocations (limit {d}); this path allocates per " ++
+                "element - pass an arena or a caller-owned scratch buffer\n",
+            .{ count, limit },
+        );
+    }
+}
+
 test "the budget fails a path that allocates per element" {
     var b = budget(4);
     defer b.deinit();
@@ -117,6 +149,10 @@ test "the budget fails a path that allocates per element" {
     }
     try std.testing.expect(overrun);
     try std.testing.expect(b.exceeded());
+    // Every refusal is counted, so a caller can assert on the shape of the overrun
+    // rather than reading it off a print.
+    try std.testing.expectEqual(@as(usize, 5), b.overruns);
+    try std.testing.expectEqual(@as(usize, 9), b.count);
 }
 
 test "the arena allocates chunks, not per call" {

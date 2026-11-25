@@ -1540,7 +1540,8 @@ const fixtures_root: []const u8 = @import("fixtures_dir").path;
 const checkpoint_variable = "INFERNO_MODEL_DIR";
 
 /// Checkpoint directory when the environment does not name one.
-const checkpoint_default = "/home/gary/models/qwen38-flash-next-nvfp4";
+// No hard-coded default: the 51 GB n-gram table must never be opened by the default
+// test suite. Opt in with INFERNO_MODEL_DIR.
 
 /// The file the real n-gram table lives in (53.7 GB, table plus the MTP head).
 const real_table_file = "model-fp8-mtp-ple.safetensors";
@@ -1730,8 +1731,13 @@ fn realTablePath(allocator: std.mem.Allocator) !?[]u8 {
     assert(real_table_file.len > 0);
     assert(checkpoint_variable.len > 0);
 
-    const directory = std.posix.getenv(checkpoint_variable) orelse
-        checkpoint_default;
+    const directory = std.posix.getenv(checkpoint_variable) orelse {
+        std.debug.print(
+            "SKIP: set INFERNO_MODEL_DIR to run the real n-gram table tests\n",
+            .{},
+        );
+        return null;
+    };
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}",
