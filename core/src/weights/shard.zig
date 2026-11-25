@@ -52,6 +52,7 @@ const cuda_driver = @import("../hw/api.zig").cuda_driver;
 const manifest = @import("manifest.zig");
 const placement = @import("../mem/placement.zig");
 const safetensors = @import("safetensors.zig");
+const testing_alloc = @import("../testing_alloc.zig");
 
 const assert = std.debug.assert;
 
@@ -69,12 +70,22 @@ pub const alignment_bytes: u64 = 16;
 /// Bytes one staged read moves from the mapping to the device.
 pub const read_chunk_bytes: u64 = 1 << 26;
 
+/// Bytes of one sampled extent read back from the device and compared.
+const verify_window_bytes: u64 = 4_096;
+
+/// One extent in this many is read back, plus the last one. The read-back is a
+/// sample because the alternative is 65 GB of device-to-host traffic; the
+/// sample is pinned to the extents' head and tail, where a slot-arithmetic
+/// error would show first.
+const verify_stride: usize = 512;
+
 pub const ShardError = error{
     shard_not_divisible,
     slab_layout_mismatch,
     tensor_bytes_disagree,
     rank_bytes_disagree,
     extent_out_of_order,
+    staging_too_small,
 };
 
 /// Where a rank keeps one tensor.
@@ -221,8 +232,15 @@ fn shardRows(
             return .{ .first = first, .rows = per_rank };
         },
         // An expert's rows belong to exactly one rank: the walker emits the
-        // experts it owns and never asks a row split for one.
-        .expert_parallel, .host_resident => return null,
+        // experts it owns and never asks a row split for one. A host-resident
+        // tensor is the opposite case: the mapping is opened once and every
+        // rank reads all of it, so the rank's slice is the whole tensor and no
+        // rank copies it.
+        .expert_parallel => return null,
+        .host_resident => {
+            assert(rows > 0);
+            return .{ .first = 0, .rows = rows };
+        },
     }
 }
 
@@ -244,8 +262,18 @@ pub fn walkRank(
     try walkGlobal(subject, rank, sink);
     for (subject.layers) |*layer| {
         assert(layer.index < subject.layers.len);
-        try walkHyper(&layer.attn_hyper_connection, layer.index, sink);
-        try walkHyper(&layer.mlp_hyper_connection, layer.index, sink);
+        try walkHyper(
+            &layer.attn_hyper_connection,
+            .attn_hyper_connection,
+            layer.index,
+            sink,
+        );
+        try walkHyper(
+            &layer.mlp_hyper_connection,
+            .mlp_hyper_connection,
+            layer.index,
+            sink,
+        );
         try walkAttention(subject, layer, rank, sink);
         try walkMoe(subject, layer, rank, sink);
         if (layer.ple) |*ple| {
@@ -273,16 +301,18 @@ fn walkGlobal(
     try emitFull(mixer.mix_up, .hyper_connection_mixer, null, sink);
 }
 
-/// One hyper-connection block: four replicated tensors.
+/// One hyper-connection block: four replicated tensors, tagged with the role
+/// the block belongs to so the per-role report separates the two halves.
 fn walkHyper(
     block: *const manifest.HyperConnection,
+    role: manifest.Role,
     layer: u32,
     sink: Sink,
 ) !void {
     assert(layer < placement.layer_count);
     assert(block.block_inject.byte_len > 0);
 
-    const role: manifest.Role = .attn_hyper_connection;
+    assert(role == .attn_hyper_connection or role == .mlp_hyper_connection);
     try emitFull(block.block_inject, role, layer, sink);
     try emitFull(block.norm, role, layer, sink);
     try emitFull(block.mix_down, role, layer, sink);
@@ -1233,6 +1263,12 @@ pub const RankLoad = struct {
     /// Sampled witness over the bytes that were copied, so a short or misplaced
     /// read is caught without hashing 13 GB per rank.
     witness: u64 = 0,
+    /// Extents whose head and tail were read back off the device and compared
+    /// with the mapping, byte for byte.
+    verified: u64 = 0,
+    /// One extent of this rank was also read with `pread` and compared, so the
+    /// check does not depend on the mapping's own offset arithmetic.
+    cross_checked: bool = false,
     free_after_bytes: u64 = 0,
 };
 
@@ -1259,7 +1295,11 @@ pub fn load(
 ) !LoadReport {
     assert(subject.ranks.len == rank_count);
     assert(devices.ready == rank_count);
-    assert(staging_bytes > 0);
+    if (staging_bytes < 2 * verify_window_bytes) {
+        return ShardError.staging_too_small;
+    } else {
+        assert(staging_bytes >= 2 * verify_window_bytes);
+    }
 
     var arenas: [rank_count]cuda_context.DeviceBuffer = undefined;
     var allocated: u32 = 0;
@@ -1326,10 +1366,194 @@ fn loadRank(
     try stream.synchronize();
     result.elapsed_ns = @intCast(std.time.nanoTimestamp() - started);
     assert(result.bytes == shard.resident_bytes);
+    // The bytes are in VRAM; now read a sample of them back and compare.
+    // Without this the report would prove the plan agrees with itself, not that
+    // the device holds the planned bytes.
+    result.verified = try verifyCopied(loaded, shard, arena, &stream, &staging);
+    assert(result.verified > 0);
+    try crossCheckFile(loaded, shard, arena, &stream, &staging);
+    result.cross_checked = true;
     return result;
 }
 
+/// One extent's head window, read with `pread` instead of through the mapping,
+/// compared with the device.
+///
+/// The mapping and the loader share one offset computation, so a wrong base
+/// offset would agree with itself and pass the read-back above. A file read
+/// does not share it: the file the manifest named, at the offset the manifest
+/// derived, is what the device must hold.
+fn crossCheckFile(
+    loaded: *const manifest.Loaded,
+    shard: *const RankShard,
+    arena: *const cuda_context.DeviceBuffer,
+    stream: *const cuda_context.Stream,
+    staging: *const cuda_context.PinnedHostBuffer,
+) !void {
+    assert(shard.extents.len > 0);
+    assert(staging.slice().len >= 2 * verify_window_bytes);
+
+    // The middle of the list, so the check is not the same extent the walk
+    // emits first.
+    const extent = shard.extents[shard.extents.len / 2];
+    const file = &loaded.files[extent.ref.file_index];
+    assert(extent.ref.file_index < loaded.files.len);
+    const row_bytes = rowBytes(extent.ref);
+    const window = @min(extent.rows * row_bytes, verify_window_bytes);
+    assert(window > 0);
+    const offset = extent.ref.file_offset + extent.first_row * row_bytes;
+    const host = staging.slice()[0..window];
+    const device_view = staging.slice()[verify_window_bytes..][0..window];
+    try preadExact(file.path, offset, host);
+    try stream.copy_d_to_h(
+        &cuda_context.PinnedHostBuffer{
+            .pointer = device_view.ptr,
+            .bytes = window,
+        },
+        &cuda_context.DeviceBuffer{
+            .pointer = arena.pointer + extent.slot,
+            .bytes = window,
+        },
+        window,
+    );
+    try stream.synchronize();
+    if (!std.mem.eql(u8, host, device_view)) {
+        std.debug.print(
+            "shard: {s} at {d} is not what the device holds\n",
+            .{ file.path, offset },
+        );
+        return ShardError.tensor_bytes_disagree;
+    } else {
+        assert(std.mem.eql(u8, host, device_view));
+    }
+}
+
+/// Reads exactly `into.len` bytes at `offset`, out of the file itself.
+fn preadExact(path: []const u8, offset: u64, into: []u8) !void {
+    assert(into.len > 0);
+    assert(std.fs.path.isAbsolute(path));
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const read = try file.preadAll(into, offset);
+    if (read != into.len) {
+        return ShardError.tensor_bytes_disagree;
+    } else {
+        assert(read == into.len);
+    }
+}
+
+/// Reads the head and tail of every `verify_stride`-th extent, plus the last
+/// one, back off the device and compares each window with the mapping.
+fn verifyCopied(
+    loaded: *const manifest.Loaded,
+    shard: *const RankShard,
+    arena: *const cuda_context.DeviceBuffer,
+    stream: *const cuda_context.Stream,
+    staging: *const cuda_context.PinnedHostBuffer,
+) !u64 {
+    assert(shard.extents.len > 0);
+    assert(staging.slice().len >= 2 * verify_window_bytes);
+
+    var compared: u64 = 0;
+    var index: usize = 0;
+    while (index < shard.extents.len) : (index += verify_stride) {
+        assert(index < shard.extents.len);
+        try compareExtent(loaded, shard.extents[index], arena, stream, staging);
+        compared += 1;
+    }
+    const last = shard.extents.len - 1;
+    if (last % verify_stride == 0) {
+        // Already compared by the loop above.
+    } else {
+        try compareExtent(loaded, shard.extents[last], arena, stream, staging);
+        compared += 1;
+    }
+    assert(compared > 0);
+    assert(compared <= shard.extents.len);
+    return compared;
+}
+
+/// Compares one extent's first and last window: mapping against device.
+fn compareExtent(
+    loaded: *const manifest.Loaded,
+    extent: Extent,
+    arena: *const cuda_context.DeviceBuffer,
+    stream: *const cuda_context.Stream,
+    staging: *const cuda_context.PinnedHostBuffer,
+) !void {
+    assert(extent.rows > 0);
+    assert(extent.slot < arena.bytes);
+
+    const bytes = extent.rows * rowBytes(extent.ref);
+    const window = @min(bytes, verify_window_bytes);
+    assert(window > 0);
+    try compareWindow(loaded, extent, 0, window, arena, stream, staging);
+    try compareWindow(
+        loaded,
+        extent,
+        bytes - window,
+        window,
+        arena,
+        stream,
+        staging,
+    );
+}
+
+/// One window at `offset` inside the extent: read the mapping, copy the device
+/// bytes back, and refuse if they differ.
+fn compareWindow(
+    loaded: *const manifest.Loaded,
+    extent: Extent,
+    offset: u64,
+    window: u64,
+    arena: *const cuda_context.DeviceBuffer,
+    stream: *const cuda_context.Stream,
+    staging: *const cuda_context.PinnedHostBuffer,
+) !void {
+    assert(window > 0);
+    assert(window <= verify_window_bytes);
+
+    const row_bytes = rowBytes(extent.ref);
+    assert(offset + window <= extent.rows * row_bytes);
+    const source = extent.ref.file_offset +
+        extent.first_row * row_bytes + offset;
+    const slot = extent.slot + offset;
+    assert(slot + window <= arena.bytes);
+    const host = staging.slice()[0..window];
+    const device_view = staging.slice()[verify_window_bytes..][0..window];
+    try readMapping(loaded, extent.ref.file_index, source, host);
+    try stream.copy_d_to_h(
+        &cuda_context.PinnedHostBuffer{
+            .pointer = device_view.ptr,
+            .bytes = window,
+        },
+        &cuda_context.DeviceBuffer{
+            .pointer = arena.pointer + slot,
+            .bytes = window,
+        },
+        window,
+    );
+    try stream.synchronize();
+    if (!std.mem.eql(u8, host, device_view)) {
+        std.debug.print(
+            "shard: device bytes at slot {d} differ from the mapping\n",
+            .{slot},
+        );
+        return ShardError.tensor_bytes_disagree;
+    } else {
+        assert(std.mem.eql(u8, host, device_view));
+    }
+}
+
 /// Copies one extent in staging-sized chunks: mapping -> pinned -> device.
+///
+/// The staging buffer is reused by the next chunk, so the copy that reads it
+/// has to be finished first: `cuMemcpyHtoDAsync` from pinned memory returns
+/// before the DMA has read a byte, and without the synchronise the CPU refills
+/// the buffer underneath it. That is not hypothetical - the first version
+/// skipped it and the read-back below found the device holding the wrong bytes
+/// at the very first slot, with the byte count and the witnesses still correct.
 fn copyExtent(
     loaded: *const manifest.Loaded,
     extent: Extent,
@@ -1353,6 +1577,9 @@ fn copyExtent(
         const chunk = @min(bytes - copied, window.len);
         assert(chunk > 0);
         const to = extent.slot + copied;
+        // The previous chunk's DMA must have read the buffer before this one
+        // overwrites it.
+        try stream.synchronize();
         try readMapping(
             loaded,
             extent.ref.file_index,
@@ -1426,10 +1653,24 @@ test "the policy maps every role onto the placement's sharding" {
         @as(usize, rank_count),
     );
     // Every role is decided; none falls through to a default. The counts are
-    // pinned so a role added without a decision changes this test.
+    // pinned so a role added without a decision changes this test, and each
+    // bucket is named below so a wrong pinned number is checkable by reading the
+    // two lists rather than by trusting them.
+    //
+    //   host (4)       embed_tokens, ngram_table, ngram_index, ngram_scale
+    //   parallel (3)   lm_head and linear_attn (tensor), expert (expert)
+    //   replicated(15) both hyper-connection blocks, the mixer, the router, the
+    //                  shared expert and its gate, q/k/v/o, attn_norm, the
+    //                  indexer, and the three PLE tensors
+    //   deferred (1)   not this engine's to load
+    //
+    // The four host roles are the gather-only ones: one row per token, read out
+    // of the mapping, so no rank spends VRAM on them. Everything that a kernel
+    // touches every step is on a device, even the small PLE tensors.
     var replicated: u32 = 0;
     var parallel: u32 = 0;
     var host: u32 = 0;
+    var deferred: u32 = 0;
     for (manifest.all_roles) |role| {
         switch (shardingFor(role)) {
             .replicated => replicated += 1,
@@ -1437,15 +1678,22 @@ test "the policy maps every role onto the placement's sharding" {
             .host_resident => {
                 if (role == .deferred) {
                     // Counted, never loaded.
+                    deferred += 1;
                 } else {
                     host += 1;
                 }
             },
         }
     }
-    try std.testing.expectEqual(@as(u32, 11), host);
+    try std.testing.expectEqual(@as(u32, 4), host);
     try std.testing.expectEqual(@as(u32, 3), parallel);
-    try std.testing.expectEqual(@as(u32, 8), replicated);
+    try std.testing.expectEqual(@as(u32, 15), replicated);
+    try std.testing.expectEqual(@as(u32, 1), deferred);
+    // No role may fall outside the three buckets, whatever `shardingFor` grows.
+    try std.testing.expectEqual(
+        @as(u32, @intCast(manifest.all_roles.len)),
+        host + parallel + replicated + deferred,
+    );
 }
 
 test "a row slice is contiguous, whole and disjoint across the ranks" {
@@ -1468,10 +1716,13 @@ test "a row slice is contiguous, whole and disjoint across the ranks" {
         const slice = (try shardRows(ref, .replicated, @intCast(index))).?;
         try std.testing.expectEqual(@as(u64, 2_560), slice.rows);
     }
-    try std.testing.expectEqual(
-        @as(?RowSlice, null),
-        try shardRows(ref, .host_resident, 0),
-    );
+    // A host-resident tensor is the whole mapping row range for every rank:
+    // gather-only, so no rank copies it and no rank sees less than all of it.
+    for (0..rank_count) |index| {
+        const shared = (try shardRows(ref, .host_resident, @intCast(index))).?;
+        try std.testing.expectEqual(@as(u64, 0), shared.first);
+        try std.testing.expectEqual(@as(u64, 2_560), shared.rows);
+    }
     var ragged = ref;
     ragged.dims.values[0] = 2_561;
     ragged.byte_len = 2 * 2_561 * 6_144;
@@ -1509,7 +1760,12 @@ fn checkpointDirectory(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 test "the real checkpoint's shard plan is sized against measured VRAM" {
-    const allocator = std.testing.allocator;
+    // An arena, not the tracked allocator: the manifest's tensor loop allocates
+    // once per tensor over 299,545 tensors, which `std.testing.allocator` maps
+    // and validates (measured: 478 ms against more than ten minutes, I-035).
+    var arena = testing_alloc.arena();
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const maybe_directory = try checkpointDirectory(allocator);
     if (maybe_directory == null) {
         std.debug.print("SKIP: no checkpoint (set INFERNO_MODEL_DIR)\n", .{});
@@ -1562,6 +1818,12 @@ test "the real checkpoint's shard plan is sized against measured VRAM" {
 
     // Every rank: one copy of what is replicated, a quarter of what is not,
     // and its own expert shard. Pinned to the checkpoint's own bytes.
+    //
+    //   fixed     6,585,173,760 = replicated 5,905,565,440 + a quarter of the
+    //                            sliced set 679,608,320
+    //   slabs    16,987,078,656 = 6,144 slabs of 2,764,824 shipped NVFP4
+    //   mapping  52,471,644,442 = embed 1,271,398,400 + table 51,200,245,760
+    //                            + 282 B of index and scale
     for (&plan_shards.ranks) |*rank| {
         try std.testing.expectEqual(
             @as(u64, 6_585_173_760),
@@ -1587,9 +1849,15 @@ test "the real checkpoint's shard plan is sized against measured VRAM" {
         // The tier has to hold the rest, and it is not small.
         try std.testing.expect(rank.placement.tier_bytes > 1_000_000_000);
     }
+    // One rank's device bytes: the checkpoint's text weights are 129.04 GB,
+    // of which a rank holds 23.57 GB and gathers 52.47 GB from the mapping.
     try std.testing.expectEqual(
-        @as(u64, 129_043_957_786),
+        @as(u64, 23_572_252_416),
         plan_shards.device_bytes_checkpoint,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 52_471_644_442),
+        plan_shards.mapping_bytes_checkpoint,
     );
     try std.testing.expectEqual(
         @as(u64, 3_595_888_608),
@@ -1612,7 +1880,11 @@ test "the real checkpoint's shard plan is sized against measured VRAM" {
 }
 
 test "the real shard plan loads into the four cards and reports headroom" {
-    const allocator = std.testing.allocator;
+    // Same arena rationale as the plan test above: the manifest build is a bulk
+    // path (I-035).
+    var arena = testing_alloc.arena();
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const enabled = std.posix.getenv("INFERNO_SHARD_LOAD") orelse "";
     if (!std.mem.eql(u8, enabled, "1")) {
         std.debug.print(
@@ -1657,6 +1929,10 @@ test "the real shard plan loads into the four cards and reports headroom" {
         try std.testing.expect(rank.elapsed_ns > 0);
         try std.testing.expect(rank.witness != 0);
         try std.testing.expect(rank.free_after_bytes < devices.free_bytes[index]);
+        // Read back off the device and compared with the mapping, byte for byte.
+        try std.testing.expect(rank.verified > 8);
+        // And one extent compared against the file itself, not the mapping.
+        try std.testing.expect(rank.cross_checked);
     }
     const gigabytes = @as(f64, @floatFromInt(report.bytes_total)) / 1e9;
     const seconds = @as(f64, @floatFromInt(report.elapsed_ns)) / 1e9;
@@ -1666,13 +1942,14 @@ test "the real shard plan loads into the four cards and reports headroom" {
     );
     for (&report.ranks, 0..) |*rank, index| {
         std.debug.print(
-            "  rank {d}: {d} B in {d:.3} s, {d} extents, witness {x}, " ++
-                "{d} B free after ({d} B headroom)\n",
+            "  rank {d}: {d} B in {d:.3} s, {d} extents, {d} verified " ++
+                "bit-identical, witness {x}, {d} B free after ({d} B headroom)\n",
             .{
                 index,
                 rank.bytes,
                 @as(f64, @floatFromInt(rank.elapsed_ns)) / 1e9,
                 rank.extents,
+                rank.verified,
                 rank.witness,
                 rank.free_after_bytes,
                 plan_shards.ranks[index].placement.vram_bytes -

@@ -90,10 +90,12 @@ const manifest_main_path = "src/weights/manifest_main.zig";
 /// Name of the report the manifest step installs into `zig-out`.
 const manifest_file_name = "manifest.json";
 
-/// Checkpoint used when neither `-Dmodel-dir` nor `INFERNO_MODEL_DIR` is set.
-const model_directory_default = "/home/gary/models/qwen38-flash-next-nvfp4";
-
-/// Environment variable that overrides `model_directory_default`.
+/// Environment variable that names the checkpoint directory.
+///
+/// There is deliberately no fallback path: a 132 GB artifact that lives only on
+/// the machine that built the engine must be named by whoever asks for it. A
+/// hard-coded `/home/...` default made every checkout silently depend on one
+/// host's layout (I-017).
 const model_directory_variable = "INFERNO_MODEL_DIR";
 
 /// The cubin generation pass: compiles every kernel and embeds the result.
@@ -421,37 +423,52 @@ fn build_manifest(
     });
     const tool = b.addExecutable(.{ .name = "inferno-manifest", .root_module = module });
 
+    const step = b.step("manifest", "Write zig-out/manifest.json from the checkpoint");
+    const directory = model_directory(b) orelse {
+        // Resolved when the graph is built, so the refusal is a step that fails
+        // only when `zig build manifest` is asked for: a bare `zig build` must
+        // stay checkpoint free.
+        const missing = b.addFail(b.fmt(
+            "the manifest step needs the checkpoint directory: pass " ++
+                "-Dmodel-dir=<path> or set {s}",
+            .{model_directory_variable},
+        ));
+        step.dependOn(&missing.step);
+        return;
+    };
+    assert(directory.len > 0);
+
     const run = b.addRunArtifact(tool);
     // The checkpoint is not a build input (it lives outside the tree and is
     // 132 GB), so the step must not be treated as up to date when nothing in
     // the build graph changed: every `zig build manifest` re-reads the headers.
     run.has_side_effects = true;
-    run.addArg(model_directory(b));
+    run.addArg(directory);
     const report = run.addOutputFileArg(manifest_file_name);
     const install = b.addInstallFileWithDir(report, .prefix, manifest_file_name);
-    const step = b.step("manifest", "Write zig-out/manifest.json from the checkpoint");
     step.dependOn(&install.step);
 }
 
-/// Checkpoint directory: `-Dmodel-dir`, then `INFERNO_MODEL_DIR`, then the default.
-fn model_directory(b: *std.Build) []const u8 {
-    assert(model_directory_default.len > 0);
+/// Checkpoint directory from `-Dmodel-dir` or `INFERNO_MODEL_DIR`, else null.
+fn model_directory(b: *std.Build) ?[]const u8 {
     assert(model_directory_variable.len > 0);
 
     const override = b.option([]const u8, "model-dir", "Checkpoint directory");
     if (override) |given| {
+        assert(given.len > 0);
         return given;
     } else {
-        // Fall through to the environment, then to the fixed path.
+        // Fall through to the environment.
     }
     const from_environment = std.process.getEnvVarOwned(
         b.allocator,
         model_directory_variable,
     );
     if (from_environment) |value| {
+        assert(value.len > 0);
         return value;
     } else |_| {
-        return model_directory_default;
+        return null;
     }
 }
 
