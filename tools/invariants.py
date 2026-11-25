@@ -71,6 +71,13 @@ for path in core_src.rglob("*.zig"):
                 )
 
 # G3 (I-035): a bulk data path must never be handed the tracked test allocator.
+#
+# A module-wide ban was tried and rejected: it flagged 12 test blocks inside
+# model/ that run the TINY fixture, where the tracked allocator costs nothing.
+# No static check can tell a tiny fixture from a 132 GB checkpoint - the input is
+# the variable. The enforced rules are therefore: (a) bulk entry points take an
+# arena (here), and (b) real-checkpoint tests run under testing_alloc.trackedBudget,
+# so a per-element path fails at the limit instead of hanging for ten minutes.
 # std.testing.allocator maps every allocation for leak checking; over a 299,545-tensor
 # checkpoint that turns a 478 ms build into a run that does not finish in ten minutes
 # (measured: arena 478 ms vs tracked >600 s). Bulk entry points take an arena.

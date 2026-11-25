@@ -85,6 +85,23 @@ busy box, always runs twice, and rejects the pair when they disagree by more tha
 I report must come from its `quotable` line; hand-timed figures are not reportable. It caught a live busy
 box on its first day (the running lane's `zig`/`build` processes).
 
+### The allocator heuristic (my second miss, per the user)
+
+The other thing the user had to draw out: a bulk path handed `std.testing.allocator` does not look
+**slow**, it looks **hung** — measured on this repo on the real checkpoint, 478 ms with an arena versus
+not finished in 600 s with the tracker. Two consequences:
+
+- **If a test appears to hang, suspect the allocator before the algorithm.** Check, in this order: (1)
+  orphaned processes, (2) the tracked allocator on a bulk path, (3) the algorithm itself.
+- **Isolate cheapest-first.** The user's phrase — "do one at a time, fast one first" — is the method that
+  made this take seconds. The cheap variant (arena, which also proved the parse was never the problem)
+  answers the question before the expensive one is worth running.
+- **A tool only guards what it is pointed at.** `testing_alloc.trackedBudget(n)` asserts a path you own
+  allocates O(1) times, and G3 keeps an arena at the bulk entry points. Neither can be forced onto a
+  leaky-by-design parser (`weights/config.zig`'s `parse` hands out slices of the caller's memory), so that
+  path stays on an arena with the reason written next to it. §7d triage: guard where meaningful,
+  document the rest — not a blanket rule that churns 12 working tiny-fixture tests.
+
 Standing checklist before any timing claim or slow-path diagnosis:
 
 1. **Prove the box is idle.** `pgrep -x zig; pgrep -x test; pgrep -x cargo` and GPU memory. My own aborted

@@ -228,6 +228,11 @@ pub fn loadReal(
 }
 
 test "the real checkpoint config translates into the reference shape" {
+    // An arena, not a budget: `weights/config.zig`'s `parse` is leaky ON PURPOSE (its
+    // slices point into the caller's allocator), so a tracked allocator reports the
+    // intended leak. `testing_alloc.trackedBudget` is for asserting that a path you own
+    // allocates O(1) times; it is not for leaky-by-design parsers. The cliff that cost an
+    // evening is guarded where it applies: G3 requires an arena at the bulk entry points.
     var arena = @import("../testing_alloc.zig").arena();
     defer arena.deinit();
     const allocator = arena.allocator();

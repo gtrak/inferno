@@ -33,6 +33,18 @@ pub fn arena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.testing.allocator);
 }
 
+/// The tracked allocator under a hard allocation budget, with **no arena** above it.
+///
+/// This is the guard for a real-checkpoint path. An arena absorbs per-element allocation
+/// (that is its job), so an arena can hide the exact regression that cost an evening: a
+/// bulk path that allocates once per tensor looks *hung* rather than slow (measured on
+/// this repo: 478 ms with an arena, not finished in 600 s with the tracker). Passing this
+/// allocator directly means a per-element path trips the limit in milliseconds and names
+/// itself, instead of looking like a deadlock.
+pub fn trackedBudget(limit: usize) Budget {
+    return budget(limit);
+}
+
 /// Wraps the tracked allocator and fails the test if it is asked for more than `limit`
 /// allocations. Use this to assert that a data path allocates O(1) times, not O(n).
 pub fn budget(limit: usize) Budget {
@@ -153,6 +165,24 @@ test "the budget fails a path that allocates per element" {
     // rather than reading it off a print.
     try std.testing.expectEqual(@as(usize, 5), b.overruns);
     try std.testing.expectEqual(@as(usize, 9), b.count);
+}
+
+test "trackedBudget refuses a per-element path without an arena" {
+    var b = trackedBudget(16);
+    defer b.deinit();
+    const a = b.allocator();
+    var refused: usize = 0;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        if (a.alloc(u8, 8) catch null) |slice| {
+            a.free(slice);
+        } else {
+            refused += 1;
+        }
+    }
+    // The point of the guard: it stops at the limit instead of grinding.
+    try std.testing.expect(refused > 0);
+    try std.testing.expect(b.exceeded());
 }
 
 test "the arena allocates chunks, not per call" {
