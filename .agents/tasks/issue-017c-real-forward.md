@@ -14,6 +14,14 @@ compare against another GPU path. The numeric authorities in order are:
 2. The published bf16 trace (`jyohukuchan/qwen38-flash-next-bf16-logits`, 2048 positions) for
    end-to-end quality — that is I-031's grader, at **short context** (plan.md §7i).
 
+## Re-scoped by the target state (`.agents/design/target-state.md`)
+
+Loading is Rust's job now, so this issue must **not** grow a Zig-side real-checkpoint loader — that would
+create exactly the second production path the target state forbids. What this issue owns is the other
+half: **the executor's weight source becomes an interface**, so `exec.Model` can be fed either the tiny
+fixture or a real weights view (dtype, tier, rank, offset) resolved by Rust. Incoherence #5 in the target
+state is this issue.
+
 ## Where the seam actually is
 
 `model/exec.zig` (1745 lines) is written for the tiny fixture: `fixtures.RefConfig` plus **f32**
