@@ -16,6 +16,11 @@
 #   tools/measure.sh -- <command...>        # default: two runs
 #   tools/measure.sh -n 3 -- <command...>   # three runs
 #   tools/measure.sh --allow-gpu -- <cmd>   # box may have GPU memory in use
+#   tools/measure.sh --budget gate -- <cmd> # compare against tools/time-budgets.tsv
+#
+# With --budget NAME the run is checked against that budget's expected time and cap.
+# Exceeding expected is reported as a finding to diagnose; reaching the cap is an error.
+# A budgeted run is capped by `timeout`, so it cannot sit wedged indefinitely.
 #
 # Quote only the per-run wall times printed here, and say which run you quoted.
 
@@ -23,6 +28,7 @@ set -u -o pipefail
 
 runs=2
 allow_gpu=0
+budget_name=
 while [ $# -gt 0 ]; do
     case "$1" in
         -n)
@@ -32,6 +38,10 @@ while [ $# -gt 0 ]; do
         --allow-gpu)
             allow_gpu=1
             shift
+            ;;
+        --budget)
+            budget_name="$2"
+            shift 2
             ;;
         --)
             shift
@@ -55,6 +65,28 @@ if ! [ "$runs" -ge 2 ] 2>/dev/null; then
     # One run cannot distinguish cold from warm, which is the whole failure mode.
     echo "measure: -n must be >= 2 (a single run cannot separate cold from warm)" >&2
     exit 2
+fi
+
+# ---- optional budget lookup -------------------------------------------------
+budget_expected=""
+budget_cap=""
+if [ -n "$budget_name" ]; then
+    budgets_file="$(dirname "$0")/time-budgets.tsv"
+    if ! [ -f "$budgets_file" ]; then
+        echo "measure: no budget table at $budgets_file" >&2
+        exit 2
+    fi
+    budget_line="$(awk -F'\t' -v want="$budget_name" \
+        '$1 == want {print $2 "\t" $3; found=1} END{if (!found) exit 1}' "$budgets_file")"
+    if [ -z "$budget_line" ]; then
+        echo "measure: unknown budget '$budget_name'; known budgets:" >&2
+        awk -F'\t' '$1 !~ /^#/ && NF >= 3 {print "         " $1 " (expected " $2 "s, cap " $3 "s)"}' \
+            "$budgets_file" >&2
+        exit 2
+    fi
+    budget_expected="${budget_line%%	*}"
+    budget_cap="${budget_line##*	}"
+    echo "measure: budget '$budget_name' expected ${budget_expected}s cap ${budget_cap}s"
 fi
 
 # ---- precondition 1: no competing build/test processes ----------------------
@@ -100,7 +132,22 @@ declare -a seconds=()
 index=1
 while [ "$index" -le "$runs" ]; do
     started="$(date +%s.%N)"
-    if ! "$@" >/tmp/measure-run-"$index".log 2>&1; then
+    if [ -n "$budget_cap" ]; then
+        run_status=0
+        timeout "$budget_cap" "$@" >/tmp/measure-run-"$index".log 2>&1 || run_status=$?
+    else
+        run_status=0
+        "$@" >/tmp/measure-run-"$index".log 2>&1 || run_status=$?
+    fi
+    if [ "$run_status" -eq 124 ]; then
+        echo "measure: run $index STOPPED at the budget cap (${budget_cap}s) for '$budget_name'." >&2
+        echo "         This is not a slow run, it is a wedged or pathological one." >&2
+        echo "         Diagnose in this order: orphaned processes, tracked allocator on a" >&2
+        echo "         bulk path, cold compile mistaken for the run, then the algorithm." >&2
+        tail -5 /tmp/measure-run-"$index".log >&2
+        exit 7
+    fi
+    if [ "$run_status" -ne 0 ]; then
         echo "measure: run $index FAILED - see /tmp/measure-run-$index.log" >&2
         tail -5 /tmp/measure-run-"$index".log >&2
         exit 4
@@ -123,3 +170,13 @@ if awk -v a="$first" -v b="$last" 'BEGIN{exit !(a > 0 && ((b-a)/a > 0.25 || (a-b
 fi
 
 echo "measure: quotable = ${last}s (runs agreed within 25%; ${first}s first, ${last}s last)"
+
+if [ -n "$budget_expected" ]; then
+    if awk -v got="$last" -v want="$budget_expected" 'BEGIN{exit !(got > want)}'; then
+        echo "measure: EXCEEDS EXPECTED - '$budget_name' expected ${budget_expected}s, got ${last}s." >&2
+        echo "         Not a reason to wait longer: record the real number in" >&2
+        echo "         tools/time-budgets.tsv if it is the new normal, or diagnose why it moved." >&2
+        exit 6
+    fi
+    echo "measure: within budget '$budget_name' (expected ${budget_expected}s, cap ${budget_cap}s)"
+fi

@@ -114,6 +114,37 @@ Standing checklist before any timing claim or slow-path diagnosis:
 5. **Never route debugging to the user.** They get decisions and authorisations, not "it's slow, help".
    If I catch myself asking for a debugging opinion, the correct move is another measurement.
 
+## Time discipline: budgets, and never waiting instead of diagnosing
+
+User, 2026-11-25: *"expensive polling and idle waiting masks a problem for too long. Time blindness also
+doesn't help. We should track time expectations of different things and escalate if we exceed them."*
+
+`tools/time-budgets.tsv` holds an expectation for every long operation (expected seconds, cap seconds,
+and whether the number is measured, derived or still unmeasured). `tools/measure.sh --budget NAME -- cmd`:
+
+- refuses on a busy box, runs twice, and reports the quotable number (as before);
+- **caps the run with `timeout`**, so a wedged operation is stopped rather than waited on (exit 7, with
+  the diagnosis order printed: orphaned processes → tracked allocator on a bulk path → cold compile
+  mistaken for the run → the algorithm);
+- **reports exceeding `expected` as a finding** (exit 6) and says explicitly that it is not a reason to
+  wait longer.
+
+Escalation ladder: **> expected** = record the real number as the new normal or diagnose the move;
+**> 2× expected** = stop and diagnose before doing anything else; **= cap** = stopped automatically.
+
+Judgment rules that go with it:
+
+- **No polling loops.** One blocking wait with a timeout, never a repeat-until-done loop. A subagent's
+  native completion is the wake; `status` is for a decision, not for a heartbeat.
+- **Waiting is not an activity.** If something is slow, the next action is to measure *what* is slow, not
+  to wait again. Every instance of "still running, let me check again" in this project's history replaced
+  a measurement that would have answered in seconds.
+- **A budgeted number is the only kind I report.** Unmeasured entries are placeholders with a cap; the
+  first use must write the real number into the table.
+- **Estimate a lane's wall time before dispatching it**, from the budgets (a load is ~15 s, a sharded suite
+  is ~25 s, a gate is ~160 s), and say the estimate in the dispatch. A lane whose scope cannot finish
+  inside its ceiling is a mis-scoped brief, not a slow worker.
+
 ## Standing constraints
 
 - Guard bands **on** by default: iterate with `INFERNO_GUARD_BANDS=0`, verify without.

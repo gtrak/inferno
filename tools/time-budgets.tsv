@@ -1,0 +1,30 @@
+# Time budgets — expected durations, and when to stop waiting
+#
+# Every long operation gets an expectation. An operation that exceeds its `expected`
+# is a finding to diagnose, not something to keep waiting on. An operation that
+# reaches `cap` is stopped.
+#
+# Columns: name<TAB>expected_s<TAB>cap_s<TAB>source
+# `source` is `measured` (observed on this box, value in this file), `unmeasured`
+# (a placeholder cap — the first use must record the real number here), or
+# `derived` (arithmetic from measured bandwidth, shown in the note).
+#
+# Rule of thumb: expected is the number you would be surprised to exceed; cap is the
+# number at which continuing to wait is itself the error.
+zig_build	60	240	unmeasured; the manifest step's compile was 13.6 s, so a warm build should be near that
+zig_test_sharded	25	120	measured 24.1-24.8 s (4 shards, one per GPU, quad group last)
+zig_test_whole	100	240	measured 59-97 s single process (depends on box load)
+zig_test_shard	35	120	measured 28-34 s for each of moe / attn-ew / gemm-gemv / support
+zig_test_single	60	180	unmeasured; tiny_check alone was ~19 s
+cargo_build	120	480	unmeasured; build.rs also runs `zig build`, so cold cost is both toolchains
+cargo_test	120	480	unmeasured
+gate	160	420	measured 147-156 s (fmt, invariants, suites, cargo, probe)
+manifest_build	2	30	measured 0.57 s on the real checkpoint (mapfiles 391 ms, 299545-tensor loop 34 ms)
+shard_plan	5	60	unmeasured; classification only, no upload
+shard_load_4rank	20	90	measured 14.96 s = 4.39 GB/s for 65,667,551,616 B over 4 ranks
+checkpoint_verify	3600	7200	derived: 132.7 GB of sha256 at ~400 MB/s is ~330 s of hashing plus I/O, budgeted generously
+quality_eval_2048	900	5400	unmeasured: 2048 positions against the published bf16 trace on the real model
+csan_kernel	300	1800	compute-sanitizer runs 10-100x slower than the kernel; a memcheck is minutes, not seconds
+bench_sweep	300	1800	unmeasured; only with INFERNO_BENCH=1
+oracle_fp32_big	120	600	unmeasured; the removed gemv case cost 21 s of fp32 oracle for one ungated line
+worker_lane	1800	5400	first attempt 30 min, 90 min ceiling after a first failure (user, 2026-11-25)
