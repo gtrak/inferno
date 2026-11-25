@@ -1,16 +1,15 @@
-//! `inferno-server`: the Rust control plane of the inferno inference engine.
+//! `inferno-server`: the transport layer of the inferno inference engine.
 //!
-//! The hot path is Zig (`core/`); everything here is orchestration: the
-//! OpenAI-compatible HTTP surface, the tokenizer and chat template, admission
-//! control, configuration, logging and Prometheus metrics.
+//! HTTP/SSE only: the OpenAI-compatible surface (`api/`), the server assembly
+//! (`server.rs`) and the binary (`main.rs`).
+//!
+//! Everything that is integration or ownership rather than transport - request
+//! admission, the engine boundary, the tokenizer and chat template, stop
+//! strings, configuration, logging, Prometheus metrics - lives in the
+//! `inferno-host` crate and is re-exported here, so transport code and the
+//! integration tests keep one spelling for it.
 
-pub mod admission;
 pub mod api;
-pub mod config;
-pub mod engine;
-pub mod metrics;
 pub mod server;
-pub mod stop;
-pub mod telemetry;
-pub mod template;
-pub mod tokenizer;
+
+pub use inferno_host::{admission, config, engine, metrics, stop, telemetry, template, tokenizer};

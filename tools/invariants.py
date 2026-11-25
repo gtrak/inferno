@@ -105,15 +105,26 @@ for path in core_src.rglob("*.zig"):
                     "use testing_alloc.arena()" % (rel, lineno, entry)
                 )
 
-# 4. The server may depend on crates; the core may not. Report the count for the log.
+# 4. The Rust crates may depend on libraries; the core may not. Report the counts
+#    for the log: the workspace crates by name (I-039 split the single `server`
+#    crate into `host` + `server`, so the count must say which crates it means)
+#    and the size of the whole dependency graph behind them.
 lock = pathlib.Path("Cargo.lock").read_text()
 packages = lock.count("[[package]]")
+# A path/workspace package carries no `source =` line in Cargo.lock, a registry
+# dependency always does.
+workspace_crates = sorted(
+    re.search(r'name = "([^"]+)"', block).group(1)
+    for block in lock.split("[[package]]")[1:]
+    if "source = " not in block
+)
 
 if fail:
     print("\n".join("FAIL " + f for f in fail))
     sys.exit(1)
 print(
     "invariants ok: zig core dep-free, no rust in core/, CUDA mass confined to hw/+bench/, "
-    "G1 raw driver imports confined to hw/+bench/, G3 bulk paths off the tracked allocator, server dependency graph = %d crates"
-    % packages
+    "G1 raw driver imports confined to hw/+bench/, G3 bulk paths off the tracked allocator, "
+    "rust workspace = %d crates (%s), dependency graph = %d crates"
+    % (len(workspace_crates), ", ".join(workspace_crates), packages)
 )

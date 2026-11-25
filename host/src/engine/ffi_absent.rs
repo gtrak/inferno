@@ -1,9 +1,9 @@
 //! Fallbacks for the engine C ABI.
 //!
 //! Compiled only while `libinferno_core.a` does not export the engine ABI (issue
-//! I-15); `server/build.rs` decides that from the archive's symbol table. They
-//! carry the same names and signatures as `ffi.rs`, so the rest of the server
-//! compiles against one spelling and the failure is a plain "not implemented"
+//! I-15); `host/build.rs` decides that from the archive's symbol table. They
+//! carry the same names and signatures as `ffi.rs`, so the rest of the host
+//! crate compiles against one spelling and the failure is a plain "not implemented"
 //! error instead of a link error. `--engine mock` is the supported mode until
 //! then.
 

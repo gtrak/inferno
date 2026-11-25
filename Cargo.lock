@@ -670,20 +670,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "inferno-server"
+name = "inferno-host"
 version = "0.1.0"
 dependencies = [
- "async-stream",
- "axum",
  "clap",
  "figment",
- "futures",
  "minijinja",
  "prometheus-client",
  "serde",
  "serde_json",
  "thiserror",
  "tokenizers",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "inferno-server"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "clap",
+ "futures",
+ "inferno-host",
+ "prometheus-client",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

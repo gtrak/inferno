@@ -39,7 +39,7 @@ const PROSE_THEN_CALL: &str = concat!(
 
 /// The fixture model directory (identity tokenizer + the model chat template).
 fn fixture_model() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../host/tests/fixtures/model")
 }
 
 /// A configuration that serves the fixtures.

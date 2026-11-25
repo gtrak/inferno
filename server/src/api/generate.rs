@@ -454,7 +454,11 @@ mod tests {
     use super::*;
 
     fn fixture_tokenizer() -> Tokenizer {
-        Tokenizer::from_file("tests/fixtures/model/tokenizer.json").expect("fixture tokenizer")
+        Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../host/tests/fixtures/model/tokenizer.json"
+        ))
+        .expect("fixture tokenizer")
     }
 
     #[test]

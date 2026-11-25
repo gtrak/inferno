@@ -30,7 +30,7 @@ const FIRST_TOKEN_AFTER: Duration = Duration::from_millis(400);
 
 /// The fixture model directory (identity tokenizer + the model chat template).
 fn fixture_model() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../host/tests/fixtures/model")
 }
 
 /// An engine that blocks in `submit`, the way a core with a full inbox does.
