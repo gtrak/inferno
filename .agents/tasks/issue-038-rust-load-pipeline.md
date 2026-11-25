@@ -25,8 +25,31 @@ Moves to Rust:
    sizing formulas are part of the kernels' contract. Bug class #1 (1.4 MB written past a 64 KB buffer)
    was two sizing formulas drifting between modules; moving this across a language boundary creates the
    worst version of that bug. Expose the placement **decision as data** over the ABI instead.
-2. **The safetensors byte reader.** The Zig test tree depends on it; the pipeline moves, the reader
-   does not.
+2. **The safetensors byte reader** — the single parser of the checkpoint's bytes, with its 9 tests.
+
+   The first draft of this spec justified the carve-out with "the Zig test tree depends on it", which is
+   the weak reason. The real ones:
+
+   - It is the **only** safetensors parser in the repo (nothing on the Rust side parses it today), so
+     keeping it here keeps one parser rather than two. Two parsers with two validation suites is bug
+     class #1 again, in the worst place: the decoder of a 132 GB artifact.
+   - **8 of its 9 tests are refusal tests** — overlapping offsets, trailing bytes, a header length past
+     EOF, a shape contradicting its byte length, an unsupported dtype, a rank-six shape, a shard still
+     downloading keeping a complete header. Those are precisely the modes that corrupt a load
+     *silently*, which is why they are load-bearing rather than incidental.
+   - It is not fixture-only: `kernels/ple.zig` mmaps and reads the real 47.7 GiB n-gram table, and
+     `weights/quant.zig` validates quantisation goldens through the same header machinery. Both are on
+     the production path.
+   - Zig core must stay testable standalone with no Rust dependency; a Zig-side reader is what lets the
+     tiny path (`model/load.zig`) run the suite without linking the server.
+
+   **Boundary shape:** Zig parses and answers "here are the tensors and their offsets"; Rust owns the
+   mapping lifetime, ordering, pacing, capacity negotiation and read-back verification, and never
+   re-parses bytes. Coarse: one call per shard (11 of them), not per tensor.
+
+   **If a future issue does put bytes in Rust's hands**, the reader's validation must move with it as
+   *shared conformance vectors* — one set of malformed headers that both implementations must reject —
+   rather than as a second hand-written test suite.
 
 ## Hard constraints
 
