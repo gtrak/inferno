@@ -78,8 +78,46 @@ a return code. Handles are generation-counted; a stale handle is an error, not U
 6. **No runtime guard where a static one exists.** `epochs` survives only for lifetimes no language
    proves; each survivor is listed with its reason.
 7. **No allocation on the hot path**; bulk paths take an arena and allocate O(1).
-8. **The architecture gate holds at every step**: 16 greedy ids exactly, `ulp_error ≤ 16`, cached ==
+8. **A test lives in the layer that owns the behaviour**, and cross-boundary behaviour is tested from the
+   consuming side. No behaviour has two authorities.
+9. **The architecture gate holds at every step**: 16 greedy ids exactly, `ulp_error ≤ 16`, cached ==
    full recompute, deterministic. This is the alignment instrument, and it is exact.
+
+## Test ownership (user, 2026-11-25)
+
+**A test belongs to the layer that owns the behaviour.** Cross-boundary behaviour is tested from the
+**consuming** side, through the ABI. This is not tidiness — it is the only thing that keeps the ABI honest.
+
+The measurement that motivated it: the C ABI has **4 exports and 7 Zig tests, all trivial** (version
+string, cubin bounds, probe JSON), and **not one Rust test drives it**. Meanwhile the behaviour that
+Rust is about to own — 33 `model/` tests including the architecture gate and `runtime_check`'s reset /
+snapshot / stop / cached-vs-recompute checks — is tested *inside* Zig, bypassing the boundary entirely.
+So today the seam the production consumer uses is the least-tested thing in the repo, and the tests that
+would catch a bad ABI are written on the wrong side of it.
+
+| behaviour | owner | test lives in | style |
+|---|---|---|---|
+| kernels vs fp32 oracle, dtype rounding | Zig | Zig | calls kernels directly with `ref/` |
+| `hw/` buffers, guard bands, epochs, contexts | Zig | Zig | calls internals |
+| forward numerics (ulp vs committed trace) | Zig | Zig | `tiny_check` numerics |
+| quad-rank forward, peer exchange, expert tier | Zig | Zig | `multi.zig` |
+| **the ABI itself**: lifecycle, stale/closed handles, generation counters, determinism across two runs, one-owner rule | **boundary** | **Rust** | calls the FFI as a client |
+| **the architecture gate's ids** (16 exact) | boundary | **Rust** | through `model_open` → `seq_step` |
+| sequence control: reset equivalence, snapshot/restore, stop surface, cached == recompute | host | **Rust** | through the FFI (moves with I-037) |
+| decode loop, sampling, speculative accept/rollback | host | **Rust** | through the FFI (I-037) |
+| load pipeline: mapping lifetime, ordering, pacing, capacity, verification | host | **Rust** | (I-038) |
+| production parser refusals (overlap, trailing bytes, header past EOF, …) | host | **Rust** | move with the parser (I-038) |
+| fixture-grade parsing, quant goldens | Zig | Zig | tiny artifact only |
+
+**Two claims, two tests, not a duplicate authority.** The Zig test asserts *numerics* against the
+committed trace (`ulp_error`, logit deltas). The Rust test asserts the *contract* through the ABI (same
+golden ids, stable handles, determinism). Different claims about the same model — both are load-bearing
+and neither implies the other.
+
+**The discipline this buys:** if a test is awkward to write in Rust because it needs a Zig internal, that
+is evidence the behaviour has not actually moved, or the ABI is too narrow. The test's address is the
+design check. Corollary: Rust tests must never reimplement device setup; if one wants to, the setup is
+misplaced.
 
 ## Where the inconsistencies are today (what the migration is for)
 
@@ -89,6 +127,7 @@ a return code. Handles are generation-counted; a stale handle is an error, not U
 | 2 | handle validity is a **runtime** epoch check that a release build can drop | I-036, I-037 |
 | 3 | production parser + pipeline in Zig while Rust is meant to integrate | I-038 |
 | 4 | integration logic lives in a crate named `server` | I-039 |
+| 7 | the ABI is an **untested seam**: 4 exports, trivial Zig tests, zero Rust clients | I-040 |
 | 5 | `exec.Model` can only be fed by the tiny fixture | I-017c (weight source becomes an interface) |
 | 6 | three config shapes (`TextConfig`, `RefConfig`, bridge) | keep, but bridge is the **only** translation and it is tested against the real checkpoint |
 
