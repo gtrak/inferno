@@ -453,7 +453,11 @@ We are innovating on **one specific model + hardware combination** — NVFP4 Qwe
 The ecosystem has already dumped logits traces, quantisation deltas, routing traces, eval harnesses
 and convergence tooling for this model; reading for them costs minutes and building them costs hours.
 
-**Ask me first if any of these is true:**
+**The critical path is exempt. Do not ask about work that is on the path to a real token** — dispatch
+it, report the estimate in the completion message, and keep going. This rule exists to stop *side
+quests* (hunting references, pulling datasets, exploratory benchmarks), not to gate progress.
+
+**Ask me first if the work is NOT on the critical path and any of these is true:**
 
 | trigger | threshold |
 |---|---|
