@@ -146,6 +146,7 @@ THEORY.md PLAN-log.md ledger.jsonl configs/ best-config.json   (inference-optimi
 - [x] **I-017b** real config drives the reference plan: 48 layers (36 linear + 12 indexed), 512 experts
       top-10, ctx 262144, mrope [11,11,10], one PLE layer resolved to index 1 (`model/config_bridge.zig`)
 - [ ] **I-017c** real-weight forward: first coherent tokens (see `.agents/tasks/issue-017c-real-forward.md`)
+- [ ] **I-039** split the Rust crate: `host/` (integration + ownership) vs `server/` (transport)
 - [ ] **I-036** Rust owns lifetime policy: opaque handle ABI (prereq for I-037/I-038)
 - [ ] **I-037** decode loop + stop surface move to Rust; delete the runtime epoch checks they replace
 - [ ] **I-038** weight-loading pipeline moves to Rust (placement algebra + byte reader stay in Zig)

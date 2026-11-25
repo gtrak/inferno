@@ -25,31 +25,28 @@ Moves to Rust:
    sizing formulas are part of the kernels' contract. Bug class #1 (1.4 MB written past a 64 KB buffer)
    was two sizing formulas drifting between modules; moving this across a language boundary creates the
    worst version of that bug. Expose the placement **decision as data** over the ABI instead.
-2. **The safetensors byte reader** — the single parser of the checkpoint's bytes, with its 9 tests.
+2. **Zig keeps only a *fixture-grade* reader.** The production parser moves to Rust with the pipeline,
+   because loading is integration work and this is now explicit: Zig infers, Rust integrates. The Zig
+   reader that remains serves the tiny fixture (`model/load.zig`) and the quantisation goldens
+   (`weights/quant.zig`) — a **different artifact** from the 132 GB checkpoint, so this is a split by
+   artifact rather than two parsers doing the same job.
+   - The production parser's refusal tests move with it, translated: overlapping offsets, trailing bytes,
+     header length past EOF, shape contradicting byte length, unsupported dtype, rank-six shape, and a
+     partially-downloaded shard that must still present a complete header. Those are the modes that
+     corrupt a load *silently*; they are the point, not an afterthought.
+   - Anything the Zig side must still parse (the fixture) keeps its own small refusals. Where both
+     implementations can see the same input, prefer **shared conformance vectors** — one set of
+     malformed headers both must reject — over a hand-written second suite.
+   - `kernels/ple.zig` reads the real 47.7 GiB n-gram table in a test; that stays a Zig test reading
+     through the fixture-grade reader, and is not a reason to keep the production parser here.
 
-   The first draft of this spec justified the carve-out with "the Zig test tree depends on it", which is
-   the weak reason. The real ones:
+**Stays in Zig** (this one is a contract, not a convention):
 
-   - It is the **only** safetensors parser in the repo (nothing on the Rust side parses it today), so
-     keeping it here keeps one parser rather than two. Two parsers with two validation suites is bug
-     class #1 again, in the worst place: the decoder of a 132 GB artifact.
-   - **8 of its 9 tests are refusal tests** — overlapping offsets, trailing bytes, a header length past
-     EOF, a shape contradicting its byte length, an unsupported dtype, a rank-six shape, a shard still
-     downloading keeping a complete header. Those are precisely the modes that corrupt a load
-     *silently*, which is why they are load-bearing rather than incidental.
-   - It is not fixture-only: `kernels/ple.zig` mmaps and reads the real 47.7 GiB n-gram table, and
-     `weights/quant.zig` validates quantisation goldens through the same header machinery. Both are on
-     the production path.
-   - Zig core must stay testable standalone with no Rust dependency; a Zig-side reader is what lets the
-     tiny path (`model/load.zig`) run the suite without linking the server.
-
-   **Boundary shape:** Zig parses and answers "here are the tensors and their offsets"; Rust owns the
-   mapping lifetime, ordering, pacing, capacity negotiation and read-back verification, and never
-   re-parses bytes. Coarse: one call per shard (11 of them), not per tensor.
-
-   **If a future issue does put bytes in Rust's hands**, the reader's validation must move with it as
-   *shared conformance vectors* — one set of malformed headers that both implementations must reject —
-   rather than as a second hand-written test suite.
+1. **`mem/placement.zig`'s layout algebra.** `kernels/moe.zig` and `model/multi.zig` import it, so its
+   sizing formulas are part of the kernels' contract. Bug class #1 (1.4 MB written past a 64 KB buffer)
+   was two sizing formulas drifting between modules; moving this across a language boundary creates the
+   worst version of that bug. Expose the placement **decision as data** over the ABI: Rust decides
+   *what* to load and *where it goes*, Zig answers *how big and with what stride*.
 
 ## Hard constraints
 
