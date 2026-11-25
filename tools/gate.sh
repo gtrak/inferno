@@ -12,6 +12,19 @@ cd "$repo_root"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.2}"
 export PATH="$CUDA_HOME/bin:$PATH"
 
+# Guard bands are on for the core test step (I-033). A guard that runs only
+# when someone remembers an environment variable is decoration: the canary
+# bands and the context-scoped epoch registry must be exercised by every gate
+# run. Measured on 4x5060Ti: `zig build test` is ~196 s with bands on against
+# ~106 s with them off (1.85x, +90 s), which is the price of actually running
+# them.
+#
+# The setting is captured and then removed from the environment: the Rust
+# server treats every INFERNO_* variable as configuration and refuses an
+# unknown key, so it must not reach the cargo steps.
+guard_bands="${INFERNO_GUARD_BANDS:-1}"
+unset INFERNO_GUARD_BANDS
+
 # This machine has four RTX 5060 Ti cards; a different count is a failure.
 expected_devices=4
 
@@ -37,8 +50,8 @@ if [ -e "$absent_checkpoint" ]; then
 fi
 (cd core && INFERNO_MODEL_DIR="$absent_checkpoint" zig build -Doptimize=ReleaseSafe)
 
-step "zig build test (core)"
-(cd core && zig build test)
+step "zig build test (core, INFERNO_GUARD_BANDS=$guard_bands)"
+(cd core && INFERNO_GUARD_BANDS="$guard_bands" zig build test)
 
 step "cargo fmt --all -- --check"
 cargo fmt --all -- --check

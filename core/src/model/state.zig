@@ -302,7 +302,12 @@ pub const State = struct {
         assert(self.allocator.vtable != undefined);
 
         for (self.allocations.items) |buffer| {
-            guards.free(&buffer);
+            guards.free(&buffer) catch |err| {
+                std.log.err(
+                    "cannot free a state buffer: {s}",
+                    .{@errorName(err)},
+                );
+            };
         }
         self.allocations.deinit();
         self.staging.free();
@@ -511,7 +516,7 @@ pub const State = struct {
         );
         const sealed = writable.seal();
         const device = sealed.device();
-        errdefer guards.free(&device);
+        errdefer guards.free(&device) catch {};
         try self.allocations.append(device);
         return sealed;
     }

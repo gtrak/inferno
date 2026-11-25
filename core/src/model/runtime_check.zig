@@ -9,8 +9,8 @@
 //! 2. a sequence after a reset agrees with the same model's recompute form — the
 //!    reset contract three bugs this project already paid for. The stronger
 //!    two-live-model form (reset model vs a second, freshly initialised model)
-//!    is compiled but skipped until `exec.Model.init` stops returning a value
-//!    with interior pointers into its own frame; see `secondSequenceAfterReset`;
+//!    also checks every interior binding of both models and requires the same
+//!    prompt to prefill to identical logits; see `secondSequenceAfterReset`;
 //! 3. a snapshot of the recurrent state restores bit-identically, and a
 //!    continuation after the restore matches a run that never diverged.
 //!
@@ -114,7 +114,8 @@ test "one-at-a-time decode matches prefill and the golden greedy ids" {
     const allocator = std.testing.allocator;
     var golden = try tiny_check.Golden.open(allocator);
     defer golden.close();
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
 
     const count: u32 = tiny_check.greedy_tokens;
@@ -163,7 +164,8 @@ test "a sequence after reset matches the recompute form on the same model" {
     const allocator = std.testing.allocator;
     var golden = try tiny_check.Golden.open(allocator);
     defer golden.close();
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
 
     const count: u32 = 12;
@@ -212,28 +214,83 @@ test "a sequence after reset matches the recompute form on the same model" {
     try std.testing.expect(distinct > 1);
 }
 
-/// Whether `exec.Model.init` establishes its interior pointers at the
-/// caller's address. It does not: the function returns the Model by value
-/// while storing `State.stream_handle = &model.ple.stream`,
-/// `ple_block.ple = &model.ple`, `ple_block.table = &model.table` and
-/// `pool.table = &model.table` — pointers into its callee frame. A single
-/// long-lived model never exposes it, because that frame is not reused; a
-/// second live model does (the stale stream makes the same prompt prefill to
-/// different logits). The fix belongs in `exec.zig` (construct at the final
-/// address, or take caller-owned storage). This lane does not own that file
-/// and must not bind its way around the dangling pointer, so the two-model
-/// check below stays compiled and skipped until that fix lands. **Any future
-/// test that instantiates two models is load-bearing for this class.**
-fn execModelInitIsBound() bool {
-    return false;
+/// Every interior pointer a live model stores must address the storage that
+/// owns it. Asserted individually so a partial fix of I-032 cannot pass: the
+/// stale `stream_handle` alone used to corrupt the second model's prefill.
+fn expectBound(model: *const exec.Model) !void {
+    assert(model.plan.layer_count > 0);
+    assert(model.state.arena_length > 0);
+
+    const start = @intFromPtr(model);
+    const end = start + @sizeOf(exec.Model);
+    try expectBinding(
+        "state.stream_handle",
+        @intFromPtr(&model.ple.stream),
+        @intFromPtr(model.state.stream_handle),
+        start,
+        end,
+    );
+    try expectBinding(
+        "ple_block.ple",
+        @intFromPtr(&model.ple),
+        @intFromPtr(model.ple_block.ple),
+        start,
+        end,
+    );
+    try expectBinding(
+        "ple_block.table",
+        @intFromPtr(&model.table),
+        @intFromPtr(model.ple_block.table),
+        start,
+        end,
+    );
+    // `ple_block.pool` is the one binding whose target is the heap-allocated
+    // gather pool, not a field of `Model`: equality is the whole contract.
+    try std.testing.expect(model.ple_block.pool == model.pool);
+    try expectBinding(
+        "pool.table",
+        @intFromPtr(&model.table),
+        @intFromPtr(model.pool.table),
+        start,
+        end,
+    );
 }
 
-/// The two-live-model reset equivalence; skipped until `exec.zig` is fixed.
+/// One binding, named: a failure says which field points at a frame that the
+/// model does not own, instead of collapsing every binding into one `false`.
+fn expectBinding(
+    name: []const u8,
+    expected: usize,
+    actual: usize,
+    start: usize,
+    end: usize,
+) !void {
+    assert(name.len > 0);
+    assert(end > start);
+
+    if (actual != expected) {
+        std.debug.print(
+            "I-032 binding: {s} = 0x{x}, expected 0x{x}\n",
+            .{ name, actual, expected },
+        );
+        return error.ModelNotSelfContained;
+    }
+    if (actual < start or actual >= end) {
+        std.debug.print(
+            "I-032 binding: {s} = 0x{x} lies outside [{x}, {x})\n",
+            .{ name, actual, start, end },
+        );
+        return error.ModelNotSelfContained;
+    }
+}
+
+/// The two-live-model check: bindings, identical logits from the same prompt
+/// through both models, and reset equivalence against a model that never saw
+/// the first sequence.
 fn secondSequenceAfterReset(allocator: std.mem.Allocator) !void {
     assert(allocator.vtable != undefined);
-    if (!execModelInitIsBound()) {
-        return error.SkipZigTest;
-    }
+    assert(@sizeOf(exec.Model) > 0);
+
     var golden = try tiny_check.Golden.open(allocator);
     defer golden.close();
 
@@ -252,14 +309,47 @@ fn secondSequenceAfterReset(allocator: std.mem.Allocator) !void {
 
     // Two models live at once: the "fresh process" must not inherit device
     // memory that the reset model has already written.
-    var reset_model = try exec.Model.init(allocator);
+    var reset_model: exec.Model = undefined;
+    try reset_model.init(allocator);
     defer reset_model.deinit();
-    var fresh_model = try exec.Model.init(allocator);
+    var fresh_model: exec.Model = undefined;
+    try fresh_model.init(allocator);
     defer fresh_model.deinit();
     try std.testing.expect(
         reset_model.state.allocations.items[0].pointer !=
             fresh_model.state.allocations.items[0].pointer,
     );
+
+    // The I-032 defect: both models were built by a by-value `init` whose
+    // callee frame the caller does not own. Every binding is checked, for both
+    // models, before either runs a forward.
+    try expectBound(&reset_model);
+    try expectBound(&fresh_model);
+
+    // The same prompt through two live models must produce the same logits,
+    // bit for bit. This is the check the single-model e2e passed by luck.
+    const vocab: usize = reset_model.config.vocab_size;
+    const logits_length = golden.prompt.len * vocab;
+    const reset_logits = try allocator.alloc(f32, logits_length);
+    defer allocator.free(reset_logits);
+    const fresh_logits = try allocator.alloc(f32, logits_length);
+    defer allocator.free(fresh_logits);
+    try reset_model.reset();
+    try reset_model.forward(golden.prompt);
+    try reset_model.state.downloadF32(&reset_model.state.logits, reset_logits);
+    try fresh_model.reset();
+    try fresh_model.forward(golden.prompt);
+    try fresh_model.state.downloadF32(&fresh_model.state.logits, fresh_logits);
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(reset_logits),
+        std.mem.sliceAsBytes(fresh_logits),
+    );
+    var logit_drift: f64 = 0.0;
+    for (reset_logits, fresh_logits) |left, right| {
+        logit_drift = @max(logit_drift, @abs(@as(f64, left) - @as(f64, right)));
+    }
+    try std.testing.expectEqual(@as(f64, 0.0), logit_drift);
 
     var sequence = generate.Sequence.init(&reset_model);
     try sequence.begin(golden.prompt);
@@ -306,13 +396,15 @@ fn secondSequenceAfterReset(allocator: std.mem.Allocator) !void {
     const distinct = distinctCount(after_reset);
     std.debug.print(
         "reset equivalence: {d} ids per sequence, {d} distinct in the " ++
-            "second; reset model and fresh model agree; allocations {d}\n",
-        .{ count, distinct, allocations },
+            "second; two live models bound, same-prompt logits identical " ++
+            "(max drift {d}), reset model and fresh model agree; " ++
+            "allocations {d}\n",
+        .{ count, distinct, logit_drift, allocations },
     );
     try std.testing.expect(distinct > 1);
 }
 
-test "a second sequence after reset matches a fresh process" {
+test "two live models stay bound and a second sequence after reset matches a fresh process" {
     return secondSequenceAfterReset(std.testing.allocator);
 }
 
@@ -320,7 +412,8 @@ test "a GDN state snapshot restores bit-identically and continues like an undive
     const allocator = std.testing.allocator;
     var golden = try tiny_check.Golden.open(allocator);
     defer golden.close();
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
 
     const prefix_steps: u32 = 4;
@@ -436,7 +529,8 @@ test "a GDN state snapshot restores bit-identically and continues like an undive
 
 test "a prompt longer than the arena is refused before any compute" {
     const allocator = std.testing.allocator;
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
     var sequence = generate.Sequence.init(&model);
     const too_long = try allocator.alloc(i64, model.state.arena_length + 1);
@@ -452,7 +546,8 @@ test "a token past the arena stops with context_limit" {
     const allocator = std.testing.allocator;
     var golden = try tiny_check.Golden.open(allocator);
     defer golden.close();
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
     var sequence = generate.Sequence.init(&model);
     try sequence.begin(golden.prompt);
@@ -473,7 +568,8 @@ test "the stop surface honours eos, max_tokens and a predicate" {
     const allocator = std.testing.allocator;
     var golden = try tiny_check.Golden.open(allocator);
     defer golden.close();
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
 
     var sequence = generate.Sequence.init(&model);

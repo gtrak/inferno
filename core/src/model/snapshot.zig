@@ -264,5 +264,10 @@ fn freeShadow(shadow: epochs.Sealed) void {
     assert(shadow.pointer != 0);
 
     const payload = shadow.device();
-    guards.free(&payload);
+    guards.free(&payload) catch |err| {
+        std.log.err(
+            "cannot free a snapshot shadow: {s}",
+            .{@errorName(err)},
+        );
+    };
 }

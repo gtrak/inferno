@@ -1499,7 +1499,10 @@ pub const Forward = struct {
         try self.announce();
         for (0..rank_count) |index| {
             const rank: u32 = @intCast(index);
-            self.models[rank] = try exec.Model.initOnDevice(allocator, rank);
+            // The storage is the rank's slot in this heap-allocated forward,
+            // so the model's interior pointers are established at their final
+            // address (I-032).
+            try self.models[rank].initOnDevice(allocator, rank);
             self.model_count += 1;
         }
         for (0..rank_count) |index| {
@@ -1689,6 +1692,14 @@ pub const Forward = struct {
             .expert_weights = expertWeights,
             .gather_experts = gatherExperts,
         };
+
+        // `Forward` is the other struct in this tree that stores an interior
+        // pointer: every cluster's `user` names this forward's own hook slot.
+        // It is heap-allocated and returned by pointer, so the address cannot
+        // move; the assertion makes a future by-value return fail on the first
+        // run instead of resolving through a dead frame.
+        assert(inRange(self, &self.hooks[rank]));
+        assert(inRange(self, self.models[rank].cluster.?.user));
     }
 
     /// Runs `count` greedy steps on every rank, concurrently, and returns each
@@ -1801,6 +1812,16 @@ pub const Forward = struct {
 };
 
 // --- hook implementations ----------------------------------------------------
+
+/// Whether `pointer` addresses storage inside this heap-allocated forward.
+fn inRange(self: *const Forward, pointer: anytype) bool {
+    assert(@intFromPtr(self) != 0);
+    assert(@sizeOf(Forward) > 0);
+
+    const start = @intFromPtr(self);
+    const address = @intFromPtr(pointer);
+    return address >= start and address < start + @sizeOf(Forward);
+}
 
 fn castHook(user: *anyopaque) *Hook {
     assert(@intFromPtr(user) != 0);

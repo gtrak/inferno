@@ -244,7 +244,8 @@ test "the tiny model reproduces the golden logits and the golden greedy ids" {
     const allocator = std.testing.allocator;
     var golden = try Golden.open(allocator);
     defer golden.close();
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
 
     const rows: u32 = @intCast(golden.prompt.len);
@@ -415,7 +416,8 @@ test "a reset that forgets the mRoPE table is a read before write, not a silent 
     // operation; the test below takes `State.reset` alone, which is exactly the
     // half-finished reset, and requires the launch to refuse it.
     const allocator = std.testing.allocator;
-    var model = try exec.Model.init(allocator);
+    var model: exec.Model = undefined;
+    try model.init(allocator);
     defer model.deinit();
     try model.reset();
 

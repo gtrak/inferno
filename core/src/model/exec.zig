@@ -17,6 +17,7 @@ const std = @import("std");
 const attention = @import("../kernels/attention.zig");
 const cuda_context = @import("../hw/api.zig").cuda_context;
 const cuda_driver = @import("../hw/api.zig").cuda_driver;
+const epochs = @import("../hw/epochs.zig");
 const guards = @import("../hw/buffer.zig");
 const elementwise = @import("../kernels/elementwise.zig");
 const fixtures = @import("../ref/fixtures.zig");
@@ -204,15 +205,31 @@ pub const Model = struct {
     cluster: ?Cluster = null,
     timings: Timings,
 
-    /// Opens device 0, loads the checkpoint and builds the caches.
-    pub fn init(allocator: std.mem.Allocator) !Model {
-        return initOnDevice(allocator, 0);
+    /// Opens device 0, loads the checkpoint and builds the caches in `self`.
+    ///
+    /// Storage is the caller's so every interior pointer (`state.stream_handle`,
+    /// `ple_block.ple`, `ple_block.table`, `pool.table`) is established at the
+    /// address the model will live at. Returning a `Model` by value left those
+    /// pointers naming a dead callee frame: one long-lived model hid it, a
+    /// second live model did not (I-032). A `Model` must not be copied after
+    /// `init`; the interior pointers assume the address they were built at.
+    pub fn init(self: *Model, allocator: std.mem.Allocator) !void {
+        assert(@sizeOf(Model) > 0);
+        assert(allocator.vtable != undefined);
+
+        try self.initOnDevice(allocator, 0);
     }
 
-    /// Opens one device by index: one rank's copy of the graph. Every buffer,
-    /// module and stream this model owns belongs to that device's context.
-    pub fn initOnDevice(allocator: std.mem.Allocator, device_index: u32) !Model {
+    /// Opens one device by index: one rank's copy of the graph, in `self`.
+    /// Every buffer, module and stream this model owns belongs to that
+    /// device's context.
+    pub fn initOnDevice(
+        self: *Model,
+        allocator: std.mem.Allocator,
+        device_index: u32,
+    ) !void {
         assert(device_index < cuda_driver.device_count_max);
+        assert(allocator.vtable != undefined);
 
         const config = try fixtures.load_config(allocator);
         const plan = try plan_module.Plan.init(config);
@@ -228,8 +245,12 @@ pub const Model = struct {
         const context = try cuda_context.Context.retain(&devices[device_index]);
         errdefer context.release();
         try context.set_current();
+        // The epoch/guard registries are context-scoped (I-033); name this
+        // device now, while its context is current, so a cross-context lookup
+        // can say which GPU it crossed from.
+        epochs.nameScope(device_index);
 
-        var model = Model{
+        self.* = Model{
             .allocator = allocator,
             .config = config,
             .plan = plan,
@@ -259,38 +280,57 @@ pub const Model = struct {
             .cluster = null,
             .timings = .{},
         };
-        errdefer model.release();
+        errdefer self.release();
 
-        model.ple = try ple.Ple.init();
-        errdefer model.ple.deinit();
-        model.weights = try load.Weights.load(
+        self.ple = try ple.Ple.init();
+        errdefer self.ple.deinit();
+        self.weights = try load.Weights.load(
             allocator,
-            &model.ple.stream,
-            &config,
+            &self.ple.stream,
+            &self.config,
         );
-        errdefer model.weights.deinit();
-        model.state = try state_module.State.init(
+        errdefer self.weights.deinit();
+        self.state = try state_module.State.init(
             allocator,
-            &model.ple.stream,
-            config,
+            &self.ple.stream,
+            self.config,
             plan,
         );
-        errdefer model.state.deinit();
-        model.glue_kernels = try glue.Kernels.load();
-        errdefer model.glue_kernels.deinit();
-        model.elementwise_kernels = try elementwise.Kernels.load();
-        errdefer model.elementwise_kernels.deinit();
-        model.gdn_kernels = try gdn.Kernels.load();
-        errdefer model.gdn_kernels.deinit();
-        model.moe_kernels = try moe.Kernels.init(try moe.cubinBytes());
-        errdefer model.moe_kernels.deinit();
-        model.attention = try attention.Attention.init();
-        errdefer model.attention.deinit();
-        try model.allocateRopeTables();
-        try model.openPle();
-        try model.allocateHostScratch();
-        assert(model.state.length == 0);
-        return model;
+        errdefer self.state.deinit();
+        self.glue_kernels = try glue.Kernels.load();
+        errdefer self.glue_kernels.deinit();
+        self.elementwise_kernels = try elementwise.Kernels.load();
+        errdefer self.elementwise_kernels.deinit();
+        self.gdn_kernels = try gdn.Kernels.load();
+        errdefer self.gdn_kernels.deinit();
+        self.moe_kernels = try moe.Kernels.init(try moe.cubinBytes());
+        errdefer self.moe_kernels.deinit();
+        self.attention = try attention.Attention.init();
+        errdefer self.attention.deinit();
+        try self.allocateRopeTables();
+        try self.openPle();
+        try self.allocateHostScratch();
+        assert(self.state.length == 0);
+        self.assertSelfContained();
+    }
+
+    /// Every pointer this model stores to one of its own fields must point
+    /// inside the `Model` the caller passed to `init` — checked after the
+    /// fields exist. This catches a construction aimed outside the owner; the
+    /// two-model test in `runtime_check.zig` catches the other half, a model
+    /// built in one frame and returned from another (I-032).
+    fn assertSelfContained(self: *const Model) void {
+        assert(self.plan.layer_count > 0);
+        assert(@sizeOf(Model) > 0);
+
+        assert(inRange(self, &self.ple.stream));
+        assert(inRange(self, &self.ple));
+        assert(inRange(self, &self.table));
+        assert(inRange(self, self.state.stream_handle));
+        assert(inRange(self, self.ple_block.ple));
+        assert(inRange(self, self.ple_block.table));
+        assert(inRange(self, self.pool.table));
+        assert(self.ple_block.pool == self.pool);
     }
 
     /// Releases every module, cache and host allocation.
@@ -1675,6 +1715,20 @@ fn selectedExpert(selected: []const u32, expert: u32) bool {
         }
     }
     return false;
+}
+
+/// Whether `pointer` addresses storage inside `self`.
+///
+/// The self-containment assertion of I-032: a pointer stored in a struct to one
+/// of the struct's own fields must lie inside the storage the owner was
+/// initialised in. A by-value return makes it point into a dead frame.
+fn inRange(self: *const Model, pointer: anytype) bool {
+    assert(@intFromPtr(self) != 0);
+    assert(@sizeOf(Model) > 0);
+
+    const start = @intFromPtr(self);
+    const address = @intFromPtr(pointer);
+    return address >= start and address < start + @sizeOf(Model);
 }
 
 /// How many tokens one row's indexer selection lists.
